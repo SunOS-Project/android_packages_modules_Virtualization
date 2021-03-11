@@ -13,11 +13,21 @@ import /init.environ.rc
 # Cgroups are mounted right before early-init using list from /etc/cgroups.json
 on early-init
     start ueventd
+    setprop ro.apex.updatable true
+    setprop ro.debuggable 1
+    setprop ro.adb.secure 0
+
+    # Generate ld.config.txt
+    exec -- /system/bin/bootstrap/linkerconfig --target /linkerconfig
+    chmod 644 /linkerconfig/ld.config.txt
 
     # Run apexd-bootstrap so that APEXes that provide critical libraries
     # become available. Note that this is executed as exec_start to ensure that
     # the libraries are available to the processes started after this statement.
     exec_start apexd-bootstrap
+
+    # Generate linker config based on apex mounted in bootstrap namespace
+    update_linker_config
 
 on init
     # Mount binderfs
