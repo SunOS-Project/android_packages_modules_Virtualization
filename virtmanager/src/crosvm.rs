@@ -18,6 +18,7 @@ use crate::config::VmConfig;
 use crate::Cid;
 use anyhow::Error;
 use log::{debug, error, info};
+use std::fs::File;
 use std::process::{Child, Command};
 
 const CROSVM_PATH: &str = "/apex/com.android.virt/bin/crosvm";
@@ -29,19 +30,27 @@ pub struct VmInstance {
     child: Child,
     /// The CID assigned to the VM for vsock communication.
     pub cid: Cid,
+    /// The filename of the config file that was used to start the VM. This may have changed since
+    /// it was read so it shouldn't be trusted; it is only stored for debugging purposes.
+    pub config_path: String,
 }
 
 impl VmInstance {
     /// Create a new `VmInstance` for the given process.
-    fn new(child: Child, cid: Cid) -> VmInstance {
-        VmInstance { child, cid }
+    fn new(child: Child, cid: Cid, config_path: &str) -> VmInstance {
+        VmInstance { child, cid, config_path: config_path.to_owned() }
     }
 
     /// Start an instance of `crosvm` to manage a new VM. The `crosvm` instance will be killed when
     /// the `VmInstance` is dropped.
-    pub fn start(config: &VmConfig, cid: Cid) -> Result<VmInstance, Error> {
-        let child = run_vm(config, cid)?;
-        Ok(VmInstance::new(child, cid))
+    pub fn start(
+        config: &VmConfig,
+        cid: Cid,
+        config_path: &str,
+        log_fd: Option<File>,
+    ) -> Result<VmInstance, Error> {
+        let child = run_vm(config, cid, log_fd)?;
+        Ok(VmInstance::new(child, cid, config_path))
     }
 }
 
@@ -61,14 +70,18 @@ impl Drop for VmInstance {
 }
 
 /// Start an instance of `crosvm` to manage a new VM.
-fn run_vm(config: &VmConfig, cid: Cid) -> Result<Child, Error> {
+fn run_vm(config: &VmConfig, cid: Cid, log_fd: Option<File>) -> Result<Child, Error> {
     config.validate()?;
 
     let mut command = Command::new(CROSVM_PATH);
     // TODO(qwandor): Remove --disable-sandbox.
     command.arg("run").arg("--disable-sandbox").arg("--cid").arg(cid.to_string());
-    // TODO(jiyong): Don't redirect console to the host syslog
-    command.arg("--serial=type=syslog");
+    if let Some(log_fd) = log_fd {
+        command.stdout(log_fd);
+    } else {
+        // Ignore console output.
+        command.arg("--serial=type=sink");
+    }
     if let Some(bootloader) = &config.bootloader {
         command.arg("--bios").arg(bootloader);
     }

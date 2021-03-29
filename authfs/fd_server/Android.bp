@@ -7,10 +7,13 @@ rust_binary {
     srcs: ["src/main.rs"],
     rustlibs: [
         "authfs_aidl_interface-rust",
+        "libandroid_logger",
         "libanyhow",
         "libbinder_rs",
         "libclap",
         "liblibc",
         "liblog_rust",
+        "libnix",
     ],
+    apex_available: ["com.android.virt"],
 }
