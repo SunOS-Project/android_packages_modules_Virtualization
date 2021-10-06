@@ -44,6 +44,7 @@ import org.junit.runner.RunWith;
 
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @RootPermissionTest
 @RunWith(DeviceJUnit4ClassRunner.class)
@@ -66,6 +67,8 @@ public final class AuthFsHostTest extends VirtualizationTestCaseBase {
 
     /** FUSE's magic from statfs(2) */
     private static final String FUSE_SUPER_MAGIC_HEX = "65735546";
+
+    private static final int VMADDR_CID_HOST = 2;
 
     private static CommandRunner sAndroid;
     private static String sCid;
@@ -108,7 +111,8 @@ public final class AuthFsHostTest extends VirtualizationTestCaseBase {
                         apkName,
                         packageName,
                         configPath,
-                        /* debug */ false);
+                        /* debug */ false,
+                        /* use default memoryMib */ 0);
         adbConnectToMicrodroid(androidDevice, sCid);
 
         // Root because authfs (started from shell in this test) currently require root to open
@@ -151,11 +155,11 @@ public final class AuthFsHostTest extends VirtualizationTestCaseBase {
         // Setup
         runFdServerOnAndroid(
                 "3<input.4m 4<input.4m.merkle_dump 5<input.4m.fsv_sig 6<input.4m",
-                "--ro-fds 3:4:5 --ro-fds 6 --rpc-binder");
+                "--ro-fds 3:4:5 --ro-fds 6");
 
         runAuthFsOnMicrodroid(
-                "--remote-ro-file-unverified 10:6:4194304 --remote-ro-file 11:3:4194304:cert.der"
-                        + " --cid 2");
+                "--remote-ro-file-unverified 10:6 --remote-ro-file 11:3:cert.der --cid "
+                        + VMADDR_CID_HOST);
 
         // Action
         String actualHashUnverified4m = computeFileHashOnMicrodroid(MOUNT_DIR + "/10");
@@ -177,9 +181,10 @@ public final class AuthFsHostTest extends VirtualizationTestCaseBase {
         runFdServerOnAndroid(
                 "3<input.4k 4<input.4k.merkle_dump 5<input.4k.fsv_sig"
                         + " 6<input.4k1 7<input.4k1.merkle_dump 8<input.4k1.fsv_sig",
-                "--ro-fds 3:4:5 --ro-fds 6:7:8 --rpc-binder");
+                "--ro-fds 3:4:5 --ro-fds 6:7:8");
         runAuthFsOnMicrodroid(
-                "--remote-ro-file 10:3:4096:cert.der --remote-ro-file 11:6:4097:cert.der --cid 2");
+                "--remote-ro-file 10:3:cert.der --remote-ro-file 11:6:cert.der --cid "
+                        + VMADDR_CID_HOST);
 
         // Action
         String actualHash4k = computeFileHashOnMicrodroid(MOUNT_DIR + "/10");
@@ -198,9 +203,8 @@ public final class AuthFsHostTest extends VirtualizationTestCaseBase {
             throws DeviceNotAvailableException, InterruptedException {
         // Setup
         runFdServerOnAndroid(
-                "3<input.4m 4<input.4m.merkle_dump.bad 5<input.4m.fsv_sig",
-                "--ro-fds 3:4:5 --rpc-binder");
-        runAuthFsOnMicrodroid("--remote-ro-file 10:3:4096:cert.der --cid 2");
+                "3<input.4m 4<input.4m.merkle_dump.bad 5<input.4m.fsv_sig", "--ro-fds 3:4:5");
+        runAuthFsOnMicrodroid("--remote-ro-file 10:3:cert.der --cid " + VMADDR_CID_HOST);
 
         // Verify
         assertFalse(copyFileOnMicrodroid(MOUNT_DIR + "/10", "/dev/null"));
@@ -210,8 +214,8 @@ public final class AuthFsHostTest extends VirtualizationTestCaseBase {
     public void testWriteThroughCorrectly()
             throws DeviceNotAvailableException, InterruptedException {
         // Setup
-        runFdServerOnAndroid("3<>output", "--rw-fds 3 --rpc-binder");
-        runAuthFsOnMicrodroid("--remote-new-rw-file 20:3 --cid 2");
+        runFdServerOnAndroid("3<>output", "--rw-fds 3");
+        runAuthFsOnMicrodroid("--remote-new-rw-file 20:3 --cid " + VMADDR_CID_HOST);
 
         // Action
         String srcPath = "/system/bin/linker64";
@@ -228,8 +232,8 @@ public final class AuthFsHostTest extends VirtualizationTestCaseBase {
     public void testWriteFailedIfDetectsTampering()
             throws DeviceNotAvailableException, InterruptedException {
         // Setup
-        runFdServerOnAndroid("3<>output", "--rw-fds 3 --rpc-binder");
-        runAuthFsOnMicrodroid("--remote-new-rw-file 20:3 --cid 2");
+        runFdServerOnAndroid("3<>output", "--rw-fds 3");
+        runAuthFsOnMicrodroid("--remote-new-rw-file 20:3 --cid " + VMADDR_CID_HOST);
 
         String srcPath = "/system/bin/linker64";
         String destPath = MOUNT_DIR + "/20";
@@ -259,8 +263,8 @@ public final class AuthFsHostTest extends VirtualizationTestCaseBase {
     @Test
     public void testFileResize() throws DeviceNotAvailableException, InterruptedException {
         // Setup
-        runFdServerOnAndroid("3<>output", "--rw-fds 3 --rpc-binder");
-        runAuthFsOnMicrodroid("--remote-new-rw-file 20:3 --cid 2");
+        runFdServerOnAndroid("3<>output", "--rw-fds 3");
+        runAuthFsOnMicrodroid("--remote-new-rw-file 20:3 --cid " + VMADDR_CID_HOST);
         String outputPath = MOUNT_DIR + "/20";
         String backendPath = TEST_DIR + "/output";
 
@@ -339,11 +343,16 @@ public final class AuthFsHostTest extends VirtualizationTestCaseBase {
     private void runAuthFsOnMicrodroid(String flags) {
         String cmd = AUTHFS_BIN + " " + MOUNT_DIR + " " + flags;
 
+        AtomicBoolean starting = new AtomicBoolean(true);
         mThreadPool.submit(
                 () -> {
-                    CLog.i("Starting authfs");
-                    CommandResult result = runOnMicrodroidForResult(cmd);
-                    CLog.w("authfs has stopped: " + result);
+                    // authfs may fail to start if fd_server is not yet listening on the vsock
+                    // ("Error: Invalid raw AIBinder"). Just restart if that happens.
+                    while (starting.get()) {
+                        CLog.i("Starting authfs");
+                        CommandResult result = runOnMicrodroidForResult(cmd);
+                        CLog.w("authfs has stopped: " + result);
+                    }
                 });
         try {
             PollingCheck.waitFor(
@@ -353,6 +362,8 @@ public final class AuthFsHostTest extends VirtualizationTestCaseBase {
             // methods. waitFor throws Exception because the callback, Callable#call(), has a
             // signature to throw an Exception.
             throw new RuntimeException(e);
+        } finally {
+            starting.set(false);
         }
     }
 

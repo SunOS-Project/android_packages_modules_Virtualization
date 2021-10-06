@@ -19,6 +19,7 @@ mod run;
 mod sync;
 
 use android_system_virtualizationservice::aidl::android::system::virtualizationservice::IVirtualizationService::IVirtualizationService;
+use android_system_virtualizationservice::aidl::android::system::virtualizationservice::PartitionType::PartitionType;
 use android_system_virtualizationservice::binder::{wait_for_interface, ProcessState, Strong};
 use anyhow::{Context, Error};
 use create_partition::command_create_partition;
@@ -61,6 +62,11 @@ enum Opt {
         /// Whether to run VM in debug mode.
         #[structopt(short, long)]
         debug: bool,
+
+        /// Memory size (in MiB) of the VM. If unspecified, defaults to the value of `memory_mib`
+        /// in the VM config file.
+        #[structopt(short, long)]
+        mem: Option<u32>,
     },
     /// Run a virtual machine
     Run {
@@ -91,7 +97,19 @@ enum Opt {
 
         /// The desired size of the partition, in bytes.
         size: u64,
+
+        /// Type of the partition
+        #[structopt(short="t", long="type", default_value="raw", parse(try_from_str=parse_partition_type))]
+        partition_type: PartitionType,
     },
+}
+
+fn parse_partition_type(s: &str) -> Result<PartitionType, String> {
+    match s {
+        "raw" => Ok(PartitionType::RAW),
+        "instance" => Ok(PartitionType::ANDROID_VM_INSTANCE),
+        _ => Err(format!("Invalid partition type {}", s)),
+    }
 }
 
 fn main() -> Result<(), Error> {
@@ -105,7 +123,7 @@ fn main() -> Result<(), Error> {
         .context("Failed to find VirtualizationService")?;
 
     match opt {
-        Opt::RunApp { apk, idsig, instance, config_path, daemonize, log, debug } => {
+        Opt::RunApp { apk, idsig, instance, config_path, daemonize, log, debug, mem } => {
             command_run_app(
                 service,
                 &apk,
@@ -115,14 +133,17 @@ fn main() -> Result<(), Error> {
                 daemonize,
                 log.as_deref(),
                 debug,
+                mem,
             )
         }
         Opt::Run { config, daemonize, log } => {
-            command_run(service, &config, daemonize, log.as_deref())
+            command_run(service, &config, daemonize, log.as_deref(), /* mem */ None)
         }
         Opt::Stop { cid } => command_stop(service, cid),
         Opt::List => command_list(service),
-        Opt::CreatePartition { path, size } => command_create_partition(service, &path, size),
+        Opt::CreatePartition { path, size, partition_type } => {
+            command_create_partition(service, &path, size, partition_type)
+        }
     }
 }
 
