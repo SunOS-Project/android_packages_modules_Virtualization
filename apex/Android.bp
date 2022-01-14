@@ -2,6 +2,14 @@ package {
     default_applicable_licenses: ["Android-Apache-2.0"],
 }
 
+microdroid_filesystem_images = [
+    "microdroid_super",
+    "microdroid_boot-5.10",
+    "microdroid_vendor_boot-5.10",
+    "microdroid_vbmeta",
+    "microdroid_vbmeta_bootconfig",
+]
+
 apex {
     name: "com.android.virt",
 
@@ -13,6 +21,7 @@ apex {
 
     key: "com.android.virt.key",
     certificate: ":com.android.virt.certificate",
+    custom_sign_tool: "sign_virt_apex",
 
     // crosvm and virtualizationservice are only enabled for 64-bit targets on device
     arch: {
@@ -21,24 +30,14 @@ apex {
                 "crosvm",
                 "virtualizationservice",
             ],
-            filesystems: [
-                "microdroid_super",
-                "microdroid_boot-5.10",
-                "microdroid_vendor_boot-5.10",
-                "microdroid_vbmeta",
-            ],
+            filesystems: microdroid_filesystem_images,
         },
         x86_64: {
             binaries: [
                 "crosvm",
                 "virtualizationservice",
             ],
-            filesystems: [
-                "microdroid_super",
-                "microdroid_boot-5.10",
-                "microdroid_vendor_boot-5.10",
-                "microdroid_vbmeta",
-            ],
+            filesystems: microdroid_filesystem_images,
         },
     },
     binaries: [
@@ -90,6 +89,64 @@ python_binary_host {
     name: "sign_virt_apex",
     srcs: [
         "sign_virt_apex.py",
+    ],
+    version: {
+        py2: {
+            enabled: false,
+        },
+        py3: {
+            enabled: true,
+            embedded_launcher: true,
+        },
+    },
+    required: [
+        "img2simg",
+        "lpmake",
+        "lpunpack",
+        "simg2img",
+    ],
+}
+
+sh_test_host {
+    name: "sign_virt_apex_test",
+    src: "sign_virt_apex_test.sh",
+    test_config: "sign_virt_apex_test.xml",
+    data_bins: [
+        // deapexer
+        "deapexer",
+        "debugfs_static",
+
+        // sign_virt_apex
+        "avbtool",
+        "img2simg",
+        "lpmake",
+        "lpunpack",
+        "sign_virt_apex",
+        "simg2img",
+    ],
+    data_libs: [
+        "libbase",
+        "libc++",
+        "libcrypto_utils",
+        "libcrypto",
+        "libext4_utils",
+        "liblog",
+        "liblp",
+        "libsparse",
+        "libz",
+    ],
+    data: [
+        ":com.android.virt",
+        "test.com.android.virt.pem",
+    ],
+    test_suites: ["general-tests"],
+}
+
+// custom tool to replace bytes in a file
+python_binary_host {
+    name: "replace_bytes",
+    srcs: [
+        "replace_bytes.py",
     ],
     version: {
         py2: {

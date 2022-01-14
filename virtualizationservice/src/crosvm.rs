@@ -181,8 +181,8 @@ impl VmInstance {
     /// `self.vm_state` to avoid holding the lock on `vm_state` while it is running.
     fn monitor(&self, child: Arc<SharedChild>) {
         match child.wait() {
-            Err(e) => error!("Error waiting for crosvm instance to die: {}", e),
-            Ok(status) => info!("crosvm exited with status {}", status),
+            Err(e) => error!("Error waiting for crosvm({}) instance to die: {}", child.id(), e),
+            Ok(status) => info!("crosvm({}) exited with status {}", child.id(), status),
         }
 
         let mut vm_state = self.vm_state.lock().unwrap();
@@ -220,9 +220,11 @@ impl VmInstance {
     pub fn kill(&self) {
         let vm_state = &*self.vm_state.lock().unwrap();
         if let VmState::Running { child } = vm_state {
+            let id = child.id();
+            debug!("Killing crosvm({})", id);
             // TODO: Talk to crosvm to shutdown cleanly.
             if let Err(e) = child.kill() {
-                error!("Error killing crosvm instance: {}", e);
+                error!("Error killing crosvm({}) instance: {}", id, e);
             }
         }
     }
@@ -249,8 +251,9 @@ fn run_vm(config: CrosvmConfig) -> Result<SharedChild, Error> {
 
     // Setup the serial devices.
     // 1. uart device: used as the output device by bootloaders and as early console by linux
-    // 2. virtio-console device: used as the console device
-    // 3. virtio-console device: used as the logcat output
+    // 2. virtio-console device: used as the console device where kmsg is redirected to
+    // 3. virtio-console device: used as the androidboot.console device (not used currently)
+    // 4. virtio-console device: used as the logcat output
     //
     // When [console|log]_fd is not specified, the devices are attached to sink, which means what's
     // written there is discarded.
@@ -271,8 +274,10 @@ fn run_vm(config: CrosvmConfig) -> Result<SharedChild, Error> {
     command.arg(format!("--serial={},hardware=serial", &console_arg));
     // /dev/hvc0
     command.arg(format!("--serial={},hardware=virtio-console,num=1", &console_arg));
-    // /dev/hvc1
-    command.arg(format!("--serial={},hardware=virtio-console,num=2", &log_arg));
+    // /dev/hvc1 (not used currently)
+    command.arg("--serial=type=sink,hardware=virtio-console,num=2");
+    // /dev/hvc2
+    command.arg(format!("--serial={},hardware=virtio-console,num=3", &log_arg));
 
     if let Some(bootloader) = &config.bootloader {
         command.arg("--bios").arg(add_preserved_fd(&mut preserved_fds, bootloader));
@@ -301,6 +306,7 @@ fn run_vm(config: CrosvmConfig) -> Result<SharedChild, Error> {
 
     info!("Running {:?}", command);
     let result = SharedChild::spawn(&mut command)?;
+    debug!("Spawned crosvm({}).", result.id());
     Ok(result)
 }
 
