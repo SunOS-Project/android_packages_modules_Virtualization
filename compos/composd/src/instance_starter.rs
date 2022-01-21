@@ -152,7 +152,11 @@ impl InstanceStarter {
 
         // TODO(198211396): Implement correctly.
         service
-            .initializeClasspaths(&env::var("BOOTCLASSPATH")?, &env::var("DEX2OATBOOTCLASSPATH")?)
+            .initializeClasspaths(
+                &env::var("BOOTCLASSPATH")?,
+                &env::var("DEX2OATBOOTCLASSPATH")?,
+                &env::var("SYSTEMSERVERCLASSPATH")?,
+            )
             .context("Initializing *CLASSPATH")?;
         Ok(())
     }
@@ -195,7 +199,7 @@ impl InstanceStarter {
 
     fn check_files_exist(&self) -> Result<()> {
         if !self.instance_root.is_dir() {
-            bail!("Directory {} not found", self.instance_root.display())
+            bail!("Directory {:?} not found", self.instance_root)
         };
         Self::check_file_exists(&self.instance_image)?;
         Self::check_file_exists(&self.key_blob)?;
@@ -205,7 +209,7 @@ impl InstanceStarter {
 
     fn check_file_exists(file: &Path) -> Result<()> {
         if !file.is_file() {
-            bail!("File {} not found", file.display())
+            bail!("File {:?} not found", file)
         };
         Ok(())
     }

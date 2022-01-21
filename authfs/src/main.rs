@@ -37,6 +37,7 @@ mod auth;
 mod common;
 mod crypto;
 mod file;
+mod fsstat;
 mod fsverity;
 mod fusefs;
 
@@ -44,6 +45,7 @@ use auth::FakeAuthenticator;
 use file::{
     InMemoryDir, RemoteDirEditor, RemoteFileEditor, RemoteFileReader, RemoteMerkleTreeReader,
 };
+use fsstat::RemoteFsStatsReader;
 use fsverity::{VerifiedFileEditor, VerifiedFileReader};
 use fusefs::{AuthFs, AuthFsEntry};
 
@@ -129,7 +131,7 @@ struct OptionRemoteRoDir {
     /// A mapping file that describes the expecting file/directory structure and integrity metadata
     /// in the remote directory. The file contains serialized protobuf of
     /// android.security.fsverity.FSVerityDigests.
-    /// TODO(203251769): Really use the file when it's generated.
+    /// TODO(206869687): Really use the file when it's generated.
     #[allow(dead_code)]
     mapping_file_path: PathBuf,
 
@@ -204,9 +206,11 @@ fn new_remote_new_verified_dir_entry(
     Ok(AuthFsEntry::VerifiedNewDirectory { dir })
 }
 
-fn prepare_root_dir_entries(authfs: &mut AuthFs, args: &Args) -> Result<()> {
-    let service = file::get_rpc_binder_service(args.cid)?;
-
+fn prepare_root_dir_entries(
+    service: file::VirtFdService,
+    authfs: &mut AuthFs,
+    args: &Args,
+) -> Result<()> {
     for config in &args.remote_ro_file {
         authfs.add_entry_at_root_dir(
             remote_fd_to_path_buf(config.remote_fd),
@@ -252,10 +256,19 @@ fn prepare_root_dir_entries(authfs: &mut AuthFs, args: &Args) -> Result<()> {
             AuthFsEntry::ReadonlyDirectory { dir: InMemoryDir::new() },
         )?;
 
-        // TODO(203251769): Read actual path from config.mapping_file_path when it's generated.
+        // TODO(206869687): Read actual path from config.mapping_file_path when it's generated.
         let paths = vec![
+            Path::new("/system/framework/com.android.location.provider.jar"),
+            Path::new("/system/framework/ethernet-service.jar"),
+            Path::new("/system/framework/ext.jar"),
+            Path::new("/system/framework/framework-graphics.jar"),
             Path::new("/system/framework/framework.jar"),
+            Path::new("/system/framework/ims-common.jar"),
             Path::new("/system/framework/services.jar"),
+            Path::new("/system/framework/telephony-common.jar"),
+            Path::new("/system/framework/voip-common.jar"),
+            Path::new("/system/etc/boot-image.prof"),
+            Path::new("/system/etc/dirty-image-objects"),
         ];
 
         for path in &paths {
@@ -268,7 +281,7 @@ fn prepare_root_dir_entries(authfs: &mut AuthFs, args: &Args) -> Result<()> {
                     related_path,
                 )?;
                 let file_size = service.getFileSize(remote_file.get_remote_fd())?.try_into()?;
-                // TODO(203251769): Switch to VerifiedReadonly
+                // TODO(206869687): Switch to VerifiedReadonly
                 AuthFsEntry::UnverifiedReadonly { reader: remote_file, file_size }
             };
             authfs.add_entry_at_ro_dir_by_path(
@@ -287,16 +300,18 @@ fn remote_fd_to_path_buf(fd: i32) -> PathBuf {
 }
 
 fn try_main() -> Result<()> {
-    let args = Args::from_args();
+    let args = Args::from_args_safe()?;
 
     let log_level = if args.debug { log::Level::Debug } else { log::Level::Info };
     android_logger::init_once(
         android_logger::Config::default().with_tag("authfs").with_min_level(log_level),
     );
 
-    let mut authfs = AuthFs::new();
-    prepare_root_dir_entries(&mut authfs, &args)?;
-    fusefs::loop_forever(authfs, &args.mount_point, &args.extra_options)?;
+    let service = file::get_rpc_binder_service(args.cid)?;
+    let mut authfs = AuthFs::new(RemoteFsStatsReader::new(service.clone()));
+    prepare_root_dir_entries(service, &mut authfs, &args)?;
+
+    fusefs::mount_and_enter_message_loop(authfs, &args.mount_point, &args.extra_options)?;
     bail!("Unexpected exit after the handler loop")
 }
 

@@ -18,25 +18,34 @@
 //! desired.
 
 use crate::compilation_task::CompilationTask;
+use crate::fd_server_helper::FdServerConfig;
 use crate::instance_manager::InstanceManager;
+use crate::instance_starter::CompOsInstance;
 use crate::util::to_binder_result;
 use android_system_composd::aidl::android::system::composd::{
     ICompilationTask::{BnCompilationTask, ICompilationTask},
     ICompilationTaskCallback::ICompilationTaskCallback,
     IIsolatedCompilationService::{BnIsolatedCompilationService, IIsolatedCompilationService},
 };
-use android_system_composd::binder::{self, BinderFeatures, Interface, Strong};
-use anyhow::{Context, Result};
-use binder_common::new_binder_service_specific_error;
-use compos_aidl_interface::aidl::com::android::compos::{
-    CompilationResult::CompilationResult, FdAnnotation::FdAnnotation,
+use android_system_composd::binder::{
+    self, BinderFeatures, ExceptionCode, Interface, Status, Strong, ThreadState,
 };
+use anyhow::{Context, Result};
+use compos_common::COMPOS_DATA_ROOT;
+use rustutils::{system_properties, users::AID_ROOT, users::AID_SYSTEM};
+use std::fs::{create_dir, File, OpenOptions};
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::AsRawFd;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub struct IsolatedCompilationService {
-    instance_manager: InstanceManager,
+    instance_manager: Arc<InstanceManager>,
 }
 
-pub fn new_binder(instance_manager: InstanceManager) -> Strong<dyn IIsolatedCompilationService> {
+pub fn new_binder(
+    instance_manager: Arc<InstanceManager>,
+) -> Strong<dyn IIsolatedCompilationService> {
     let service = IsolatedCompilationService { instance_manager };
     BnIsolatedCompilationService::new_binder(service, BinderFeatures::default())
 }
@@ -44,29 +53,41 @@ pub fn new_binder(instance_manager: InstanceManager) -> Strong<dyn IIsolatedComp
 impl Interface for IsolatedCompilationService {}
 
 impl IIsolatedCompilationService for IsolatedCompilationService {
+    fn startStagedApexCompile(
+        &self,
+        callback: &Strong<dyn ICompilationTaskCallback>,
+    ) -> binder::Result<Strong<dyn ICompilationTask>> {
+        check_permissions()?;
+        to_binder_result(self.do_start_staged_apex_compile(callback))
+    }
+
     fn startTestCompile(
         &self,
         callback: &Strong<dyn ICompilationTaskCallback>,
     ) -> binder::Result<Strong<dyn ICompilationTask>> {
-        // TODO - check caller is system or shell/root?
+        check_permissions()?;
         to_binder_result(self.do_start_test_compile(callback))
     }
 
-    fn compile_cmd(
-        &self,
-        args: &[String],
-        fd_annotation: &FdAnnotation,
-    ) -> binder::Result<CompilationResult> {
-        // TODO - check caller is odrefresh
-        to_binder_result(self.do_compile_cmd(args, fd_annotation))
-    }
-
-    fn compile(&self, _marshaled: &[u8], _fd_annotation: &FdAnnotation) -> binder::Result<i8> {
-        Err(new_binder_service_specific_error(-1, "Not yet implemented"))
+    fn startTestOdrefresh(&self) -> binder::Result<i8> {
+        check_permissions()?;
+        to_binder_result(self.do_odrefresh_for_test())
     }
 }
 
 impl IsolatedCompilationService {
+    fn do_start_staged_apex_compile(
+        &self,
+        callback: &Strong<dyn ICompilationTaskCallback>,
+    ) -> Result<Strong<dyn ICompilationTask>> {
+        // TODO: Try to start the current instance with staged APEXes to see if it works?
+        let comp_os = self.instance_manager.start_pending_instance().context("Starting CompOS")?;
+
+        let task = CompilationTask::start_staged_apex_compile(comp_os, callback)?;
+
+        Ok(BnCompilationTask::new_binder(task, BinderFeatures::default()))
+    }
+
     fn do_start_test_compile(
         &self,
         callback: &Strong<dyn ICompilationTaskCallback>,
@@ -78,12 +99,57 @@ impl IsolatedCompilationService {
         Ok(BnCompilationTask::new_binder(task, BinderFeatures::default()))
     }
 
-    fn do_compile_cmd(
-        &self,
-        args: &[String],
-        fd_annotation: &FdAnnotation,
-    ) -> Result<CompilationResult> {
-        let compos = self.instance_manager.get_running_service()?;
-        compos.compile_cmd(args, fd_annotation).context("Compiling")
+    fn do_odrefresh_for_test(&self) -> Result<i8> {
+        let mut staging_dir_path = PathBuf::from(COMPOS_DATA_ROOT);
+        staging_dir_path.push("test-artifacts");
+        to_binder_result(create_dir(&staging_dir_path))?;
+
+        let compos = self
+            .instance_manager
+            .start_test_instance()
+            .context("Starting CompOS for odrefresh test")?;
+        self.do_odrefresh(compos, &staging_dir_path)
     }
+
+    fn do_odrefresh(&self, compos: Arc<CompOsInstance>, staging_dir_path: &Path) -> Result<i8> {
+        let output_dir = open_dir(staging_dir_path)?;
+        let system_dir = open_dir(Path::new("/system"))?;
+
+        // Spawn a fd_server to serve the FDs.
+        let fd_server_config = FdServerConfig {
+            ro_dir_fds: vec![system_dir.as_raw_fd()],
+            rw_dir_fds: vec![output_dir.as_raw_fd()],
+            ..Default::default()
+        };
+        let fd_server_raii = fd_server_config.into_fd_server()?;
+
+        let zygote_arch = system_properties::read("ro.zygote")?;
+        let result = compos.get_service().odrefresh(
+            system_dir.as_raw_fd(),
+            output_dir.as_raw_fd(),
+            &zygote_arch,
+        );
+        drop(fd_server_raii);
+        Ok(result?.exitCode)
+    }
+}
+
+fn check_permissions() -> binder::Result<()> {
+    let calling_uid = ThreadState::get_calling_uid();
+    // This should only be called by system server, or root while testing
+    if calling_uid != AID_SYSTEM && calling_uid != AID_ROOT {
+        Err(Status::new_exception(ExceptionCode::SECURITY, None))
+    } else {
+        Ok(())
+    }
+}
+
+/// Returns an owned FD of the directory. It currently returns a `File` as a FD owner, but
+/// it's better to use `std::os::unix::io::OwnedFd` once/if it becomes standard.
+fn open_dir(path: &Path) -> Result<File> {
+    OpenOptions::new()
+        .custom_flags(libc::O_DIRECTORY)
+        .read(true) // O_DIRECTORY can only be opened with read
+        .open(path)
+        .with_context(|| format!("Failed to open {:?} directory as path fd", path))
 }

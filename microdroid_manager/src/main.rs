@@ -19,7 +19,7 @@ mod ioutil;
 mod payload;
 
 use crate::instance::{ApkData, InstanceDisk, MicrodroidData, RootHash};
-use anyhow::{anyhow, bail, ensure, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Error, Result};
 use apkverify::{get_public_key_der, verify};
 use binder::unstable_api::{new_spibinder, AIBinder};
 use binder::{FromIBinder, Strong};
@@ -33,23 +33,53 @@ use rustutils::system_properties::PropertyWatcher;
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::io::{FromRawFd, IntoRawFd};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::str;
 use std::time::{Duration, SystemTime};
 use vsock::VsockStream;
 
 use android_system_virtualmachineservice::aidl::android::system::virtualmachineservice::IVirtualMachineService::{
-    VM_BINDER_SERVICE_PORT, VM_STREAM_SERVICE_PORT, IVirtualMachineService,
+    ERROR_PAYLOAD_CHANGED, ERROR_PAYLOAD_VERIFICATION_FAILED, ERROR_UNKNOWN, VM_BINDER_SERVICE_PORT, VM_STREAM_SERVICE_PORT, IVirtualMachineService,
 };
 
 const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+const APK_DM_VERITY_ARGUMENT: ApkDmverityArgument = {
+    ApkDmverityArgument {
+        apk: "/dev/block/by-name/microdroid-apk",
+        idsig: "/dev/block/by-name/microdroid-apk-idsig",
+        name: "microdroid-apk",
+    }
+};
 const DM_MOUNTED_APK_PATH: &str = "/dev/block/mapper/microdroid-apk";
+const APKDMVERITY_BIN: &str = "/system/bin/apkdmverity";
+const ZIPFUSE_BIN: &str = "/system/bin/zipfuse";
 
 /// The CID representing the host VM
 const VMADDR_CID_HOST: u32 = 2;
 
 const APEX_CONFIG_DONE_PROP: &str = "apex_config.done";
 const LOGD_ENABLED_PROP: &str = "ro.boot.logd.enabled";
+
+#[derive(thiserror::Error, Debug)]
+enum MicrodroidError {
+    #[error("Payload has changed: {0}")]
+    PayloadChanged(String),
+    #[error("Payload verification has failed: {0}")]
+    PayloadVerificationFailed(String),
+}
+
+fn translate_error(err: &Error) -> (i32, String) {
+    if let Some(e) = err.downcast_ref::<MicrodroidError>() {
+        match e {
+            MicrodroidError::PayloadChanged(msg) => (ERROR_PAYLOAD_CHANGED, msg.to_string()),
+            MicrodroidError::PayloadVerificationFailed(msg) => {
+                (ERROR_PAYLOAD_VERIFICATION_FAILED, msg.to_string())
+            }
+        }
+    } else {
+        (ERROR_UNKNOWN, err.to_string())
+    }
+}
 
 fn get_vms_rpc_binder() -> Result<Strong<dyn IVirtualMachineService>> {
     // SAFETY: AIBinder returned by RpcClient has correct reference count, and the ownership can be
@@ -81,6 +111,17 @@ fn try_main() -> Result<()> {
     kernlog::init()?;
     info!("started.");
 
+    let service = get_vms_rpc_binder().context("cannot connect to VirtualMachineService")?;
+    if let Err(err) = try_start_payload(&service) {
+        let (error_code, message) = translate_error(&err);
+        service.notifyError(error_code, &message)?;
+        Err(err)
+    } else {
+        Ok(())
+    }
+}
+
+fn try_start_payload(service: &Strong<dyn IVirtualMachineService>) -> Result<()> {
     let metadata = load_metadata().context("Failed to load payload metadata")?;
 
     let mut instance = InstanceDisk::new().context("Failed to load instance.img")?;
@@ -90,20 +131,26 @@ fn try_main() -> Result<()> {
     let verified_data =
         verify_payload(&metadata, saved_data.as_ref()).context("Payload verification failed")?;
     if let Some(saved_data) = saved_data {
-        if saved_data == verified_data {
-            info!("Saved data is verified.");
-        } else {
-            bail!("Detected an update of the payload which isn't supported yet.");
-        }
+        ensure!(
+            saved_data == verified_data,
+            MicrodroidError::PayloadChanged(String::from(
+                "Detected an update of the payload which isn't supported yet."
+            ))
+        );
+        info!("Saved data is verified.");
     } else {
         info!("Saving verified data.");
         instance.write_microdroid_data(&verified_data).context("Failed to write identity data")?;
     }
 
     // Before reading a file from the APK, start zipfuse
-    system_properties::write("ctl.start", "zipfuse")?;
+    run_zipfuse(
+        "fscontext=u:object_r:zipfusefs:s0,context=u:object_r:system_file:s0",
+        Path::new("/dev/block/mapper/microdroid-apk"),
+        Path::new("/mnt/apk"),
+    )
+    .context("Failed to run zipfuse")?;
 
-    let service = get_vms_rpc_binder().expect("cannot connect to VirtualMachineService");
     if !metadata.payload_config_path.is_empty() {
         let config = load_config(Path::new(&metadata.payload_config_path))?;
 
@@ -117,7 +164,7 @@ fn try_main() -> Result<()> {
         wait_for_apex_config_done()?;
 
         if let Some(main_task) = &config.task {
-            exec_task(main_task, &service).map_err(|e| {
+            exec_task(main_task, service).map_err(|e| {
                 error!("failed to execute task: {}", e);
                 e
             })?;
@@ -125,6 +172,37 @@ fn try_main() -> Result<()> {
     }
 
     Ok(())
+}
+
+struct ApkDmverityArgument<'a> {
+    apk: &'a str,
+    idsig: &'a str,
+    name: &'a str,
+}
+
+fn run_apkdmverity(args: &[ApkDmverityArgument]) -> Result<Child> {
+    let mut cmd = Command::new(APKDMVERITY_BIN);
+
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+
+    for argument in args {
+        cmd.arg("--apk").arg(argument.apk).arg(argument.idsig).arg(argument.name);
+    }
+
+    cmd.spawn().context("Spawn apkdmverity")
+}
+
+fn run_zipfuse(option: &str, zip_path: &Path, mount_dir: &Path) -> Result<Child> {
+    Command::new(ZIPFUSE_BIN)
+        .arg("-o")
+        .arg(option)
+        .arg(zip_path)
+        .arg(mount_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("Spawn zipfuse")
 }
 
 // Verify payload before executing it. For APK payload, Full verification (which is slow) is done
@@ -149,14 +227,17 @@ fn verify_payload(
     }
 
     // Start apkdmverity and wait for the dm-verify block
-    system_properties::write("ctl.start", "apkdmverity")?;
+    let mut apkdmverity_child = run_apkdmverity(&[APK_DM_VERITY_ARGUMENT])?;
 
     // While waiting for apkdmverity to mount APK, gathers public keys and root digests from
     // APEX payload.
     let apex_data_from_payload = get_apex_data_from_payload(metadata)?;
     if let Some(saved_data) = saved_data.map(|d| &d.apex_data) {
         // We don't support APEX updates. (assuming that update will change root digest)
-        ensure!(saved_data == &apex_data_from_payload, "APEX payloads has changed.");
+        ensure!(
+            saved_data == &apex_data_from_payload,
+            MicrodroidError::PayloadChanged(String::from("APEXes have changed."))
+        );
         let apex_metadata = to_metadata(&apex_data_from_payload);
         // Pass metadata(with public keys and root digests) to apexd so that it uses the passed
         // metadata instead of the default one (/dev/block/by-name/payload-metadata)
@@ -170,7 +251,8 @@ fn verify_payload(
     // Start apexd to activate APEXes
     system_properties::write("ctl.start", "apexd-vm")?;
 
-    ioutil::wait_for_file(DM_MOUNTED_APK_PATH, WAIT_TIMEOUT)?;
+    // TODO(inseob): add timeout
+    apkdmverity_child.wait()?;
 
     // Do the full verification if the root_hash is un-trustful. This requires the full scanning of
     // the APK file and therefore can be very slow if the APK is large. Note that this step is
@@ -178,7 +260,10 @@ fn verify_payload(
     // of the VM or APK was updated in the host.
     // TODO(jooyung): consider multithreading to make this faster
     let apk_pubkey = if !root_hash_trustful {
-        verify(DM_MOUNTED_APK_PATH).context(format!("failed to verify {}", DM_MOUNTED_APK_PATH))?
+        verify(DM_MOUNTED_APK_PATH).context(MicrodroidError::PayloadVerificationFailed(format!(
+            "failed to verify {}",
+            DM_MOUNTED_APK_PATH
+        )))?
     } else {
         get_public_key_der(DM_MOUNTED_APK_PATH)?
     };

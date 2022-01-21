@@ -412,7 +412,7 @@ public final class AuthFsHostTest extends VirtualizationTestCaseBase {
         // Setup
         String authfsInputDir = MOUNT_DIR + "/3";
         runFdServerOnAndroid("--open-dir 3:/system", "--ro-dirs 3");
-        // TODO(203251769): Replace /dev/null with real manifest file when it's generated. We
+        // TODO(206869687): Replace /dev/null with real manifest file when it's generated. We
         // currently hard-coded the files for the test manually, and ignore the integrity check.
         runAuthFsOnMicrodroid("--remote-ro-dir 3:/dev/null:/system --cid " + VMADDR_CID_HOST);
 
@@ -430,13 +430,25 @@ public final class AuthFsHostTest extends VirtualizationTestCaseBase {
         // Setup
         String authfsInputDir = MOUNT_DIR + "/3";
         runFdServerOnAndroid("--open-dir 3:/system", "--ro-dirs 3");
-        // TODO(203251769): Replace /dev/null with real manifest file when it's generated. We
+        // TODO(206869687): Replace /dev/null with real manifest file when it's generated. We
         // currently hard-coded the files for the test manually, and ignore the integrity check.
         runAuthFsOnMicrodroid("--remote-ro-dir 3:/dev/null:/system --cid " + VMADDR_CID_HOST);
 
         // Verify
         runOnMicrodroid("test -f " + authfsInputDir + "/system/framework/services.jar");
         assertFailedOnMicrodroid("test -f " + authfsInputDir + "/system/bin/sh");
+    }
+
+    @Test
+    public void testStatfs() throws Exception {
+        // Setup
+        runFdServerOnAndroid("--open-dir 3:" + TEST_OUTPUT_DIR, "--rw-dirs 3");
+        runAuthFsOnMicrodroid("--remote-new-rw-dir 3 --cid " + VMADDR_CID_HOST);
+
+        // Verify
+        // Magic matches. Has only 2 inodes (root and "/3").
+        assertEquals(
+                FUSE_SUPER_MAGIC_HEX + " 2", runOnMicrodroid("stat -f -c '%t %c' " + MOUNT_DIR));
     }
 
     private void expectBackingFileConsistency(
