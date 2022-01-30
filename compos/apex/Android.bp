@@ -46,7 +46,6 @@ apex {
         "compos_verify_key",
         "composd",
         "composd_cmd",
-        "pvm_exec", // deprecated
 
         // Used in VM
         "compsvc",
@@ -59,7 +58,6 @@ apex {
     ],
 
     prebuilts: [
-        "CompOSPayloadApp.apk.idsig",
         "com.android.compos.init.rc",
     ],
 }
