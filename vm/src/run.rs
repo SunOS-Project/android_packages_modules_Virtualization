@@ -17,7 +17,8 @@
 use crate::create_partition::command_create_partition;
 use crate::sync::AtomicFlag;
 use android_system_virtualizationservice::aidl::android::system::virtualizationservice::{
-    IVirtualMachine::IVirtualMachine, IVirtualMachineCallback::BnVirtualMachineCallback,
+    DeathReason::DeathReason, IVirtualMachine::IVirtualMachine,
+    IVirtualMachineCallback::BnVirtualMachineCallback,
     IVirtualMachineCallback::IVirtualMachineCallback,
     IVirtualizationService::IVirtualizationService, PartitionType::PartitionType,
     VirtualMachineAppConfig::DebugLevel::DebugLevel,
@@ -50,6 +51,8 @@ pub fn command_run_app(
     log_path: Option<&Path>,
     debug_level: DebugLevel,
     mem: Option<u32>,
+    cpus: Option<u32>,
+    cpu_affinity: Option<String>,
     extra_idsigs: &[PathBuf],
 ) -> Result<(), Error> {
     let extra_apks = parse_extra_apk_list(apk, config_path)?;
@@ -98,6 +101,8 @@ pub fn command_run_app(
         configPath: config_path.to_owned(),
         debugLevel: debug_level,
         memoryMib: mem.unwrap_or(0) as i32, // 0 means use the VM default
+        numCpus: cpus.unwrap_or(1) as i32,
+        cpuAffinity: cpu_affinity,
     });
     run(
         service,
@@ -116,6 +121,8 @@ pub fn command_run(
     daemonize: bool,
     console_path: Option<&Path>,
     mem: Option<u32>,
+    cpus: Option<u32>,
+    cpu_affinity: Option<String>,
 ) -> Result<(), Error> {
     let config_file = File::open(config_path).context("Failed to open config file")?;
     let mut config =
@@ -123,6 +130,10 @@ pub fn command_run(
     if let Some(mem) = mem {
         config.memoryMib = mem as i32;
     }
+    if let Some(cpus) = cpus {
+        config.numCpus = cpus as i32;
+    }
+    config.cpuAffinity = cpu_affinity;
     run(
         service,
         &VirtualMachineConfig::RawConfig(config),
@@ -276,13 +287,17 @@ impl IVirtualMachineCallback for VirtualMachineCallback {
         Ok(())
     }
 
-    fn onDied(&self, _cid: i32) -> BinderResult<()> {
-        // No need to explicitly report the event to the user (e.g. via println!) because this
-        // callback is registered only when the vm tool is invoked as interactive mode (e.g. not
-        // --daemonize) in which case the tool will exit to the shell prompt upon VM shutdown.
-        // Printing something will actually even confuse the user as the output from the app
-        // payload is printed.
+    fn onDied(&self, _cid: i32, reason: DeathReason) -> BinderResult<()> {
         self.dead.raise();
+
+        match reason {
+            DeathReason::SHUTDOWN => println!("VM shutdown cleanly."),
+            DeathReason::REBOOT => println!("VM tried to reboot, possibly due to a kernel panic."),
+            DeathReason::KILLED => println!("VM was killed."),
+            DeathReason::UNKNOWN => println!("VM died for an unknown reason."),
+            DeathReason::INFRASTRUCTURE_ERROR => println!("Error waiting for VM to finish."),
+            _ => println!("VM died for an unrecognised reason."),
+        }
         Ok(())
     }
 }

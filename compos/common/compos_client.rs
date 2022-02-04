@@ -19,6 +19,7 @@
 use crate::timeouts::timeouts;
 use crate::{COMPOS_APEX_ROOT, COMPOS_DATA_ROOT, COMPOS_VSOCK_PORT, DEFAULT_VM_CONFIG_PATH};
 use android_system_virtualizationservice::aidl::android::system::virtualizationservice::{
+    DeathReason::DeathReason,
     IVirtualMachine::IVirtualMachine,
     IVirtualMachineCallback::{BnVirtualMachineCallback, IVirtualMachineCallback},
     IVirtualizationService::IVirtualizationService,
@@ -38,6 +39,7 @@ use compos_aidl_interface::aidl::com::android::compos::ICompOsService::ICompOsSe
 use log::{info, warn};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::num::NonZeroU32;
 use std::os::raw;
 use std::os::unix::io::IntoRawFd;
 use std::path::Path;
@@ -56,6 +58,11 @@ pub struct VmInstance {
 pub struct VmParameters {
     /// Whether the VM should be debuggable.
     pub debug_mode: bool,
+    /// Number of vCPUs to have in the VM. If None, defaults to 1.
+    pub cpus: Option<NonZeroU32>,
+    /// Comma separated list of host CPUs where vCPUs are assigned to. If None, any host CPU can be
+    /// used to run any vCPU.
+    pub cpu_set: Option<String>,
     /// If present, overrides the path to the VM config JSON file
     pub config_path: Option<String>,
 }
@@ -73,6 +80,7 @@ impl VmInstance {
         service: &dyn IVirtualizationService,
         instance_image: File,
         idsig: &Path,
+        idsig_manifest_apk: &Path,
         parameters: &VmParameters,
     ) -> Result<VmInstance> {
         let instance_fd = ParcelFileDescriptor::new(instance_image);
@@ -83,19 +91,12 @@ impl VmInstance {
         let apk_fd = File::open(apex_dir.join("app/CompOSPayloadApp/CompOSPayloadApp.apk"))
             .context("Failed to open config APK file")?;
         let apk_fd = ParcelFileDescriptor::new(apk_fd);
+        let idsig_fd = prepare_idsig(service, &apk_fd, idsig)?;
 
-        if !idsig.exists() {
-            // Prepare idsig file via VirtualizationService
-            let idsig_file = File::create(idsig).context("Failed to create idsig file")?;
-            let idsig_fd = ParcelFileDescriptor::new(idsig_file);
-            service
-                .createOrUpdateIdsigFile(&apk_fd, &idsig_fd)
-                .context("Failed to update idsig file")?;
-        }
-
-        // Open idsig as read-only
-        let idsig_file = File::open(idsig).context("Failed to open idsig file")?;
-        let idsig_fd = ParcelFileDescriptor::new(idsig_file);
+        let manifest_apk_fd = File::open("/system/etc/security/fsverity/BuildManifest.apk")
+            .context("Failed to open build manifest APK file")?;
+        let manifest_apk_fd = ParcelFileDescriptor::new(manifest_apk_fd);
+        let idsig_manifest_apk_fd = prepare_idsig(service, &manifest_apk_fd, idsig_manifest_apk)?;
 
         let (console_fd, log_fd, debug_level) = if parameters.debug_mode {
             // Console output and the system log output from the VM are redirected to file.
@@ -117,6 +118,9 @@ impl VmInstance {
             instanceImage: Some(instance_fd),
             configPath: config_path.to_owned(),
             debugLevel: debug_level,
+            extraIdsigs: vec![idsig_manifest_apk_fd],
+            numCpus: parameters.cpus.map_or(1, NonZeroU32::get) as i32,
+            cpuAffinity: parameters.cpu_set.clone(),
             ..Default::default()
         });
 
@@ -163,6 +167,26 @@ impl VmInstance {
         // TODO: Do we actually need/use this?
         self.cid
     }
+}
+
+fn prepare_idsig(
+    service: &dyn IVirtualizationService,
+    apk_fd: &ParcelFileDescriptor,
+    idsig_path: &Path,
+) -> Result<ParcelFileDescriptor> {
+    if !idsig_path.exists() {
+        // Prepare idsig file via VirtualizationService
+        let idsig_file = File::create(idsig_path).context("Failed to create idsig file")?;
+        let idsig_fd = ParcelFileDescriptor::new(idsig_file);
+        service
+            .createOrUpdateIdsigFile(apk_fd, &idsig_fd)
+            .context("Failed to update idsig file")?;
+    }
+
+    // Open idsig as read-only
+    let idsig_file = File::open(idsig_path).context("Failed to open idsig file")?;
+    let idsig_fd = ParcelFileDescriptor::new(idsig_file);
+    Ok(idsig_fd)
 }
 
 struct VsockFactory<'a> {
@@ -274,9 +298,9 @@ struct VmCallback(Arc<VmStateMonitor>);
 impl Interface for VmCallback {}
 
 impl IVirtualMachineCallback for VmCallback {
-    fn onDied(&self, cid: i32) -> BinderResult<()> {
+    fn onDied(&self, cid: i32, reason: DeathReason) -> BinderResult<()> {
         self.0.set_died();
-        log::warn!("VM died, cid = {}", cid);
+        log::warn!("VM died, cid = {}, reason = {:?}", cid, reason);
         Ok(())
     }
 

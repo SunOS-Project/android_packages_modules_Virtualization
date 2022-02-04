@@ -25,6 +25,7 @@ import static org.junit.Assume.assumeThat;
 import static java.nio.file.StandardCopyOption.REPLACE_EXISTING;
 
 import android.content.Context;
+import android.os.Build;
 import android.os.ParcelFileDescriptor;
 import android.system.virtualmachine.VirtualMachine;
 import android.system.virtualmachine.VirtualMachineCallback;
@@ -104,7 +105,7 @@ public class MicrodroidTests {
         void forceStop(VirtualMachine vm) {
             try {
                 vm.stop();
-                this.onDied(vm);
+                this.onDied(vm, VirtualMachineCallback.DEATH_REASON_KILLED);
                 mExecutorService.shutdown();
             } catch (VirtualMachineException e) {
                 throw new RuntimeException(e);
@@ -124,13 +125,27 @@ public class MicrodroidTests {
         public void onError(VirtualMachine vm, int errorCode, String message) {}
 
         @Override
-        public void onDied(VirtualMachine vm) {}
+        public void onDied(VirtualMachine vm, @DeathReason int reason) {}
     }
+
+    private static final int MIN_MEM_ARM64 = 135;
+    private static final int MIN_MEM_X86_64 = 196;
 
     @Test
     public void startAndStop() throws VirtualMachineException, InterruptedException {
         VirtualMachineConfig.Builder builder =
                 new VirtualMachineConfig.Builder(mInner.mContext, "assets/vm_config.json");
+        if (Build.SUPPORTED_ABIS.length > 0) {
+            String primaryAbi = Build.SUPPORTED_ABIS[0];
+            switch(primaryAbi) {
+                case "x86_64":
+                    builder.memoryMib(MIN_MEM_X86_64);
+                    break;
+                case "arm64-v8a":
+                    builder.memoryMib(MIN_MEM_ARM64);
+                    break;
+            }
+        }
         VirtualMachineConfig config = builder.build();
 
         mInner.mVm = mInner.mVmm.getOrCreate("test_vm", config);
@@ -151,7 +166,7 @@ public class MicrodroidTests {
                     }
 
                     @Override
-                    public void onDied(VirtualMachine vm) {
+                    public void onDied(VirtualMachine vm, @DeathReason int reason) {
                         assertTrue(mPayloadReadyCalled);
                         assertTrue(mPayloadStartedCalled);
                     }
@@ -212,7 +227,7 @@ public class MicrodroidTests {
                     }
 
                     @Override
-                    public void onDied(VirtualMachine vm) {
+                    public void onDied(VirtualMachine vm, @DeathReason int reason) {
                         assertFalse(mPayloadStarted);
                         assertTrue(mErrorOccurred);
                     }

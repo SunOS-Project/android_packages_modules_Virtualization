@@ -22,6 +22,7 @@ use crate::selinux::{SeContext, getfilecon};
 use ::binder::unstable_api::AsNative;
 use android_os_permissions_aidl::aidl::android::os::IPermissionController;
 use android_system_virtualizationservice::aidl::android::system::virtualizationservice::{
+    DeathReason::DeathReason,
     DiskImage::DiskImage,
     IVirtualMachine::{BnVirtualMachine, IVirtualMachine},
     IVirtualMachineCallback::IVirtualMachineCallback,
@@ -53,6 +54,7 @@ use kvm::{Kvm, Cap};
 use log::{debug, error, info, warn};
 use microdroid_payload_config::VmPayloadConfig;
 use rustutils::system_properties;
+use statslog_virtualization_rust::vm_creation_requested::{stats_write, Hypervisor};
 use std::convert::TryInto;
 use std::ffi::CStr;
 use std::fs::{create_dir, File, OpenOptions};
@@ -146,6 +148,9 @@ impl IVirtualizationService for VirtualizationService {
         // Make directory for temporary files.
         let temporary_directory: PathBuf = format!("{}/{}", TEMPORARY_DIRECTORY, cid).into();
         create_dir(&temporary_directory).map_err(|e| {
+            // At this point, we do not know the protected status of Vm
+            // setting it to false, though this may not be correct.
+            write_vm_creation_stats(false, false);
             error!(
                 "Failed to create temporary directory {:?} for VM files: {}",
                 temporary_directory, e
@@ -185,6 +190,9 @@ impl IVirtualizationService for VirtualizationService {
             VirtualMachineConfig::AppConfig(config) => BorrowedOrOwned::Owned(
                 load_app_config(config, &temporary_directory).map_err(|e| {
                     error!("Failed to load app config from {}: {}", &config.configPath, e);
+                    // At this point, we do not know the protected status of Vm
+                    // setting it to false, though this may not be correct.
+                    write_vm_creation_stats(false, false);
                     new_binder_exception(
                         ExceptionCode::SERVICE_SPECIFIC,
                         format!("Failed to load app config from {}: {}", &config.configPath, e),
@@ -194,6 +202,7 @@ impl IVirtualizationService for VirtualizationService {
             VirtualMachineConfig::RawConfig(config) => BorrowedOrOwned::Borrowed(config),
         };
         let config = config.as_ref();
+        let protected_vm = config.protectedVm;
 
         // Check if partition images are labeled incorrectly. This is to prevent random images
         // which are not protected by the Android Verified Boot (e.g. bits downloaded by apps) from
@@ -217,6 +226,7 @@ impl IVirtualizationService for VirtualizationService {
         let zero_filler_path = temporary_directory.join("zero.img");
         write_zero_filler(&zero_filler_path).map_err(|e| {
             error!("Failed to make composite image: {}", e);
+            write_vm_creation_stats(protected_vm, false);
             new_binder_exception(
                 ExceptionCode::SERVICE_SPECIFIC,
                 format!("Failed to make composite image: {}", e),
@@ -266,6 +276,8 @@ impl IVirtualizationService for VirtualizationService {
             params: config.params.to_owned(),
             protected,
             memory_mib: config.memoryMib.try_into().ok().and_then(NonZeroU32::new),
+            cpus: config.numCpus.try_into().ok().and_then(NonZeroU32::new),
+            cpu_affinity: config.cpuAffinity.clone(),
             console_fd,
             log_fd,
             indirect_files,
@@ -280,6 +292,7 @@ impl IVirtualizationService for VirtualizationService {
             )
             .map_err(|e| {
                 error!("Failed to create VM with config {:?}: {}", config, e);
+                write_vm_creation_stats(protected_vm, false);
                 new_binder_exception(
                     ExceptionCode::SERVICE_SPECIFIC,
                     format!("Failed to create VM: {}", e),
@@ -287,6 +300,7 @@ impl IVirtualizationService for VirtualizationService {
             })?,
         );
         state.add_vm(Arc::downgrade(&instance));
+        write_vm_creation_stats(protected_vm, true);
         Ok(VirtualMachine::create(instance))
     }
 
@@ -435,6 +449,16 @@ impl VirtualizationService {
     }
 }
 
+/// Write the stats of VMCreation to statsd
+fn write_vm_creation_stats(protected: bool, success: bool) {
+    match stats_write(Hypervisor::Pkvm, protected, success) {
+        Err(e) => {
+            info!("stastlog_rust fails with error: {}", e);
+        }
+        Ok(_) => info!("stastlog_rust succeeded for virtualization service"),
+    }
+}
+
 /// Waits for incoming connections from VM. If a new connection is made, stores the stream in the
 /// corresponding `VmInstance`.
 fn handle_stream_connection_from_vm(state: Arc<Mutex<State>>) -> Result<()> {
@@ -562,6 +586,9 @@ fn load_app_config(
     if config.memoryMib > 0 {
         vm_config.memoryMib = config.memoryMib;
     }
+
+    vm_config.numCpus = config.numCpus;
+    vm_config.cpuAffinity = config.cpuAffinity.clone();
 
     // Microdroid requires an additional payload disk image and the bootconfig partition.
     if os_name == "microdroid" {
@@ -785,10 +812,10 @@ impl VirtualMachineCallbacks {
     }
 
     /// Call all registered callbacks to say that the VM has died.
-    pub fn callback_on_died(&self, cid: Cid) {
+    pub fn callback_on_died(&self, cid: Cid, reason: DeathReason) {
         let callbacks = &*self.0.lock().unwrap();
         for callback in callbacks {
-            if let Err(e) = callback.onDied(cid as i32) {
+            if let Err(e) = callback.onDied(cid as i32, reason) {
                 error!("Error notifying exit of VM CID {}: {}", cid, e);
             }
         }
