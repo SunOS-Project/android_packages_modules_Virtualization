@@ -24,11 +24,11 @@ rust_defaults {
         "liblog_rust",
         "libminijail_rust",
         "libnix",
-        "libnum_cpus",
         "libodsign_proto_rust",
         "libprotobuf",
         "libregex",
         "libring",
+        "librustutils",
         "libscopeguard",
     ],
     prefer_rlib: true,
@@ -49,5 +49,5 @@ rust_binary {
 rust_test {
     name: "compsvc_device_tests",
     defaults: ["compsvc_defaults"],
-    test_suites: ["device-tests"],
+    test_suites: ["general-tests"],
 }
