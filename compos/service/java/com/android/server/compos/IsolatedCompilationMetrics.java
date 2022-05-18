@@ -76,6 +76,7 @@ class IsolatedCompilationMetrics {
     private long mCompilationStartTimeMs = 0;
 
     public static void onCompilationScheduled(@ScheduleJobResult int result) {
+        // TODO(b/218525257): write to ArtStatsLog instead of logcat
         ArtStatsLog.write(ArtStatsLog.ISOLATED_COMPILATION_SCHEDULED, result);
         Log.i(TAG, "ISOLATED_COMPILATION_SCHEDULED: " + result);
     }
@@ -89,6 +90,7 @@ class IsolatedCompilationMetrics {
                 : SystemClock.elapsedRealtime() - mCompilationStartTimeMs;
         mCompilationStartTimeMs = 0;
 
+        // TODO(b/218525257): write to ArtStatsLog instead of logcat
         ArtStatsLog.write(ArtStatsLog.ISOLATED_COMPILATION_ENDED, compilationTime, result);
         Log.i(TAG, "ISOLATED_COMPILATION_ENDED: " + result + ", " + compilationTime);
     }

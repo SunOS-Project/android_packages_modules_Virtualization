@@ -12,18 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! pVM firmware.
+//! Functions for shutting down the VM.
 
-#![no_main]
-#![no_std]
+use psci::{system_off, system_reset};
 
-mod exceptions;
+/// Makes a `PSCI_SYSTEM_OFF` call to shutdown the VM.
+///
+/// Panics if it returns an error.
+pub fn shutdown() -> ! {
+    system_off().unwrap();
+    #[allow(clippy::empty_loop)]
+    loop {}
+}
 
-use vmbase::{main, println};
-
-main!(main);
-
-/// Entry point for pVM firmware.
-pub fn main() {
-    println!("Hello world");
+/// Makes a `PSCI_SYSTEM_RESET` call to shutdown the VM abnormally.
+///
+/// Panics if it returns an error.
+pub fn reboot() -> ! {
+    system_reset().unwrap();
+    #[allow(clippy::empty_loop)]
+    loop {}
 }

@@ -12,18 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! pVM firmware.
+//! Basic functionality for bare-metal binaries to run in a VM under crosvm.
 
-#![no_main]
 #![no_std]
 
-mod exceptions;
+pub mod console;
+mod entry;
+pub mod power;
+pub mod uart;
 
-use vmbase::{main, println};
+use core::panic::PanicInfo;
+use power::reboot;
 
-main!(main);
-
-/// Entry point for pVM firmware.
-pub fn main() {
-    println!("Hello world");
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    eprintln!("{}", info);
+    reboot()
 }

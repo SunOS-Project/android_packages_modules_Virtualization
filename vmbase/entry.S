@@ -145,8 +145,12 @@ entry:
 	adr_l x30, boot_stack_end
 	mov sp, x30
 
+	/* Set up exception vector. */
+	adr x30, vector_table_el1
+	msr vbar_el1, x30
+
 	/* Call into Rust code. */
-	bl main
+	bl rust_entry
 
 	/* Loop forever waiting for interrupts. */
 4:	wfi
