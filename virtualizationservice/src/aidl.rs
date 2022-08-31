@@ -479,6 +479,7 @@ impl VirtualizationService {
             log_fd,
             indirect_files,
             platform_version: parse_platform_version_req(&config.platformVersion)?,
+            detect_hangup: is_app_config,
         };
         let instance = Arc::new(
             VmInstance::new(
@@ -1090,7 +1091,7 @@ impl IVirtualMachineService for VirtualMachineService {
             vm.callbacks.notify_error(cid, error_code, message);
             Ok(())
         } else {
-            error!("notifyPayloadStarted is called from an unknown CID {}", cid);
+            error!("notifyError is called from an unknown CID {}", cid);
             Err(new_binder_exception(
                 ExceptionCode::SERVICE_SPECIFIC,
                 format!("cannot find a VM with CID {}", cid),
