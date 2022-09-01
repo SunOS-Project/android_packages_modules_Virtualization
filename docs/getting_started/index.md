@@ -39,30 +39,29 @@ Once upgraded to Android 13, execute the following command to enable pKVM.
 
 ```shell
 adb reboot bootloader
+fastboot flashing unlock
 fastboot oem pkvm enable
 fastboot reboot
 ```
 
 Due to a bug in Android 13 for these devices, pKVM may stop working after an
 [OTA update](https://source.android.com/devices/tech/ota). To prevent this, it
-is necessary to manually replicate the `pvmfw` partition across A/B slots:
+is necessary to manually replicate the `pvmfw` partition to the other slot:
 
 ```shell
-adb root
-SLOT=$(adb shell getprop ro.boot.slot_suffix)
-adb pull /dev/block/by-name/pvmfw${SLOT} pvmfw.img
+git -C <android_root>/packages/modules/Virtualization
+show de6b0b2ecf6225a0a7b43241de27e74fc3e6ceb2:pvmfw/pvmfw.img > /tmp/pvmfw.img
 adb reboot bootloader
-fastboot --slot other flash pvmfw pvmfw.img
+fastboot --slot other flash pvmfw /tmp/pvmfw.img
 fastboot reboot
 ```
 
 Otherwise, if an OTA has already made pKVM unusable, the working partition
-should be copied over from the "other" slot:
+should be copied to the "current" slot:
 
 ```shell
-adb pull $(adb shell ls "/dev/block/by-name/pvmfw!(${SLOT})") pvmfw.img
 adb reboot bootloader
-fastboot flash pvmfw pvmfw.img
+fastboot flash pvmfw /tmp/pvmfw.img
 fastboot reboot
 ```
 
@@ -141,25 +140,25 @@ adb install out/dist/com.android.virt.apex
 adb reboot
 ```
 
-## Building and updating GKI inside Microdroid
+## Building and updating kernel inside Microdroid
 
 Checkout the Android common kernel and build it following the [official
 guideline](https://source.android.com/setup/build/building-kernels).
 
 ```shell
 mkdir android-kernel && cd android-kernel
-repo init -u https://android.googlesource.com/kernel/manifest -b common-android13-5.15
+repo init -u https://android.googlesource.com/kernel/manifest -b common-android14-5.15
 repo sync
-FAST_BUILD=1 DIST_DIR=out/dist BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh -j80
+FAST_BUILD=1 DIST_DIR=out/dist BUILD_CONFIG=common/build.config.microdroid.aarch64 build/build.sh -j80
 ```
 
-Replace `build.config.gki.aarch64` with `build.config.gki.x86_64` if building
+Replace `build.config.microdroid.aarch64` with `build.config.microdroid.x86_64` if building
 for x86.
 
 Then copy the built kernel to the Android source tree.
 
 ```
-cp out/dist/Image <android_root>/kernel/prebuilts/5.15/arm64/kernel-5.15
+cp out/dist/Image <android_root>/packages/modules/Virtualization/microdroid/kernel/arm64/kernel-5.15
 ```
 
 Finally rebuild the `com.android.virt` APEX and install it by following the
