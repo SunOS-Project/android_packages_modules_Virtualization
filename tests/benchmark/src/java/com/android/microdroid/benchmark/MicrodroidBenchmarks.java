@@ -20,25 +20,14 @@ import static androidx.test.platform.app.InstrumentationRegistry.getInstrumentat
 import static com.google.common.truth.Truth.assertThat;
 import static com.google.common.truth.TruthJUnit.assume;
 
-import static org.junit.Assume.assumeNoException;
-
 import android.app.Instrumentation;
-import android.content.Context;
 import android.os.Bundle;
-import android.os.ParcelFileDescriptor;
 import android.os.SystemProperties;
-import android.sysprop.HypervisorProperties;
-import android.system.virtualizationservice.DeathReason;
-import android.system.virtualmachine.VirtualMachine;
-import android.system.virtualmachine.VirtualMachineCallback;
 import android.system.virtualmachine.VirtualMachineConfig;
 import android.system.virtualmachine.VirtualMachineConfig.DebugLevel;
 import android.system.virtualmachine.VirtualMachineException;
-import android.system.virtualmachine.VirtualMachineManager;
-import android.util.Log;
 
-import androidx.annotation.CallSuper;
-import androidx.test.core.app.ApplicationProvider;
+import com.android.microdroid.test.MicrodroidDeviceTestBase;
 
 import org.junit.After;
 import org.junit.Before;
@@ -48,56 +37,30 @@ import org.junit.rules.Timeout;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 
-import java.io.BufferedReader;
+import java.io.File;
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
+import java.nio.file.Files;
 
 @RunWith(Parameterized.class)
-public class MicrodroidBenchmarks {
+public class MicrodroidBenchmarks extends MicrodroidDeviceTestBase {
     private static final String TAG = "MicrodroidBenchmarks";
 
     @Rule public Timeout globalTimeout = Timeout.seconds(300);
 
     private static final String KERNEL_VERSION = SystemProperties.get("ro.kernel.version");
 
-    /** Copy output from the VM to logcat. This is helpful when things go wrong. */
-    private static void logVmOutput(InputStream vmOutputStream, String name) {
-        new Thread(
-                () -> {
-                    try {
-                        BufferedReader reader =
-                                new BufferedReader(new InputStreamReader(vmOutputStream));
-                        String line;
-                        while ((line = reader.readLine()) != null
-                                && !Thread.interrupted()) {
-                            Log.i(TAG, name + ": " + line);
-                        }
-                    } catch (Exception e) {
-                        Log.w(TAG, name, e);
-                    }
-                }).start();
-    }
+    private static final String APEX_ETC_FS = "/apex/com.android.virt/etc/fs/";
+    private static final double SIZE_MB = 1024.0 * 1024.0;
+    private static final String MICRODROID_IMG_PREFIX = "microdroid_";
+    private static final String MICRODROID_IMG_SUFFIX = ".img";
 
-    private static class Inner {
-        public boolean mProtectedVm;
-        public Context mContext;
-        public VirtualMachineManager mVmm;
-        public VirtualMachine mVm;
-
-        Inner(boolean protectedVm) {
-            mProtectedVm = protectedVm;
-        }
-
-        /** Create a new VirtualMachineConfig.Builder with the parameterized protection mode. */
-        public VirtualMachineConfig.Builder newVmConfigBuilder(String payloadConfigPath) {
-            return new VirtualMachineConfig.Builder(mContext, payloadConfigPath)
-                    .protectedVm(mProtectedVm);
-        }
+    private boolean isCuttlefish() {
+        String productName = SystemProperties.get("ro.product.name");
+        return (null != productName)
+                && (productName.startsWith("aosp_cf_x86")
+                        || productName.startsWith("aosp_cf_arm")
+                        || productName.startsWith("cf_x86")
+                        || productName.startsWith("cf_arm"));
     }
 
     @Parameterized.Parameters(name = "protectedVm={0}")
@@ -107,125 +70,17 @@ public class MicrodroidBenchmarks {
 
     @Parameterized.Parameter public boolean mProtectedVm;
 
-    private boolean mPkvmSupported = false;
-    private Inner mInner;
-
     private Instrumentation mInstrumentation;
 
     @Before
     public void setup() {
-        // In case when the virt APEX doesn't exist on the device, classes in the
-        // android.system.virtualmachine package can't be loaded. Therefore, before using the
-        // classes, check the existence of a class in the package and skip this test if not exist.
-        try {
-            Class.forName("android.system.virtualmachine.VirtualMachineManager");
-            mPkvmSupported = true;
-        } catch (ClassNotFoundException e) {
-            assumeNoException(e);
-            return;
-        }
-        if (mProtectedVm) {
-            assume().withMessage("Skip where protected VMs aren't support")
-                    .that(HypervisorProperties.hypervisor_protected_vm_supported().orElse(false))
-                    .isTrue();
-        } else {
-            assume().withMessage("Skip where VMs aren't support")
-                    .that(HypervisorProperties.hypervisor_vm_supported().orElse(false))
-                    .isTrue();
-        }
-        mInner = new Inner(mProtectedVm);
-        mInner.mContext = ApplicationProvider.getApplicationContext();
-        mInner.mVmm = VirtualMachineManager.getInstance(mInner.mContext);
+        prepareTestSetup(mProtectedVm);
         mInstrumentation = getInstrumentation();
     }
 
     @After
     public void cleanup() throws VirtualMachineException {
-        if (!mPkvmSupported) {
-            return;
-        }
-        if (mInner == null) {
-            return;
-        }
-        if (mInner.mVm == null) {
-            return;
-        }
-        mInner.mVm.stop();
-        mInner.mVm.delete();
-    }
-
-    private abstract static class VmEventListener implements VirtualMachineCallback {
-        private ExecutorService mExecutorService = Executors.newSingleThreadExecutor();
-
-        void runToFinish(VirtualMachine vm) throws VirtualMachineException, InterruptedException {
-            vm.setCallback(mExecutorService, this);
-            vm.run();
-            logVmOutput(vm.getConsoleOutputStream(), "Console");
-            logVmOutput(vm.getLogOutputStream(), "Log");
-            mExecutorService.awaitTermination(300, TimeUnit.SECONDS);
-        }
-
-        void forceStop(VirtualMachine vm) {
-            try {
-                vm.clearCallback();
-                vm.stop();
-                mExecutorService.shutdown();
-            } catch (VirtualMachineException e) {
-                throw new RuntimeException(e);
-            }
-        }
-
-        @Override
-        public void onPayloadStarted(VirtualMachine vm, ParcelFileDescriptor stream) {}
-
-        @Override
-        public void onPayloadReady(VirtualMachine vm) {}
-
-        @Override
-        public void onPayloadFinished(VirtualMachine vm, int exitCode) {}
-
-        @Override
-        public void onError(VirtualMachine vm, int errorCode, String message) {}
-
-        @Override
-        @CallSuper
-        public void onDied(VirtualMachine vm, @DeathReason int reason) {
-            mExecutorService.shutdown();
-        }
-    }
-
-    private static class BootResult {
-        public final boolean payloadStarted;
-        public final int deathReason;
-
-        BootResult(boolean payloadStarted, int deathReason) {
-            this.payloadStarted = payloadStarted;
-            this.deathReason = deathReason;
-        }
-    }
-
-    private BootResult tryBootVm(String vmName)
-            throws VirtualMachineException, InterruptedException {
-        mInner.mVm = mInner.mVmm.get(vmName); // re-load the vm before running tests
-        final CompletableFuture<Boolean> payloadStarted = new CompletableFuture<>();
-        final CompletableFuture<Integer> deathReason = new CompletableFuture<>();
-        VmEventListener listener =
-                new VmEventListener() {
-                    @Override
-                    public void onPayloadStarted(VirtualMachine vm, ParcelFileDescriptor stream) {
-                        payloadStarted.complete(true);
-                        forceStop(vm);
-                    }
-
-                    @Override
-                    public void onDied(VirtualMachine vm, int reason) {
-                        deathReason.complete(reason);
-                        super.onDied(vm, reason);
-                    }
-                };
-        listener.runToFinish(mInner.mVm);
-        return new BootResult(
-                payloadStarted.getNow(false), deathReason.getNow(DeathReason.INFRASTRUCTURE_ERROR));
+        cleanupTestSetup();
     }
 
     private boolean canBootMicrodroidWithMemory(int mem)
@@ -234,18 +89,13 @@ public class MicrodroidBenchmarks {
 
         // returns true if succeeded at least once.
         for (int i = 0; i < trialCount; i++) {
-            VirtualMachine existingVm = mInner.mVmm.get("test_vm_minimum_memory");
-            if (existingVm != null) {
-                existingVm.delete();
-            }
-
             VirtualMachineConfig.Builder builder =
                     mInner.newVmConfigBuilder("assets/vm_config.json");
             VirtualMachineConfig normalConfig =
-                    builder.debugLevel(DebugLevel.FULL).memoryMib(mem).build();
-            mInner.mVmm.create("test_vm_minimum_memory", normalConfig);
+                    builder.debugLevel(DebugLevel.NONE).memoryMib(mem).build();
+            mInner.forceCreateNewVirtualMachine("test_vm_minimum_memory", normalConfig);
 
-            if (tryBootVm("test_vm_minimum_memory").payloadStarted) return true;
+            if (tryBootVm(TAG, "test_vm_minimum_memory").payloadStarted) return true;
         }
 
         return false;
@@ -254,11 +104,10 @@ public class MicrodroidBenchmarks {
     @Test
     public void testMinimumRequiredRAM()
             throws VirtualMachineException, InterruptedException, IOException {
+        assume().withMessage("Skip on CF; too slow").that(isCuttlefish()).isFalse();
+
         int lo = 16, hi = 512, minimum = 0;
         boolean found = false;
-
-        // TODO(b/236672526): giving inefficient memory to pVM sometimes causes host crash.
-        assume().withMessage("Skip on pVM. b/236672526").that(mProtectedVm).isFalse();
 
         while (lo <= hi) {
             int mid = (lo + hi) / 2;
@@ -274,7 +123,66 @@ public class MicrodroidBenchmarks {
         assertThat(found).isTrue();
 
         Bundle bundle = new Bundle();
-        bundle.putInt("microdroid_minimum_required_memory", minimum);
+        bundle.putInt("avf_perf/microdroid/minimum_required_memory", minimum);
+        mInstrumentation.sendStatus(0, bundle);
+    }
+
+    @Test
+    public void testMicrodroidBootTime()
+            throws VirtualMachineException, InterruptedException, IOException {
+        assume().withMessage("Skip on CF; too slow").that(isCuttlefish()).isFalse();
+
+        final int trialCount = 10;
+
+        double sum = 0;
+        double squareSum = 0;
+        double min = Double.MAX_VALUE;
+        double max = Double.MIN_VALUE;
+        for (int i = 0; i < trialCount; i++) {
+            VirtualMachineConfig.Builder builder =
+                    mInner.newVmConfigBuilder("assets/vm_config.json");
+            VirtualMachineConfig normalConfig =
+                    builder.debugLevel(DebugLevel.NONE).memoryMib(256).build();
+            mInner.forceCreateNewVirtualMachine("test_vm_boot_time", normalConfig);
+
+            BootResult result = tryBootVm(TAG, "test_vm_boot_time");
+            assertThat(result.payloadStarted).isTrue();
+
+            double elapsedMilliseconds = result.elapsedNanoTime / 1000000.0;
+
+            sum += elapsedMilliseconds;
+            squareSum += elapsedMilliseconds * elapsedMilliseconds;
+            if (min > elapsedMilliseconds) min = elapsedMilliseconds;
+            if (max < elapsedMilliseconds) max = elapsedMilliseconds;
+        }
+
+        Bundle bundle = new Bundle();
+        double average = sum / trialCount;
+        double variance = squareSum / trialCount - average * average;
+        double stdev = Math.sqrt(variance);
+        bundle.putDouble("avf_perf/microdroid/boot_time_average_ms", average);
+        bundle.putDouble("avf_perf/microdroid/boot_time_min_ms", min);
+        bundle.putDouble("avf_perf/microdroid/boot_time_max_ms", max);
+        bundle.putDouble("avf_perf/microdroid/boot_time_stdev_ms", stdev);
+        mInstrumentation.sendStatus(0, bundle);
+    }
+
+    @Test
+    public void testMicrodroidImageSize() throws IOException {
+        Bundle bundle = new Bundle();
+        for (File file : new File(APEX_ETC_FS).listFiles()) {
+            String name = file.getName();
+
+            if (!name.startsWith(MICRODROID_IMG_PREFIX) || !name.endsWith(MICRODROID_IMG_SUFFIX)) {
+                continue;
+            }
+
+            String base = name.substring(MICRODROID_IMG_PREFIX.length(),
+                                         name.length() - MICRODROID_IMG_SUFFIX.length());
+            String metric = "avf_perf/microdroid/img_size_" + base + "_MB";
+            double size = Files.size(file.toPath()) / SIZE_MB;
+            bundle.putDouble(metric, size);
+        }
         mInstrumentation.sendStatus(0, bundle);
     }
 }
