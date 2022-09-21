@@ -27,22 +27,20 @@ use std::convert::TryInto;
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Component, Path, PathBuf, MAIN_SEPARATOR};
 use std::sync::{Arc, RwLock};
 
-use crate::common::OwnedFd;
 use crate::fsverity;
 use authfs_aidl_interface::aidl::com::android::virt::fs::IVirtFdService::{
     BnVirtFdService, FsStat::FsStat, IVirtFdService, MAX_REQUESTING_DATA,
 };
-use authfs_aidl_interface::binder::{
-    BinderFeatures, ExceptionCode, Interface, Result as BinderResult, Status, StatusCode, Strong,
-};
 use authfs_fsverity_metadata::{
     get_fsverity_metadata_path, parse_fsverity_metadata, FSVerityMetadata,
 };
-use binder_common::{new_binder_exception, new_binder_service_specific_error};
+use binder::{
+    BinderFeatures, ExceptionCode, Interface, Result as BinderResult, Status, StatusCode, Strong,
+};
 
 /// Bitflags of forbidden file mode, e.g. setuid, setgid and sticky bit.
 const FORBIDDEN_MODES: Mode = Mode::from_bits_truncate(!0o777);
@@ -107,9 +105,12 @@ impl FdService {
             entry.insert(new_fd_config);
             Ok(new_fd)
         } else {
-            Err(new_binder_exception(
+            Err(Status::new_exception_str(
                 ExceptionCode::ILLEGAL_STATE,
-                format!("The newly created FD {} is already in the pool unexpectedly", new_fd),
+                Some(format!(
+                    "The newly created FD {} is already in the pool unexpectedly",
+                    new_fd
+                )),
             ))
         }
     }
@@ -173,9 +174,9 @@ impl IVirtFdService for FdService {
                     if let Some(signature) = &metadata.signature {
                         Ok(signature.clone())
                     } else {
-                        Err(new_binder_exception(
-                            ExceptionCode::SERVICE_SPECIFIC,
-                            "metadata doesn't contain a signature",
+                        Err(Status::new_service_specific_error_str(
+                            -1,
+                            Some("metadata doesn't contain a signature"),
                         ))
                     }
                 } else {
@@ -395,7 +396,7 @@ fn read_into_buf(file: &File, max_size: usize, offset: u64) -> io::Result<Vec<u8
 }
 
 fn new_errno_error(errno: Errno) -> Status {
-    new_binder_service_specific_error(errno as i32, errno.desc())
+    Status::new_service_specific_error_str(errno as i32, Some(errno.desc()))
 }
 
 fn open_readonly_at(dir_fd: RawFd, path: &Path) -> nix::Result<File> {

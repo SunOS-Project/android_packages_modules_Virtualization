@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022 The Android Open Source Project
+ * Copyright 2022 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,22 +14,15 @@
  * limitations under the License.
  */
 
-use std::fs::File;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+package com.android.microdroid.testservice;
 
-// TODO: Remove if/when std::os::unix::io::OwnedFd is standardized.
-pub struct OwnedFd {
-    owner: File,
-}
+/** {@hide} */
+interface IBenchmarkService {
+    const int SERVICE_PORT = 5677;
 
-impl FromRawFd for OwnedFd {
-    unsafe fn from_raw_fd(fd: RawFd) -> Self {
-        OwnedFd { owner: File::from_raw_fd(fd) }
-    }
-}
+    /** Reads a file and returns the elapsed seconds for the reading. */
+    double readFile(String filename, long fileSizeBytes, boolean isRand);
 
-impl AsRawFd for OwnedFd {
-    fn as_raw_fd(&self) -> RawFd {
-        self.owner.as_raw_fd()
-    }
+    /** Returns an entry from /proc/meminfo. */
+    long getMemInfoEntry(String name);
 }
