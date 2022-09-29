@@ -39,12 +39,11 @@ use binder::{
     self, BinderFeatures, ExceptionCode, Interface, LazyServiceGuard, ParcelFileDescriptor,
     SpIBinder, Status, StatusCode, Strong, ThreadState,
 };
-use android_system_virtualmachineservice::aidl::android::system::virtualmachineservice::{
-    IVirtualMachineService::{
+use android_system_virtualmachineservice::aidl::android::system::virtualmachineservice::IVirtualMachineService::{
         BnVirtualMachineService, IVirtualMachineService, VM_BINDER_SERVICE_PORT,
         VM_STREAM_SERVICE_PORT, VM_TOMBSTONES_SERVICE_PORT,
-    },
 };
+use android_system_virtualizationcommon::aidl::android::system::virtualizationcommon::ErrorCode::ErrorCode;
 use anyhow::{anyhow, bail, Context, Result};
 use rpcbinder::run_rpc_server_with_factory;
 use disk::QcowFile;
@@ -146,7 +145,7 @@ impl IVirtualizationService for VirtualizationService {
         let size = size.try_into().map_err(|e| {
             Status::new_exception_str(
                 ExceptionCode::ILLEGAL_ARGUMENT,
-                Some(format!("Invalid size {}: {}", size, e)),
+                Some(format!("Invalid size {}: {:?}", size, e)),
             )
         })?;
         let image = clone_file(image_fd)?;
@@ -154,13 +153,13 @@ impl IVirtualizationService for VirtualizationService {
         image.set_len(0).map_err(|e| {
             Status::new_service_specific_error_str(
                 -1,
-                Some(format!("Failed to reset a file: {}", e)),
+                Some(format!("Failed to reset a file: {:?}", e)),
             )
         })?;
         let mut part = QcowFile::new(image, size).map_err(|e| {
             Status::new_service_specific_error_str(
                 -1,
-                Some(format!("Failed to create QCOW2 image: {}", e)),
+                Some(format!("Failed to create QCOW2 image: {:?}", e)),
             )
         })?;
 
@@ -175,7 +174,7 @@ impl IVirtualizationService for VirtualizationService {
         .map_err(|e| {
             Status::new_service_specific_error_str(
                 -1,
-                Some(format!("Failed to initialize partition as {:?}: {}", partition_type, e)),
+                Some(format!("Failed to initialize partition as {:?}: {:?}", partition_type, e)),
             )
         })?;
 
@@ -251,7 +250,7 @@ fn handle_stream_connection_tombstoned() -> Result<()> {
     for incoming_stream in listener.incoming() {
         let mut incoming_stream = match incoming_stream {
             Err(e) => {
-                warn!("invalid incoming connection: {}", e);
+                warn!("invalid incoming connection: {:?}", e);
                 continue;
             }
             Ok(s) => s,
@@ -305,7 +304,7 @@ impl VirtualizationService {
 
         std::thread::spawn(|| {
             if let Err(e) = handle_stream_connection_tombstoned() {
-                warn!("Error receiving tombstone from guest or writing them. Error: {}", e);
+                warn!("Error receiving tombstone from guest or writing them. Error: {:?}", e);
             }
         });
 
@@ -366,7 +365,7 @@ impl VirtualizationService {
             Status::new_service_specific_error_str(
                 -1,
                 Some(format!(
-                    "Failed to create temporary directory {:?} for VM files: {}",
+                    "Failed to create temporary directory {:?} for VM files: {:?}",
                     temporary_directory, e
                 )),
             )
@@ -382,7 +381,7 @@ impl VirtualizationService {
                     Status::new_service_specific_error_str(
                         -1,
                         Some(format!(
-                            "Failed to load app config from {}: {}",
+                            "Failed to load app config from {}: {:?}",
                             &config.configPath, e
                         )),
                     )
@@ -395,29 +394,28 @@ impl VirtualizationService {
 
         // Check if partition images are labeled incorrectly. This is to prevent random images
         // which are not protected by the Android Verified Boot (e.g. bits downloaded by apps) from
-        // being loaded in a pVM.  Specifically, for images in the raw config, nothing is allowed
-        // to be labeled as app_data_file. For images in the app config, nothing but the instance
-        // partition is allowed to be labeled as such.
+        // being loaded in a pVM. This applies to everything in the raw config, and everything but
+        // the non-executable, generated partitions in the app config.
         config
             .disks
             .iter()
             .flat_map(|disk| disk.partitions.iter())
             .filter(|partition| {
                 if is_app_config {
-                    partition.label != "vm-instance"
+                    !is_safe_app_partition(&partition.label)
                 } else {
                     true // all partitions are checked
                 }
             })
             .try_for_each(check_label_for_partition)
-            .map_err(|e| Status::new_service_specific_error_str(-1, Some(e.to_string())))?;
+            .map_err(|e| Status::new_service_specific_error_str(-1, Some(format!("{:?}", e))))?;
 
         let zero_filler_path = temporary_directory.join("zero.img");
         write_zero_filler(&zero_filler_path).map_err(|e| {
             error!("Failed to make composite image: {:?}", e);
             Status::new_service_specific_error_str(
                 -1,
-                Some(format!("Failed to make composite image: {}", e)),
+                Some(format!("Failed to make composite image: {:?}", e)),
             )
         })?;
 
@@ -442,10 +440,10 @@ impl VirtualizationService {
         // will be sent back to the client (i.e. the VM owner) for readout.
         let ramdump_path = temporary_directory.join("ramdump");
         let ramdump = prepare_ramdump_file(&ramdump_path).map_err(|e| {
-            error!("Failed to prepare ramdump file: {}", e);
+            error!("Failed to prepare ramdump file: {:?}", e);
             Status::new_service_specific_error_str(
                 -1,
-                Some(format!("Failed to prepare ramdump file: {}", e)),
+                Some(format!("Failed to prepare ramdump file: {:?}", e)),
             )
         })?;
 
@@ -482,7 +480,7 @@ impl VirtualizationService {
                 error!("Failed to create VM with config {:?}: {:?}", config, e);
                 Status::new_service_specific_error_str(
                     -1,
-                    Some(format!("Failed to create VM: {}", e)),
+                    Some(format!("Failed to create VM: {:?}", e)),
                 )
             })?,
         );
@@ -499,7 +497,7 @@ fn handle_stream_connection_from_vm(state: Arc<Mutex<State>>) -> Result<()> {
     for stream in listener.incoming() {
         let stream = match stream {
             Err(e) => {
-                warn!("invalid incoming connection: {}", e);
+                warn!("invalid incoming connection: {:?}", e);
                 continue;
             }
             Ok(s) => s,
@@ -572,7 +570,7 @@ fn assemble_disk_image(
             error!("Failed to make composite image with config {:?}: {:?}", disk, e);
             Status::new_service_specific_error_str(
                 -1,
-                Some(format!("Failed to make composite image: {}", e)),
+                Some(format!("Failed to make composite image: {:?}", e)),
             )
         })?;
 
@@ -598,6 +596,12 @@ fn load_app_config(
     config: &VirtualMachineAppConfig,
     temporary_directory: &Path,
 ) -> Result<VirtualMachineRawConfig> {
+    // Controlling CPUs is reserved for platform apps only, even when using
+    // VirtualMachineAppConfig.
+    if config.cpuAffinity.is_some() || !config.taskProfiles.is_empty() {
+        check_use_custom_virtual_machine()?
+    }
+
     let apk_file = clone_file(config.apk.as_ref().unwrap())?;
     let idsig_file = clone_file(config.idsig.as_ref().unwrap())?;
     let instance_file = clone_file(config.instanceImage.as_ref().unwrap())?;
@@ -730,10 +734,33 @@ fn check_use_custom_virtual_machine() -> binder::Result<()> {
 /// Check if a partition has selinux labels that are not allowed
 fn check_label_for_partition(partition: &Partition) -> Result<()> {
     let ctx = getfilecon(partition.image.as_ref().unwrap().as_ref())?;
-    if ctx == SeContext::new("u:object_r:app_data_file:s0").unwrap() {
-        Err(anyhow!("Partition {} shouldn't be labeled as {}", &partition.label, ctx))
-    } else {
-        Ok(())
+    check_label_is_allowed(&ctx).with_context(|| format!("Partition {} invalid", &partition.label))
+}
+
+// Return whether a partition is exempt from selinux label checks, because we know that it does
+// not contain code and is likely to be generated in an app-writable directory.
+fn is_safe_app_partition(label: &str) -> bool {
+    // See make_payload_disk in payload.rs.
+    label == "vm-instance"
+        || label == "microdroid-apk-idsig"
+        || label == "payload-metadata"
+        || label.starts_with("extra-idsig-")
+}
+
+fn check_label_is_allowed(ctx: &SeContext) -> Result<()> {
+    // We only want to allow code in a VM payload to be sourced from places that apps, and the
+    // system, do not have write access to.
+    // (Note that sepolicy must also grant read access for these types to both virtualization
+    // service and crosvm.)
+    // App private data files are deliberately excluded, to avoid arbitrary payloads being run on
+    // user devices (W^X).
+    match ctx.selinux_type()? {
+        | "system_file" // immutable dm-verity protected partition
+        | "apk_data_file" // APKs of an installed app
+        | "staging_data_file" // updated/staged APEX imagess
+        | "shell_data_file" // test files created via adb shell
+         => Ok(()),
+        _ => bail!("Label {} is not allowed", ctx),
     }
 }
 
@@ -802,7 +829,7 @@ impl IVirtualMachine for VirtualMachine {
             VsockStream::connect_with_cid_port(self.instance.cid, port as u32).map_err(|e| {
                 Status::new_service_specific_error_str(
                     -1,
-                    Some(format!("Failed to connect: {}", e)),
+                    Some(format!("Failed to connect: {:?}", e)),
                 )
             })?;
         Ok(vsock_stream_to_pfd(stream))
@@ -856,7 +883,7 @@ impl VirtualMachineCallbacks {
     }
 
     /// Call all registered callbacks to say that the VM encountered an error.
-    pub fn notify_error(&self, cid: Cid, error_code: i32, message: &str) {
+    pub fn notify_error(&self, cid: Cid, error_code: ErrorCode, message: &str) {
         let callbacks = &*self.0.lock().unwrap();
         for callback in callbacks {
             if let Err(e) = callback.onError(cid as i32, error_code, message) {
@@ -881,7 +908,7 @@ impl VirtualMachineCallbacks {
         let pfd = ParcelFileDescriptor::new(ramdump);
         for callback in callbacks {
             if let Err(e) = callback.onRamdump(cid as i32, &pfd) {
-                error!("Error notifying ramdump of VM CID {}: {}", cid, e);
+                error!("Error notifying ramdump of VM CID {}: {:?}", cid, e);
             }
         }
     }
@@ -983,7 +1010,7 @@ pub fn clone_file(file: &ParcelFileDescriptor) -> Result<File, Status> {
     file.as_ref().try_clone().map_err(|e| {
         Status::new_exception_str(
             ExceptionCode::BAD_PARCELABLE,
-            Some(format!("Failed to clone File from ParcelFileDescriptor: {}", e)),
+            Some(format!("Failed to clone File from ParcelFileDescriptor: {:?}", e)),
         )
     })
 }
@@ -1005,7 +1032,7 @@ fn parse_platform_version_req(s: &str) -> Result<VersionReq, Status> {
     VersionReq::parse(s).map_err(|e| {
         Status::new_exception_str(
             ExceptionCode::BAD_PARCELABLE,
-            Some(format!("Invalid platform version requirement {}: {}", s, e)),
+            Some(format!("Invalid platform version requirement {}: {:?}", s, e)),
         )
     })
 }
@@ -1046,7 +1073,8 @@ impl IVirtualMachineService for VirtualMachineService {
             let stream = vm.stream.lock().unwrap().take();
             vm.callbacks.notify_payload_started(cid, stream);
 
-            write_vm_booted_stats(vm.requester_uid as i32, &vm.name);
+            let vm_start_timestamp = vm.vm_start_timestamp.lock().unwrap();
+            write_vm_booted_stats(vm.requester_uid as i32, &vm.name, *vm_start_timestamp);
             Ok(())
         } else {
             error!("notifyPayloadStarted is called from an unknown CID {}", cid);
@@ -1093,7 +1121,7 @@ impl IVirtualMachineService for VirtualMachineService {
         }
     }
 
-    fn notifyError(&self, error_code: i32, message: &str) -> binder::Result<()> {
+    fn notifyError(&self, error_code: ErrorCode, message: &str) -> binder::Result<()> {
         let cid = self.cid;
         if let Some(vm) = self.state.lock().unwrap().get_vm(cid) {
             info!("VM having CID {} encountered an error", cid);
@@ -1129,5 +1157,35 @@ impl VirtualMachineService {
             VirtualMachineService { state, cid },
             BinderFeatures::default(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_allowed_label_for_partition() -> Result<()> {
+        let expected_results = vec![
+            ("u:object_r:system_file:s0", true),
+            ("u:object_r:apk_data_file:s0", true),
+            ("u:object_r:app_data_file:s0", false),
+            ("u:object_r:app_data_file:s0:c512,c768", false),
+            ("u:object_r:privapp_data_file:s0:c512,c768", false),
+            ("invalid", false),
+            ("user:role:apk_data_file:severity:categories", true),
+            ("user:role:apk_data_file:severity:categories:extraneous", false),
+        ];
+
+        for (label, expected_valid) in expected_results {
+            let context = SeContext::new(label)?;
+            let result = check_label_is_allowed(&context);
+            if expected_valid {
+                assert!(result.is_ok(), "Expected label {} to be allowed, got {:?}", label, result);
+            } else if result.is_ok() {
+                bail!("Expected label {} to be disallowed", label);
+            }
+        }
+        Ok(())
     }
 }

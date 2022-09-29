@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package com.android.microdroid.test;
+package com.android.microdroid.test.device;
 
 import static com.google.common.truth.TruthJUnit.assume;
 
@@ -22,7 +22,6 @@ import static org.junit.Assume.assumeNoException;
 import android.content.Context;
 import android.os.ParcelFileDescriptor;
 import android.os.SystemProperties;
-import android.sysprop.HypervisorProperties;
 import android.system.virtualmachine.VirtualMachine;
 import android.system.virtualmachine.VirtualMachineCallback;
 import android.system.virtualmachine.VirtualMachineConfig;
@@ -106,19 +105,30 @@ public abstract class MicrodroidDeviceTestBase {
             return;
         }
         if (protectedVm) {
-            assume().withMessage("Skip where protected VMs aren't support")
-                    .that(HypervisorProperties.hypervisor_protected_vm_supported().orElse(false))
+            assume().withMessage("Skip where protected VMs aren't supported")
+                    .that(hypervisor_protected_vm_supported())
                     .isTrue();
         } else {
-            assume().withMessage("Skip where VMs aren't support")
-                    .that(HypervisorProperties.hypervisor_vm_supported().orElse(false))
+            assume().withMessage("Skip where VMs aren't supported")
+                    .that(hypervisor_vm_supported())
                     .isTrue();
         }
         Context context = ApplicationProvider.getApplicationContext();
         mInner = new Inner(context, protectedVm, VirtualMachineManager.getInstance(context));
     }
 
-    protected abstract static class VmEventListener implements VirtualMachineCallback {
+    // These are inlined from android.sysprop.HypervisorProperties which isn't @SystemApi.
+    // TODO(b/243642678): Move to using a proper Java API for this.
+
+    private boolean hypervisor_vm_supported() {
+        return SystemProperties.getBoolean("ro.boot.hypervisor.vm.supported", false);
+    }
+
+    private boolean hypervisor_protected_vm_supported() {
+        return SystemProperties.getBoolean("ro.boot.hypervisor.protected_vm.supported", false);
+    }
+
+    public abstract static class VmEventListener implements VirtualMachineCallback {
         private ExecutorService mExecutorService = Executors.newSingleThreadExecutor();
         private OptionalLong mVcpuStartedNanoTime = OptionalLong.empty();
         private OptionalLong mKernelStartedNanoTime = OptionalLong.empty();

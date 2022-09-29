@@ -6,11 +6,12 @@ rust_defaults {
     name: "microdroid_manager_defaults",
     crate_name: "microdroid_manager",
     srcs: ["src/main.rs"],
-    edition: "2018",
+    edition: "2021",
     prefer_rlib: true,
     rustlibs: [
         "android.hardware.security.dice-V1-rust",
         "android.security.dice-rust",
+        "android.system.virtualizationcommon-rust",
         "android.system.virtualizationservice-rust",
         "android.system.virtualmachineservice-rust",
         "libanyhow",
