@@ -86,9 +86,8 @@ public class MicrodroidTestCase extends MicrodroidHostTestCaseBase {
     private static final int MIN_MEM_ARM64 = 145;
     private static final int MIN_MEM_X86_64 = 196;
 
-    // Number of vCPUs and their affinity to host CPUs for testing purpose
+    // Number of vCPUs for testing purpose
     private static final int NUM_VCPUS = 3;
-    private static final String CPU_AFFINITY = "0,1,2";
 
     @Rule public TestLogData mTestLogs = new TestLogData();
     @Rule public TestName mTestName = new TestName();
@@ -510,8 +509,7 @@ public class MicrodroidTestCase extends MicrodroidHostTestCaseBase {
                         configPath,
                         /* debug */ true,
                         minMemorySize(),
-                        Optional.of(NUM_VCPUS),
-                        Optional.of(CPU_AFFINITY));
+                        Optional.of(NUM_VCPUS));
         // check until microdroid is shut down
         CommandRunner android = new CommandRunner(getDevice());
         android.runWithTimeout(15000, "logcat", "-m", "1", "-e", "'crosvm has exited normally'");
@@ -563,8 +561,7 @@ public class MicrodroidTestCase extends MicrodroidHostTestCaseBase {
                         configPath,
                         /* debug */ true,
                         minMemorySize(),
-                        Optional.of(NUM_VCPUS),
-                        Optional.of(CPU_AFFINITY));
+                        Optional.of(NUM_VCPUS));
 
         // Check VmCreationRequested atom and clear the statsd report
         List<StatsLog.EventMetricData> data;
@@ -586,7 +583,6 @@ public class MicrodroidTestCase extends MicrodroidHostTestCaseBase {
                 AtomsProto.VmCreationRequested.ConfigType.VIRTUAL_MACHINE_APP_CONFIG,
                 atomVmCreationRequested.getConfigType());
         assertEquals(NUM_VCPUS, atomVmCreationRequested.getNumCpus());
-        assertEquals(CPU_AFFINITY, atomVmCreationRequested.getCpuAffinity());
         assertEquals(minMemorySize(), atomVmCreationRequested.getMemoryMib());
         assertEquals(
                 "com.android.art:com.android.compos:com.android.sdkext",
@@ -639,8 +635,7 @@ public class MicrodroidTestCase extends MicrodroidHostTestCaseBase {
                         configPath,
                         /* debug */ true,
                         minMemorySize(),
-                        Optional.of(NUM_VCPUS),
-                        Optional.of(CPU_AFFINITY));
+                        Optional.of(NUM_VCPUS));
         adbConnectToMicrodroid(getDevice(), cid);
         waitForBootComplete();
         // Test writing to /data partition
@@ -713,6 +708,11 @@ public class MicrodroidTestCase extends MicrodroidHostTestCaseBase {
         }
     }
 
+    // TODO(b/6184548): to be replaced by ProcessUtil
+    /**
+    * @deprecated use ProcessUtil instead.
+    */
+    @Deprecated
     private Map<String, Long> parseMemInfo(String file) {
         Map<String, Long> stats = new HashMap<>();
         file.lines().forEach(line -> {
@@ -725,11 +725,21 @@ public class MicrodroidTestCase extends MicrodroidHostTestCaseBase {
         return stats;
     }
 
+    // TODO(b/6184548): to be replaced by ProcessUtil
+    /**
+    * @deprecated use ProcessUtil instead.
+    */
+    @Deprecated
     private String skipFirstLine(String str) {
         int index = str.indexOf("\n");
         return (index < 0) ? "" : str.substring(index + 1);
     }
 
+    // TODO(b/6184548): to be replaced by ProcessUtil
+    /**
+    * @deprecated use ProcessUtil instead.
+    */
+    @Deprecated
     private List<ProcessInfo> getRunningProcessesList() {
         List<ProcessInfo> list = new ArrayList<ProcessInfo>();
         skipFirstLine(runOnMicrodroid("ps", "-Ao", "PID,NAME")).lines().forEach(ps -> {
@@ -744,10 +754,20 @@ public class MicrodroidTestCase extends MicrodroidHostTestCaseBase {
         return list;
     }
 
+    // TODO(b/6184548): to be replaced by ProcessUtil
+    /**
+    * @deprecated use ProcessUtil instead.
+    */
+    @Deprecated
     private Map<String, Long> getProcMemInfo() {
         return parseMemInfo(runOnMicrodroid("cat", "/proc/meminfo"));
     }
 
+    // TODO(b/6184548): to be replaced by ProcessUtil
+    /**
+    * @deprecated use ProcessUtil instead.
+    */
+    @Deprecated
     private Map<String, Long> getProcSmapsRollup(int pid) {
         String path = "/proc/" + pid + "/smaps_rollup";
         return  parseMemInfo(skipFirstLine(runOnMicrodroid("cat", path, "||", "true")));
@@ -765,8 +785,7 @@ public class MicrodroidTestCase extends MicrodroidHostTestCaseBase {
                         configPath,
                         /* debug */ true,
                         minMemorySize(),
-                        Optional.of(NUM_VCPUS),
-                        Optional.of(CPU_AFFINITY));
+                        Optional.of(NUM_VCPUS));
         adbConnectToMicrodroid(getDevice(), cid);
         waitForBootComplete();
         rootMicrodroid();

@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-use apkverify::{testing::assert_contains, verify};
-use std::matches;
+use apkverify::{get_public_key_der, testing::assert_contains, verify};
+use std::{fs, matches, path::Path};
 
 const KEY_NAMES_DSA: &[&str] = &["1024", "2048", "3072"];
 const KEY_NAMES_ECDSA: &[&str] = &["p256", "p384", "p521"];
@@ -25,7 +25,7 @@ const KEY_NAMES_RSA: &[&str] = &["1024", "2048", "3072", "4096", "8192", "16384"
 fn test_verify_truncated_cd() {
     use zip::result::ZipError;
     let res = verify("tests/data/v2-only-truncated-cd.apk");
-    // TODO(jooyung): consider making a helper for err assertion
+    // TODO(b/190343842): consider making a helper for err assertion
     assert!(matches!(
         res.unwrap_err().root_cause().downcast_ref::<ZipError>().unwrap(),
         ZipError::InvalidArchive(_),
@@ -34,61 +34,52 @@ fn test_verify_truncated_cd() {
 
 #[test]
 fn test_verify_v3() {
-    assert!(verify("tests/data/test.apex").is_ok());
+    validate_apk_public_key("tests/data/test.apex");
 }
 
-// TODO(b/190343842)
 #[test]
 fn test_verify_v3_dsa_sha256() {
     for key_name in KEY_NAMES_DSA.iter() {
         let res = verify(format!("tests/data/v3-only-with-dsa-sha256-{}.apk", key_name));
         assert!(res.is_err());
-        assert_contains(
-            &res.unwrap_err().to_string(),
-            "TODO(b/190343842) not implemented signature algorithm",
-        );
+        assert_contains(&res.unwrap_err().to_string(), "not implemented");
     }
 }
 
 #[test]
 fn test_verify_v3_ecdsa_sha256() {
     for key_name in KEY_NAMES_ECDSA.iter() {
-        assert!(verify(format!("tests/data/v3-only-with-ecdsa-sha256-{}.apk", key_name)).is_ok());
+        validate_apk_public_key(format!("tests/data/v3-only-with-ecdsa-sha256-{}.apk", key_name));
     }
 }
 
-// TODO(b/190343842)
 #[test]
 fn test_verify_v3_ecdsa_sha512() {
     for key_name in KEY_NAMES_ECDSA.iter() {
-        let res = verify(format!("tests/data/v3-only-with-ecdsa-sha512-{}.apk", key_name));
-        assert!(res.is_err());
-        assert_contains(
-            &res.unwrap_err().to_string(),
-            "TODO(b/190343842) not implemented signature algorithm",
-        );
+        validate_apk_public_key(format!("tests/data/v3-only-with-ecdsa-sha512-{}.apk", key_name));
     }
 }
 
 #[test]
 fn test_verify_v3_rsa_sha256() {
     for key_name in KEY_NAMES_RSA.iter() {
-        assert!(
-            verify(format!("tests/data/v3-only-with-rsa-pkcs1-sha256-{}.apk", key_name)).is_ok()
-        );
+        validate_apk_public_key(format!(
+            "tests/data/v3-only-with-rsa-pkcs1-sha256-{}.apk",
+            key_name
+        ));
     }
 }
 
 #[test]
 fn test_verify_v3_rsa_sha512() {
     for key_name in KEY_NAMES_RSA.iter() {
-        assert!(
-            verify(format!("tests/data/v3-only-with-rsa-pkcs1-sha512-{}.apk", key_name)).is_ok()
-        );
+        validate_apk_public_key(format!(
+            "tests/data/v3-only-with-rsa-pkcs1-sha512-{}.apk",
+            key_name
+        ));
     }
 }
 
-// TODO(b/190343842)
 #[test]
 fn test_verify_v3_sig_does_not_verify() {
     let path_list = [
@@ -101,13 +92,11 @@ fn test_verify_v3_sig_does_not_verify() {
         assert!(res.is_err());
         let error_msg = &res.unwrap_err().to_string();
         assert!(
-            error_msg.contains("Signature is invalid")
-                || error_msg.contains("TODO(b/190343842) not implemented signature algorithm")
+            error_msg.contains("Signature is invalid") || error_msg.contains("not implemented")
         );
     }
 }
 
-// TODO(b/190343842)
 #[test]
 fn test_verify_v3_digest_mismatch() {
     let path_list = [
@@ -118,10 +107,7 @@ fn test_verify_v3_digest_mismatch() {
         let res = verify(path);
         assert!(res.is_err());
         let error_msg = &res.unwrap_err().to_string();
-        assert!(
-            error_msg.contains("Digest mismatch")
-                || error_msg.contains("TODO(b/190343842) not implemented signature algorithm")
-        );
+        assert!(error_msg.contains("Digest mismatch") || error_msg.contains("not implemented"));
     }
 }
 
@@ -183,20 +169,49 @@ fn test_verify_v3_signatures_and_digests_block_mismatch() {
 
 #[test]
 fn test_verify_v3_unknown_additional_attr() {
-    assert!(verify("tests/data/v3-only-unknown-additional-attr.apk").is_ok());
+    validate_apk_public_key("tests/data/v3-only-unknown-additional-attr.apk");
 }
 
 #[test]
 fn test_verify_v3_unknown_pair_in_apk_sig_block() {
-    assert!(verify("tests/data/v3-only-unknown-pair-in-apk-sig-block.apk").is_ok());
+    validate_apk_public_key("tests/data/v3-only-unknown-pair-in-apk-sig-block.apk");
 }
 
 #[test]
 fn test_verify_v3_ignorable_unsupported_sig_algs() {
-    assert!(verify("tests/data/v3-only-with-ignorable-unsupported-sig-algs.apk").is_ok());
+    validate_apk_public_key("tests/data/v3-only-with-ignorable-unsupported-sig-algs.apk");
 }
 
 #[test]
 fn test_verify_v3_stamp() {
-    assert!(verify("tests/data/v3-only-with-stamp.apk").is_ok());
+    validate_apk_public_key("tests/data/v3-only-with-stamp.apk");
+}
+
+fn validate_apk_public_key<P: AsRef<Path>>(apk_path: P) {
+    // Validates public key from verification == expected public key.
+    let public_key_from_verification = verify(apk_path.as_ref());
+    let public_key_from_verification =
+        public_key_from_verification.expect("Error in verification result");
+
+    let expected_public_key_path = format!("{}.der", apk_path.as_ref().to_str().unwrap());
+    assert!(
+        fs::metadata(&expected_public_key_path).is_ok(),
+        "File does not exist. You can re-create it with:\n$ echo -en {} > {}\n",
+        public_key_from_verification.iter().map(|b| format!("\\\\x{:02x}", b)).collect::<String>(),
+        expected_public_key_path
+    );
+    let expected_public_key = fs::read(&expected_public_key_path).unwrap();
+    assert_eq!(
+        expected_public_key,
+        public_key_from_verification.as_ref(),
+        "{}",
+        expected_public_key_path
+    );
+
+    // Validates public key extracted directly from apk
+    // (without verification) == expected public key.
+    let public_key_from_apk = get_public_key_der(apk_path.as_ref());
+    let public_key_from_apk =
+        public_key_from_apk.expect("Error when extracting public key from apk");
+    assert_eq!(expected_public_key, public_key_from_apk.as_ref(), "{}", expected_public_key_path);
 }

@@ -57,8 +57,6 @@ android_system_image {
         "libbinder",
         "libbinder_ndk",
         "libstdc++",
-        "logcat.microdroid",
-        "logd.microdroid",
         "secilc",
 
         // "com.android.adbd" requires these,
@@ -577,4 +575,19 @@ prebuilt_etc {
     src: "microdroid_event-log-tags",
     filename: "event-log-tags",
     installable: false,
+}
+
+filegroup {
+    name: "microdroid_bootconfig_full_debuggable_src",
+    srcs: ["bootconfig.full_debuggable"],
+}
+
+filegroup {
+    name: "microdroid_bootconfig_app_debuggable_src",
+    srcs: ["bootconfig.app_debuggable"],
+}
+
+filegroup {
+    name: "microdroid_bootconfig_normal_src",
+    srcs: ["bootconfig.normal"],
 }
