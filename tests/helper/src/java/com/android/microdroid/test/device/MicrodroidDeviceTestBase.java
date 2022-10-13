@@ -19,6 +19,7 @@ import static com.google.common.truth.TruthJUnit.assume;
 
 import static org.junit.Assume.assumeNoException;
 
+import android.app.UiAutomation;
 import android.content.Context;
 import android.os.ParcelFileDescriptor;
 import android.os.SystemProperties;
@@ -32,9 +33,12 @@ import android.util.Log;
 import androidx.annotation.CallSuper;
 import androidx.test.core.app.ApplicationProvider;
 
+import com.android.microdroid.test.common.MetricsProcessor;
 import com.android.virt.VirtualizationTestHelper;
 
 import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.util.OptionalLong;
@@ -46,6 +50,11 @@ import java.util.concurrent.TimeUnit;
 public abstract class MicrodroidDeviceTestBase {
     public static boolean isCuttlefish() {
         return VirtualizationTestHelper.isCuttlefish(SystemProperties.get("ro.product.name"));
+    }
+
+    public static String getMetricPrefix() {
+        return MetricsProcessor.getMetricPrefix(
+                SystemProperties.get("debug.hypervisor.metrics_tag"));
     }
 
     // TODO(b/220920264): remove Inner class; this is a hack to hide virt APEX types
@@ -273,7 +282,9 @@ public abstract class MicrodroidDeviceTestBase {
         }
 
         private long getKernelStartedNanoTime() {
-            return kernelStartedNanoTime.getAsLong();
+            // pvmfw emits log at the end which is used to estimate the kernelStart time.
+            // In case of no pvmfw run(non-protected mode), use vCPU started time instead.
+            return kernelStartedNanoTime.orElse(vcpuStartedNanoTime.getAsLong());
         }
 
         private long getInitStartedNanoTime() {
@@ -333,5 +344,21 @@ public abstract class MicrodroidDeviceTestBase {
                 listener.getKernelStartedNanoTime(),
                 listener.getInitStartedNanoTime(),
                 listener.getPayloadStartedNanoTime());
+    }
+
+    /** Execute a command. Returns stdout. */
+    protected String runInShell(String tag, UiAutomation uiAutomation, String command) {
+        try (InputStream is =
+                        new ParcelFileDescriptor.AutoCloseInputStream(
+                                uiAutomation.executeShellCommand(command));
+                ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            is.transferTo(out);
+            String stdout = out.toString("UTF-8");
+            Log.i(tag, "Got stdout : " + stdout);
+            return stdout;
+        } catch (IOException e) {
+            Log.e(tag, "Error executing: " + command, e);
+            throw new RuntimeException("Failed to run the command.");
+        }
     }
 }

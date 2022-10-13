@@ -69,6 +69,7 @@ apex {
         "microdroid.json",
         "microdroid_bootloader",
         "microdroid_bootloader.avbpubkey",
+        "microdroid_kernel",
     ],
     file_contexts: ":com.android.virt-file_contexts",
     canned_fs_config: "canned_fs_config",
@@ -102,11 +103,7 @@ python_binary_host {
         "sign_virt_apex.py",
     ],
     version: {
-        py2: {
-            enabled: false,
-        },
         py3: {
-            enabled: true,
             embedded_launcher: true,
         },
     },
@@ -170,11 +167,7 @@ python_binary_host {
         "replace_bytes.py",
     ],
     version: {
-        py2: {
-            enabled: false,
-        },
         py3: {
-            enabled: true,
             embedded_launcher: true,
         },
     },
