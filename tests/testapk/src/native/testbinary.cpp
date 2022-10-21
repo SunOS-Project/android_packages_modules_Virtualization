@@ -13,8 +13,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <aidl/android/security/dice/IDiceNode.h>
-#include <aidl/android/system/virtualmachineservice/IVirtualMachineService.h>
 #include <aidl/com/android/microdroid/testservice/BnTestService.h>
 #include <android-base/file.h>
 #include <android-base/properties.h>
@@ -29,14 +27,10 @@
 #include <sys/ioctl.h>
 #include <sys/system_properties.h>
 #include <unistd.h>
+#include <vm_payload.h>
 
 #include <binder_rpc_unstable.hpp>
 #include <string>
-
-using aidl::android::hardware::security::dice::BccHandover;
-using aidl::android::security::dice::IDiceNode;
-
-using aidl::android::system::virtualmachineservice::IVirtualMachineService;
 
 using android::base::ErrnoError;
 using android::base::Error;
@@ -79,77 +73,54 @@ Result<void> start_test_service() {
             return ndk::ScopedAStatus::ok();
         }
 
-        ndk::ScopedAStatus insecurelyExposeSealingCdi(std::vector<uint8_t>* out) override {
-            ndk::SpAIBinder binder(AServiceManager_getService("android.security.dice.IDiceNode"));
-            auto service = IDiceNode::fromBinder(binder);
-            if (service == nullptr) {
+        ndk::ScopedAStatus insecurelyExposeVmInstanceSecret(std::vector<uint8_t>* out) override {
+            const uint8_t identifier[] = {1, 2, 3, 4};
+            out->resize(32);
+            if (!AVmPayload_getVmInstanceSecret(identifier, sizeof(identifier), out->data(),
+                                                out->size())) {
                 return ndk::ScopedAStatus::
-                        fromServiceSpecificErrorWithMessage(0, "Failed to find diced");
+                        fromServiceSpecificErrorWithMessage(0, "Failed to VM instance secret");
             }
-            BccHandover handover;
-            auto deriveStatus = service->derive({}, &handover);
-            if (!deriveStatus.isOk()) {
-                return ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(0,
-                                                                               "Failed call diced");
-            }
-            *out = {handover.cdiSeal.begin(), handover.cdiSeal.end()};
             return ndk::ScopedAStatus::ok();
         }
 
         ndk::ScopedAStatus insecurelyExposeAttestationCdi(std::vector<uint8_t>* out) override {
-            ndk::SpAIBinder binder(AServiceManager_getService("android.security.dice.IDiceNode"));
-            auto service = IDiceNode::fromBinder(binder);
-            if (service == nullptr) {
+            size_t cdi_size;
+            if (!AVmPayload_getDiceAttestationCdi(nullptr, 0, &cdi_size)) {
                 return ndk::ScopedAStatus::
-                        fromServiceSpecificErrorWithMessage(0, "Failed to find diced");
+                        fromServiceSpecificErrorWithMessage(0, "Failed to measure attestation cdi");
             }
-            BccHandover handover;
-            auto deriveStatus = service->derive({}, &handover);
-            if (!deriveStatus.isOk()) {
-                return ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(0,
-                                                                               "Failed call diced");
+            out->resize(cdi_size);
+            if (!AVmPayload_getDiceAttestationCdi(out->data(), out->size(), &cdi_size)) {
+                return ndk::ScopedAStatus::
+                        fromServiceSpecificErrorWithMessage(0, "Failed to get attestation cdi");
             }
-            *out = {handover.cdiAttest.begin(), handover.cdiAttest.end()};
             return ndk::ScopedAStatus::ok();
         }
 
         ndk::ScopedAStatus getBcc(std::vector<uint8_t>* out) override {
-            ndk::SpAIBinder binder(AServiceManager_getService("android.security.dice.IDiceNode"));
-            auto service = IDiceNode::fromBinder(binder);
-            if (service == nullptr) {
+            size_t bcc_size;
+            if (!AVmPayload_getDiceAttestationChain(nullptr, 0, &bcc_size)) {
                 return ndk::ScopedAStatus::
-                        fromServiceSpecificErrorWithMessage(0, "Failed to find diced");
+                        fromServiceSpecificErrorWithMessage(0,
+                                                            "Failed to measure attestation chain");
             }
-            BccHandover handover;
-            auto deriveStatus = service->derive({}, &handover);
-            if (!deriveStatus.isOk()) {
-                return ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(0,
-                                                                               "Failed call diced");
+            out->resize(bcc_size);
+            if (!AVmPayload_getDiceAttestationChain(out->data(), out->size(), &bcc_size)) {
+                return ndk::ScopedAStatus::
+                        fromServiceSpecificErrorWithMessage(0, "Failed to get attestation chain");
             }
-            *out = {handover.bcc.data.begin(), handover.bcc.data.end()};
             return ndk::ScopedAStatus::ok();
         }
     };
     auto testService = ndk::SharedRefBase::make<TestService>();
 
     auto callback = []([[maybe_unused]] void* param) {
-        // Tell microdroid_manager that we're ready.
-        // If we can't, abort in order to fail fast - the host won't proceed without
-        // receiving the onReady signal.
-        ndk::SpAIBinder binder(
-                RpcClient(VMADDR_CID_HOST, IVirtualMachineService::VM_BINDER_SERVICE_PORT));
-        auto virtualMachineService = IVirtualMachineService::fromBinder(binder);
-        if (virtualMachineService == nullptr) {
-            std::cerr << "failed to connect VirtualMachineService\n";
-            abort();
-        }
-        if (auto status = virtualMachineService->notifyPayloadReady(); !status.isOk()) {
-            std::cerr << "failed to notify payload ready to virtualizationservice: "
-                      << status.getDescription() << std::endl;
+        if (!AVmPayload_notifyPayloadReady()) {
+            std::cerr << "failed to notify payload ready to virtualizationservice" << std::endl;
             abort();
         }
     };
-
     if (!RunRpcServerCallback(testService->asBinder().get(), testService->SERVICE_PORT, callback,
                               nullptr)) {
         return Error() << "RPC Server failed to run";
@@ -180,11 +151,6 @@ extern "C" int android_native_main(int argc, char* argv[]) {
     setvbuf(stdin, nullptr, _IONBF, 0);
     setvbuf(stdout, nullptr, _IONBF, 0);
     setvbuf(stderr, nullptr, _IONBF, 0);
-
-    if (strcmp(argv[1], "crash") == 0) {
-        printf("test crash!!!!\n");
-        abort();
-    }
 
     printf("Hello Microdroid ");
     for (int i = 0; i < argc; i++) {

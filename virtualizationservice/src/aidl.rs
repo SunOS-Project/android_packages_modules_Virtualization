@@ -17,7 +17,7 @@
 use crate::atom::{write_vm_booted_stats, write_vm_creation_stats};
 use crate::composite::make_composite_image;
 use crate::crosvm::{CrosvmConfig, DiskFile, PayloadState, VmInstance, VmState};
-use crate::payload::add_microdroid_images;
+use crate::payload::{add_microdroid_payload_images, add_microdroid_system_images};
 use crate::{Cid, FIRST_GUEST_CID, SYSPROP_LAST_CID};
 use crate::selinux::{SeContext, getfilecon};
 use android_os_permissions_aidl::aidl::android::os::IPermissionController;
@@ -63,7 +63,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use tombstoned_client::{TombstonedConnection, DebuggerdDumpType};
 use vmconfig::VmConfig;
-use vsock::{SockAddr, VsockListener, VsockStream};
+use vsock::{VsockListener, VsockStream};
 use zip::ZipArchive;
 
 pub const BINDER_SERVICE_IDENTIFIER: &str = "android.system.virtualizationservice";
@@ -268,7 +268,7 @@ fn handle_stream_connection_tombstoned() -> Result<()> {
 }
 
 fn handle_tombstone(stream: &mut VsockStream) -> Result<()> {
-    if let Ok(SockAddr::Vsock(addr)) = stream.peer_addr() {
+    if let Ok(addr) = stream.peer_addr() {
         info!("Vsock Stream connected to cid={} for tombstones", addr.cid());
     }
     let tb_connection =
@@ -499,7 +499,7 @@ fn handle_stream_connection_from_vm(state: Arc<Mutex<State>>) -> Result<()> {
             }
             Ok(s) => s,
         };
-        if let Ok(SockAddr::Vsock(addr)) = stream.peer_addr() {
+        if let Ok(addr) = stream.peer_addr() {
             let cid = addr.cid();
             let port = addr.port();
             info!("payload stream connected from cid={}, port={}", cid, port);
@@ -603,6 +603,12 @@ fn load_app_config(
     let idsig_file = clone_file(config.idsig.as_ref().unwrap())?;
     let instance_file = clone_file(config.instanceImage.as_ref().unwrap())?;
 
+    let storage_image = if let Some(file) = config.encryptedStorageImage.as_ref() {
+        Some(clone_file(file)?)
+    } else {
+        None
+    };
+
     let vm_payload_config = match &config.payload {
         Payload::ConfigPath(config_path) => {
             load_vm_payload_config_from_file(&apk_file, config_path.as_str())
@@ -632,13 +638,15 @@ fn load_app_config(
     vm_config.numCpus = config.numCpus;
     vm_config.taskProfiles = config.taskProfiles.clone();
 
-    // Microdroid requires an additional init ramdisk & payload disk image
-    add_microdroid_images(
+    // Microdroid takes additional init ramdisk & (optionally) storage image
+    add_microdroid_system_images(config, instance_file, storage_image, &mut vm_config)?;
+
+    // Include Microdroid payload disk (contains apks, idsigs) in vm config
+    add_microdroid_payload_images(
         config,
         temporary_directory,
         apk_file,
         idsig_file,
-        instance_file,
         &vm_payload_config,
         &mut vm_config,
     )?;
@@ -667,7 +675,7 @@ fn create_vm_payload_config(payload_config: &VirtualMachinePayloadConfig) -> VmP
         apexes: vec![],
         extra_apks: vec![],
         prefer_staged: false,
-        export_tombstones: payload_config.exportTombstones,
+        export_tombstones: false,
         enable_authfs: false,
     }
 }
