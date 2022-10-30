@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <time.h>
 #include <unistd.h>
+#include <vm_main.h>
 #include <vm_payload.h>
 
 #include <binder_rpc_unstable.hpp>
@@ -164,15 +165,15 @@ Result<void> run_io_benchmark_tests() {
         }
     };
 
-    if (!RunRpcServerCallback(test_service->asBinder().get(), test_service->SERVICE_PORT, callback,
-                              nullptr)) {
+    if (!RunVsockRpcServerCallback(test_service->asBinder().get(), test_service->SERVICE_PORT,
+                                   callback, nullptr)) {
         return Error() << "RPC Server failed to run";
     }
     return {};
 }
 } // Anonymous namespace
 
-extern "C" int android_native_main(int /* argc */, char* /* argv */[]) {
+extern "C" int AVmPayload_main() {
     if (auto res = run_io_benchmark_tests(); !res.ok()) {
         LOG(ERROR) << "IO benchmark test failed: " << res.error() << "\n";
         return EXIT_FAILURE;

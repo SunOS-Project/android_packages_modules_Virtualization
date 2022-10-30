@@ -24,6 +24,7 @@ import static org.junit.Assert.assertEquals;
 
 import android.platform.test.annotations.RootPermissionTest;
 
+import com.android.fs.common.AuthFsTestRule;
 import com.android.microdroid.test.host.CommandRunner;
 import com.android.tradefed.device.DeviceNotAvailableException;
 import com.android.tradefed.invoker.TestInformation;
@@ -52,7 +53,7 @@ public final class AuthFsHostTest extends BaseHostJUnit4Test {
     private static final String FSVERITY_BIN = "/data/local/tmp/fsverity";
 
     /** Mount point of authfs on Microdroid during the test */
-    private static final String MOUNT_DIR = "/data/local/tmp";
+    private static final String MOUNT_DIR = AuthFsTestRule.MOUNT_DIR;
 
     /** Input manifest path in the VM. */
     private static final String INPUT_MANIFEST_PATH = "/mnt/apk/assets/input_manifest.pb";
@@ -72,7 +73,8 @@ public final class AuthFsHostTest extends BaseHostJUnit4Test {
 
     @BeforeClassWithInfo
     public static void beforeClassWithDevice(TestInformation testInfo) throws Exception {
-        AuthFsTestRule.setUpClass(testInfo);
+        AuthFsTestRule.setUpAndroid(testInfo);
+        AuthFsTestRule.startMicrodroid();
         sAndroid = AuthFsTestRule.getAndroid();
         sMicrodroid = AuthFsTestRule.getMicrodroid();
     }
@@ -80,7 +82,8 @@ public final class AuthFsHostTest extends BaseHostJUnit4Test {
     @AfterClassWithInfo
     public static void afterClassWithDevice(TestInformation testInfo)
             throws DeviceNotAvailableException {
-        AuthFsTestRule.tearDownClass(testInfo);
+        AuthFsTestRule.shutdownMicrodroid();
+        AuthFsTestRule.tearDownAndroid();
     }
 
     @Test

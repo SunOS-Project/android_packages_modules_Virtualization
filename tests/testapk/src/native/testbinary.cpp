@@ -27,6 +27,7 @@
 #include <sys/ioctl.h>
 #include <sys/system_properties.h>
 #include <unistd.h>
+#include <vm_main.h>
 #include <vm_payload.h>
 
 #include <binder_rpc_unstable.hpp>
@@ -121,8 +122,8 @@ Result<void> start_test_service() {
             abort();
         }
     };
-    if (!RunRpcServerCallback(testService->asBinder().get(), testService->SERVICE_PORT, callback,
-                              nullptr)) {
+    if (!RunVsockRpcServerCallback(testService->asBinder().get(), testService->SERVICE_PORT,
+                                   callback, nullptr)) {
         return Error() << "RPC Server failed to run";
     }
 
@@ -146,20 +147,13 @@ Result<void> verify_apk() {
 
 } // Anonymous namespace
 
-extern "C" int android_native_main(int argc, char* argv[]) {
+extern "C" int AVmPayload_main() {
     // disable buffering to communicate seamlessly
     setvbuf(stdin, nullptr, _IONBF, 0);
     setvbuf(stdout, nullptr, _IONBF, 0);
     setvbuf(stderr, nullptr, _IONBF, 0);
 
-    printf("Hello Microdroid ");
-    for (int i = 0; i < argc; i++) {
-        printf("%s", argv[i]);
-        bool last = i == (argc - 1);
-        if (!last) {
-            printf(" ");
-        }
-    }
+    printf("Hello Microdroid");
     testlib_sub();
     printf("\n");
 

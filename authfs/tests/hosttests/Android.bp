@@ -4,14 +4,13 @@ package {
 
 java_test_host {
     name: "AuthFsHostTest",
-    srcs: ["java/**/*.java"],
+    srcs: ["java/src/com/android/fs/*.java"],
     libs: [
         "tradefed",
-        "compatibility-tradefed",
-        "compatibility-host-util",
     ],
     static_libs: [
         "MicrodroidHostTestHelper",
+        "AuthFsHostTestCommon",
     ],
     test_suites: ["general-tests"],
     data_device_bins_first: [
@@ -24,21 +23,4 @@ java_test_host {
         ":CtsApkVerityTestPrebuiltFiles",
         ":MicrodroidTestApp",
     ],
-}
-
-rust_test {
-    name: "open_then_run",
-    crate_name: "open_then_run",
-    srcs: ["open_then_run.rs"],
-    edition: "2021",
-    rustlibs: [
-        "libandroid_logger",
-        "libanyhow",
-        "libclap",
-        "libcommand_fds",
-        "liblibc",
-        "liblog_rust",
-    ],
-    test_suites: ["general-tests"],
-    test_harness: false,
 }

@@ -14,13 +14,17 @@
 
 //! Implementation of the AIDL interface of the VirtualizationService.
 
-use crate::atom::{write_vm_booted_stats, write_vm_creation_stats};
+use crate::atom::{
+    write_vm_booted_stats, write_vm_cpu_status_stats, write_vm_creation_stats,
+    write_vm_mem_status_stats,
+};
 use crate::composite::make_composite_image;
 use crate::crosvm::{CrosvmConfig, DiskFile, PayloadState, VmInstance, VmState};
 use crate::payload::{add_microdroid_payload_images, add_microdroid_system_images};
+use crate::selinux::{getfilecon, SeContext};
 use crate::{Cid, FIRST_GUEST_CID, SYSPROP_LAST_CID};
-use crate::selinux::{SeContext, getfilecon};
 use android_os_permissions_aidl::aidl::android::os::IPermissionController;
+use android_system_virtualizationcommon::aidl::android::system::virtualizationcommon::ErrorCode::ErrorCode;
 use android_system_virtualizationservice::aidl::android::system::virtualizationservice::{
     DeathReason::DeathReason,
     DiskImage::DiskImage,
@@ -29,39 +33,42 @@ use android_system_virtualizationservice::aidl::android::system::virtualizations
     IVirtualizationService::IVirtualizationService,
     Partition::Partition,
     PartitionType::PartitionType,
-    VirtualMachineAppConfig::{VirtualMachineAppConfig, Payload::Payload},
+    VirtualMachineAppConfig::{Payload::Payload, VirtualMachineAppConfig},
     VirtualMachineConfig::VirtualMachineConfig,
     VirtualMachineDebugInfo::VirtualMachineDebugInfo,
     VirtualMachinePayloadConfig::VirtualMachinePayloadConfig,
     VirtualMachineRawConfig::VirtualMachineRawConfig,
     VirtualMachineState::VirtualMachineState,
 };
+use android_system_virtualmachineservice::aidl::android::system::virtualmachineservice::{
+    IVirtualMachineService::{
+        BnVirtualMachineService, IVirtualMachineService, VM_BINDER_SERVICE_PORT,
+        VM_STREAM_SERVICE_PORT, VM_TOMBSTONES_SERVICE_PORT,
+    },
+    VirtualMachineCpuStatus::VirtualMachineCpuStatus,
+    VirtualMachineMemStatus::VirtualMachineMemStatus,
+};
+use anyhow::{anyhow, bail, Context, Result};
+use apkverify::{HashAlgorithm, V4Signature};
 use binder::{
     self, BinderFeatures, ExceptionCode, Interface, LazyServiceGuard, ParcelFileDescriptor,
     SpIBinder, Status, StatusCode, Strong, ThreadState,
 };
-use android_system_virtualmachineservice::aidl::android::system::virtualmachineservice::IVirtualMachineService::{
-        BnVirtualMachineService, IVirtualMachineService, VM_BINDER_SERVICE_PORT,
-        VM_STREAM_SERVICE_PORT, VM_TOMBSTONES_SERVICE_PORT,
-};
-use android_system_virtualizationcommon::aidl::android::system::virtualizationcommon::ErrorCode::ErrorCode;
-use anyhow::{anyhow, bail, Context, Result};
-use rpcbinder::run_rpc_server_with_factory;
 use disk::QcowFile;
-use apkverify::{HashAlgorithm, V4Signature};
 use log::{debug, error, info, warn};
-use microdroid_payload_config::{VmPayloadConfig, OsConfig, Task, TaskType};
+use microdroid_payload_config::{OsConfig, Task, TaskType, VmPayloadConfig};
+use rpcbinder::run_vsock_rpc_server_with_factory;
 use rustutils::system_properties;
 use semver::VersionReq;
 use std::convert::TryInto;
 use std::ffi::CStr;
 use std::fs::{create_dir, File, OpenOptions};
-use std::io::{Error, ErrorKind, Write, Read};
+use std::io::{Error, ErrorKind, Read, Write};
 use std::num::NonZeroU32;
 use std::os::unix::io::{FromRawFd, IntoRawFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
-use tombstoned_client::{TombstonedConnection, DebuggerdDumpType};
+use tombstoned_client::{DebuggerdDumpType, TombstonedConnection};
 use vmconfig::VmConfig;
 use vsock::{VsockListener, VsockStream};
 use zip::ZipArchive;
@@ -110,8 +117,6 @@ impl Interface for VirtualizationService {
             writeln!(file, "\ttemporary_directory: {}", vm.temporary_directory.to_string_lossy())
                 .or(Err(StatusCode::UNKNOWN_ERROR))?;
             writeln!(file, "\trequester_uid: {}", vm.requester_uid)
-                .or(Err(StatusCode::UNKNOWN_ERROR))?;
-            writeln!(file, "\trequester_sid: {}", vm.requester_sid)
                 .or(Err(StatusCode::UNKNOWN_ERROR))?;
             writeln!(file, "\trequester_debug_pid: {}", vm.requester_debug_pid)
                 .or(Err(StatusCode::UNKNOWN_ERROR))?;
@@ -217,7 +222,6 @@ impl IVirtualizationService for VirtualizationService {
                 cid: vm.cid as i32,
                 temporaryDirectory: vm.temporary_directory.to_string_lossy().to_string(),
                 requesterUid: vm.requester_uid as i32,
-                requesterSid: vm.requester_sid.clone(),
                 requesterPid: vm.requester_debug_pid,
                 state: get_state(&vm),
             })
@@ -316,7 +320,7 @@ impl VirtualizationService {
         let state = service.state.clone();
         std::thread::spawn(move || {
             debug!("VirtualMachineService is starting as an RPC service.");
-            if run_rpc_server_with_factory(VM_BINDER_SERVICE_PORT as u32, |cid| {
+            if run_vsock_rpc_server_with_factory(VM_BINDER_SERVICE_PORT as u32, |cid| {
                 VirtualMachineService::factory(cid, &state)
             }) {
                 debug!("RPC server has shut down gracefully");
@@ -346,7 +350,6 @@ impl VirtualizationService {
         let console_fd = console_fd.map(clone_file).transpose()?;
         let log_fd = log_fd.map(clone_file).transpose()?;
         let requester_uid = ThreadState::get_calling_uid();
-        let requester_sid = get_calling_sid()?;
         let requester_debug_pid = ThreadState::get_calling_pid();
         let cid = next_cid().or(Err(ExceptionCode::ILLEGAL_STATE))?;
 
@@ -466,20 +469,14 @@ impl VirtualizationService {
             detect_hangup: is_app_config,
         };
         let instance = Arc::new(
-            VmInstance::new(
-                crosvm_config,
-                temporary_directory,
-                requester_uid,
-                requester_sid,
-                requester_debug_pid,
-            )
-            .map_err(|e| {
-                error!("Failed to create VM with config {:?}: {:?}", config, e);
-                Status::new_service_specific_error_str(
-                    -1,
-                    Some(format!("Failed to create VM: {:?}", e)),
-                )
-            })?,
+            VmInstance::new(crosvm_config, temporary_directory, requester_uid, requester_debug_pid)
+                .map_err(|e| {
+                    error!("Failed to create VM with config {:?}: {:?}", config, e);
+                    Status::new_service_specific_error_str(
+                        -1,
+                        Some(format!("Failed to create VM: {:?}", e)),
+                    )
+                })?,
         );
         state.add_vm(Arc::downgrade(&instance));
         Ok(VirtualMachine::create(instance))
@@ -664,11 +661,8 @@ fn create_vm_payload_config(payload_config: &VirtualMachinePayloadConfig) -> VmP
     // There isn't an actual config file. Construct a synthetic VmPayloadConfig from the explicit
     // parameters we've been given. Microdroid will do something equivalent inside the VM using the
     // payload config that we send it via the metadata file.
-    let task = Task {
-        type_: TaskType::MicrodroidLauncher,
-        command: payload_config.payloadPath.clone(),
-        args: payload_config.args.clone(),
-    };
+    let task =
+        Task { type_: TaskType::MicrodroidLauncher, command: payload_config.payloadPath.clone() };
     VmPayloadConfig {
         os: OsConfig { name: MICRODROID_OS_NAME.to_owned() },
         task: Some(task),
@@ -703,27 +697,6 @@ struct CompositeImageFilenames {
     header: PathBuf,
     /// The footer partition image.
     footer: PathBuf,
-}
-
-/// Gets the calling SID of the current Binder thread.
-fn get_calling_sid() -> Result<String, Status> {
-    ThreadState::with_calling_sid(|sid| {
-        if let Some(sid) = sid {
-            match sid.to_str() {
-                Ok(sid) => Ok(sid.to_owned()),
-                Err(e) => {
-                    error!("SID was not valid UTF-8: {}", e);
-                    Err(Status::new_exception_str(
-                        ExceptionCode::ILLEGAL_ARGUMENT,
-                        Some(format!("SID was not valid UTF-8: {}", e)),
-                    ))
-                }
-            }
-        } else {
-            error!("Missing SID on createVm");
-            Err(Status::new_exception_str(ExceptionCode::SECURITY, Some("Missing SID on createVm")))
-        }
-    })
 }
 
 /// Checks whether the caller has a specific permission
@@ -1162,6 +1135,36 @@ impl IVirtualMachineService for VirtualMachineService {
             Ok(())
         } else {
             error!("notifyError is called from an unknown CID {}", cid);
+            Err(Status::new_service_specific_error_str(
+                -1,
+                Some(format!("cannot find a VM with CID {}", cid)),
+            ))
+        }
+    }
+
+    fn notifyCpuStatus(&self, status: &VirtualMachineCpuStatus) -> binder::Result<()> {
+        let cid = self.cid;
+        if let Some(vm) = self.state.lock().unwrap().get_vm(cid) {
+            info!("VM having CID {} encountered an error", cid);
+            write_vm_cpu_status_stats(vm.requester_uid as i32, &vm.name, status);
+            Ok(())
+        } else {
+            error!("notifyCurrentStatus is called from an unknown CID {}", cid);
+            Err(Status::new_service_specific_error_str(
+                -1,
+                Some(format!("cannot find a VM with CID {}", cid)),
+            ))
+        }
+    }
+
+    fn notifyMemStatus(&self, status: &VirtualMachineMemStatus) -> binder::Result<()> {
+        let cid = self.cid;
+        if let Some(vm) = self.state.lock().unwrap().get_vm(cid) {
+            info!("VM having CID {} encountered an error", cid);
+            write_vm_mem_status_stats(vm.requester_uid as i32, &vm.name, status);
+            Ok(())
+        } else {
+            error!("notifyCurrentStatus is called from an unknown CID {}", cid);
             Err(Status::new_service_specific_error_str(
                 -1,
                 Some(format!("cannot find a VM with CID {}", cid)),
