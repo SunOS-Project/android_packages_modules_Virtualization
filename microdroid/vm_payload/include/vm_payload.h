@@ -25,12 +25,36 @@
 extern "C" {
 #endif
 
+struct AIBinder;
+typedef struct AIBinder AIBinder;
+
 /**
  * Notifies the host that the payload is ready.
  *
  * \return true if the notification succeeds else false.
  */
 bool AVmPayload_notifyPayloadReady(void);
+
+/**
+ * Runs a binder RPC server, serving the supplied binder service implementation on the given vsock
+ * port.
+ *
+ * If and when the server is ready for connections (it is listening on the port), `on_ready` is
+ * called to allow appropriate action to be taken - e.g. to notify clients that they may now
+ * attempt to connect with `AVmPayload_notifyPayloadReady`.
+ *
+ * The current thread is joined to the binder thread pool to handle incoming messages.
+ *
+ * \param service the service to bind to the given port.
+ * \param port vsock port.
+ * \param on_ready the callback to execute once the server is ready for connections. The callback
+ *                 will be called at most once.
+ * \param param param for the `on_ready` callback.
+ *
+ * \return true if the server has shutdown normally, false if it failed in some way.
+ */
+bool AVmPayload_runVsockRpcServer(AIBinder *service, unsigned int port,
+                                  void (*on_ready)(void *param), void *param);
 
 /**
  * Get a secret that is uniquely bound to this VM instance. The secrets are 32-byte values and the
@@ -49,8 +73,7 @@ bool AVmPayload_getVmInstanceSecret(const void *identifier, size_t identifier_si
 /**
  * Get the VM's DICE attestation chain.
  *
- * TODO: don't expose the contained privacy breaking identifiers to the payload
- * TODO: keep the DICE chain as an internal detail for as long as possible
+ * This function will fail if the use of restricted APIs is not permitted.
  *
  * \param data pointer to size bytes where the chain is written.
  * \param size number of bytes that can be written to data.
@@ -63,7 +86,7 @@ bool AVmPayload_getDiceAttestationChain(void *data, size_t size, size_t *total);
 /**
  * Get the VM's DICE attestation CDI.
  *
- * TODO: don't expose the raw CDI, only derived values
+ * This function will fail if the use of restricted APIs is not permitted.
  *
  * \param data pointer to size bytes where the CDI is written.
  * \param size number of bytes that can be written to data.
@@ -72,6 +95,17 @@ bool AVmPayload_getDiceAttestationChain(void *data, size_t size, size_t *total);
  * \return true on success and false on failure.
  */
 bool AVmPayload_getDiceAttestationCdi(void *data, size_t size, size_t *total);
+
+/**
+ * Gets the path to the APK contents. It is a directory, under which are
+ * the unzipped contents of the APK containing the payload, all read-only
+ * but accessible to the payload.
+ *
+ * \return the path to the APK contents. The returned string should not be
+ * deleted or freed by the application. The string remains valid for the
+ * lifetime of the VM.
+ */
+const char *AVmPayload_getApkContentsPath(void);
 
 #ifdef __cplusplus
 } // extern "C"

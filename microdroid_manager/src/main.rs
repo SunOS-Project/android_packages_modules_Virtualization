@@ -33,12 +33,14 @@ use android_system_virtualmachineservice::aidl::android::system::virtualmachines
     VirtualMachineCpuStatus::VirtualMachineCpuStatus,
     VirtualMachineMemStatus::VirtualMachineMemStatus,
 };
+use android_system_virtualization_payload::aidl::android::system::virtualization::payload::IVmPayloadService::VM_APK_CONTENTS_PATH;
 use anyhow::{anyhow, bail, ensure, Context, Error, Result};
 use apkverify::{get_public_key_der, verify, V4Signature};
 use binder::{ProcessState, Strong};
 use diced_utils::cbor::{encode_header, encode_number};
 use glob::glob;
 use itertools::sorted;
+use libc::VMADDR_CID_HOST;
 use log::{error, info};
 use microdroid_metadata::{write_metadata, Metadata, PayloadMetadata};
 use microdroid_payload_config::{OsConfig, Task, TaskType, VmPayloadConfig};
@@ -62,6 +64,7 @@ use std::time::{Duration, SystemTime};
 use vsock::VsockStream;
 
 const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+const SENDING_VM_STATUS_CYCLE_PERIOD: Duration = Duration::from_secs(60);
 const MAIN_APK_PATH: &str = "/dev/block/by-name/microdroid-apk";
 const MAIN_APK_IDSIG_PATH: &str = "/dev/block/by-name/microdroid-apk-idsig";
 const MAIN_APK_DEVICE_NAME: &str = "microdroid-apk";
@@ -74,9 +77,6 @@ const AVF_STRICT_BOOT: &str = "/sys/firmware/devicetree/base/chosen/avf,strict-b
 const AVF_NEW_INSTANCE: &str = "/sys/firmware/devicetree/base/chosen/avf,new-instance";
 const DEBUG_MICRODROID_NO_VERIFIED_BOOT: &str =
     "/sys/firmware/devicetree/base/virtualization/guest/debug-microdroid,no-verified-boot";
-
-/// The CID representing the host VM
-const VMADDR_CID_HOST: u32 = 2;
 
 const APEX_CONFIG_DONE_PROP: &str = "apex_config.done";
 const APP_DEBUGGABLE_PROP: &str = "ro.boot.microdroid.app_debuggable";
@@ -97,39 +97,39 @@ enum MicrodroidError {
     InvalidConfig(String),
 }
 
-fn send_vm_status() -> Result<()> {
+fn send_vm_status(service: &Strong<dyn IVirtualMachineService>) -> Result<()> {
+    // Collect VM CPU time information and creating VmCpuStatus atom for metrics.
+    let cpu_time = get_cpu_time()?;
+    let vm_cpu_status = VirtualMachineCpuStatus {
+        cpu_time_user: cpu_time.user,
+        cpu_time_nice: cpu_time.nice,
+        cpu_time_sys: cpu_time.sys,
+        cpu_time_idle: cpu_time.idle,
+    };
+    service.notifyCpuStatus(&vm_cpu_status).expect("Can't send information about VM CPU status");
+
+    // Collect VM memory information and creating VmMemStatus atom for metrics.
+    let mem_info = get_mem_info()?;
+    let vm_mem_status = VirtualMachineMemStatus {
+        mem_total: mem_info.total,
+        mem_free: mem_info.free,
+        mem_available: mem_info.available,
+        mem_buffer: mem_info.buffer,
+        mem_cached: mem_info.cached,
+    };
+    service.notifyMemStatus(&vm_mem_status).expect("Can't send information about VM memory status");
+
+    Ok(())
+}
+
+fn send_vm_status_periodically() -> Result<()> {
     let service = get_vms_rpc_binder()
         .context("cannot connect to VirtualMachineService")
         .map_err(|e| MicrodroidError::FailedToConnectToVirtualizationService(e.to_string()))?;
 
-    let one_second = Duration::from_millis(1000);
     loop {
-        // Collect VM CPU time information and creating VmCpuStatus atom for metrics.
-        let cpu_time = get_cpu_time()?;
-        let vm_cpu_status = VirtualMachineCpuStatus {
-            cpu_time_user: cpu_time.user,
-            cpu_time_nice: cpu_time.nice,
-            cpu_time_sys: cpu_time.sys,
-            cpu_time_idle: cpu_time.idle,
-        };
-        service
-            .notifyCpuStatus(&vm_cpu_status)
-            .expect("Can't send information about VM CPU status");
-
-        // Collect VM memory information and creating VmMemStatus atom for metrics.
-        let mem_info = get_mem_info()?;
-        let vm_mem_status = VirtualMachineMemStatus {
-            mem_total: mem_info.total,
-            mem_free: mem_info.free,
-            mem_available: mem_info.available,
-            mem_buffer: mem_info.buffer,
-            mem_cached: mem_info.cached,
-        };
-        service
-            .notifyMemStatus(&vm_mem_status)
-            .expect("Can't send information about VM memory status");
-
-        thread::sleep(one_second);
+        send_vm_status(&service)?;
+        thread::sleep(SENDING_VM_STATUS_CYCLE_PERIOD);
     }
 }
 
@@ -226,7 +226,7 @@ fn try_main() -> Result<()> {
         .map_err(|e| MicrodroidError::FailedToConnectToVirtualizationService(e.to_string()))?;
 
     thread::spawn(move || {
-        if let Err(e) = send_vm_status() {
+        if let Err(e) = send_vm_status_periodically() {
             error!("failed to get virtual machine status: {:?}", e);
         }
     });
@@ -399,10 +399,17 @@ fn try_run_payload(service: &Strong<dyn IVirtualMachineService>) -> Result<i32> 
         MountForExec::Allowed,
         "fscontext=u:object_r:zipfusefs:s0,context=u:object_r:system_file:s0",
         Path::new("/dev/block/mapper/microdroid-apk"),
-        Path::new("/mnt/apk"),
+        Path::new(VM_APK_CONTENTS_PATH),
         Some(APK_MOUNT_DONE_PROP),
     )
     .context("Failed to run zipfuse")?;
+
+    // Restricted APIs are only allowed to be used by platform or test components. Infer this from
+    // the use of a VM config file since those can only be used by platform and test components.
+    let allow_restricted_apis = match payload_metadata {
+        PayloadMetadata::config_path(_) => true,
+        PayloadMetadata::config(_) => false,
+    };
 
     let config = load_config(payload_metadata).context("Failed to load payload metadata")?;
 
@@ -439,10 +446,11 @@ fn try_run_payload(service: &Strong<dyn IVirtualMachineService>) -> Result<i32> 
     // Wait until zipfuse has mounted the APK so we can access the payload
     wait_for_property_true(APK_MOUNT_DONE_PROP).context("Failed waiting for APK mount done")?;
 
-    register_vm_payload_service(service.clone(), dice)?;
+    register_vm_payload_service(allow_restricted_apis, service.clone(), dice)?;
     ProcessState::start_thread_pool();
 
     system_properties::write("dev.bootcomplete", "1").context("set dev.bootcomplete")?;
+    send_vm_status(service)?;
 
     exec_task(task, service).context("Failed to run payload")
 }
@@ -775,12 +783,11 @@ fn exec_task(task: &Task, service: &Strong<dyn IVirtualMachineService>) -> Resul
     service.notifyPayloadStarted()?;
 
     let exit_status = command.spawn()?.wait()?;
+    send_vm_status(service)?;
     exit_status.code().ok_or_else(|| anyhow!("Failed to get exit_code from the paylaod."))
 }
 
 fn build_command(task: &Task) -> Result<Command> {
-    const VMADDR_CID_HOST: u32 = 2;
-
     let mut command = match task.type_ {
         TaskType::Executable => Command::new(&task.command),
         TaskType::MicrodroidLauncher => {
@@ -818,7 +825,7 @@ fn find_library_path(name: &str) -> Result<String> {
     let mut watcher = PropertyWatcher::new("ro.product.cpu.abilist")?;
     let value = watcher.read(|_name, value| Ok(value.trim().to_string()))?;
     let abi = value.split(',').next().ok_or_else(|| anyhow!("no abilist"))?;
-    let path = format!("/mnt/apk/lib/{}/{}", abi, name);
+    let path = format!("{}/lib/{}/{}", VM_APK_CONTENTS_PATH, abi, name);
 
     let metadata = fs::metadata(&path).with_context(|| format!("Unable to access {}", path))?;
     if !metadata.is_file() {

@@ -22,7 +22,6 @@ use crate::composite::make_composite_image;
 use crate::crosvm::{CrosvmConfig, DiskFile, PayloadState, VmInstance, VmState};
 use crate::payload::{add_microdroid_payload_images, add_microdroid_system_images};
 use crate::selinux::{getfilecon, SeContext};
-use crate::{Cid, FIRST_GUEST_CID, SYSPROP_LAST_CID};
 use android_os_permissions_aidl::aidl::android::os::IPermissionController;
 use android_system_virtualizationcommon::aidl::android::system::virtualizationcommon::ErrorCode::ErrorCode;
 use android_system_virtualizationservice::aidl::android::system::virtualizationservice::{
@@ -55,6 +54,7 @@ use binder::{
     SpIBinder, Status, StatusCode, Strong, ThreadState,
 };
 use disk::QcowFile;
+use libc::VMADDR_CID_HOST;
 use log::{debug, error, info, warn};
 use microdroid_payload_config::{OsConfig, Task, TaskType, VmPayloadConfig};
 use rpcbinder::run_vsock_rpc_server_with_factory;
@@ -73,13 +73,19 @@ use vmconfig::VmConfig;
 use vsock::{VsockListener, VsockStream};
 use zip::ZipArchive;
 
+/// The unique ID of a VM used (together with a port number) for vsock communication.
+pub type Cid = u32;
+
 pub const BINDER_SERVICE_IDENTIFIER: &str = "android.system.virtualizationservice";
 
 /// Directory in which to write disk image files used while running VMs.
 pub const TEMPORARY_DIRECTORY: &str = "/data/misc/virtualizationservice";
 
-/// The CID representing the host VM
-const VMADDR_CID_HOST: u32 = 2;
+/// The first CID to assign to a guest VM managed by the VirtualizationService. CIDs lower than this
+/// are reserved for the host or other usage.
+const FIRST_GUEST_CID: Cid = 10;
+
+const SYSPROP_LAST_CID: &str = "virtualizationservice.state.last_cid";
 
 /// The size of zero.img.
 /// Gaps in composite disk images are filled with a shared zero.img.
@@ -253,7 +259,6 @@ impl IVirtualizationService for VirtualizationService {
 fn handle_stream_connection_tombstoned() -> Result<()> {
     let listener =
         VsockListener::bind_with_cid_port(VMADDR_CID_HOST, VM_TOMBSTONES_SERVICE_PORT as u32)?;
-    info!("Listening to tombstones from guests ...");
     for incoming_stream in listener.incoming() {
         let mut incoming_stream = match incoming_stream {
             Err(e) => {
@@ -340,10 +345,18 @@ impl VirtualizationService {
     ) -> binder::Result<Strong<dyn IVirtualMachine>> {
         check_manage_access()?;
 
-        if let VirtualMachineConfig::RawConfig(config) = config {
-            if config.protectedVm {
-                check_use_custom_virtual_machine()?;
+        let is_custom = match config {
+            VirtualMachineConfig::RawConfig(_) => true,
+            VirtualMachineConfig::AppConfig(config) => {
+                // Some features are reserved for platform apps only, even when using
+                // VirtualMachineAppConfig:
+                // - controlling CPUs;
+                // - specifying a config file in the APK.
+                !config.taskProfiles.is_empty() || matches!(config.payload, Payload::ConfigPath(_))
             }
+        };
+        if is_custom {
+            check_use_custom_virtual_machine()?;
         }
 
         let state = &mut *self.state.lock().unwrap();
@@ -351,7 +364,7 @@ impl VirtualizationService {
         let log_fd = log_fd.map(clone_file).transpose()?;
         let requester_uid = ThreadState::get_calling_uid();
         let requester_debug_pid = ThreadState::get_calling_pid();
-        let cid = next_cid().or(Err(ExceptionCode::ILLEGAL_STATE))?;
+        let cid = state.next_cid().or(Err(ExceptionCode::ILLEGAL_STATE))?;
 
         // Counter to generate unique IDs for temporary image files.
         let mut next_temporary_image_id = 0;
@@ -377,18 +390,17 @@ impl VirtualizationService {
             )
         })?;
 
-        let is_app_config = matches!(config, VirtualMachineConfig::AppConfig(_));
-
-        let config = match config {
-            VirtualMachineConfig::AppConfig(config) => BorrowedOrOwned::Owned(
-                load_app_config(config, &temporary_directory).map_err(|e| {
+        let (is_app_config, config) = match config {
+            VirtualMachineConfig::RawConfig(config) => (false, BorrowedOrOwned::Borrowed(config)),
+            VirtualMachineConfig::AppConfig(config) => {
+                let config = load_app_config(config, &temporary_directory).map_err(|e| {
                     *is_protected = config.protectedVm;
                     let message = format!("Failed to load app config: {:?}", e);
                     error!("{}", message);
                     Status::new_service_specific_error_str(-1, Some(message))
-                })?,
-            ),
-            VirtualMachineConfig::RawConfig(config) => BorrowedOrOwned::Borrowed(config),
+                })?;
+                (true, BorrowedOrOwned::Owned(config))
+            }
         };
         let config = config.as_ref();
         *is_protected = config.protectedVm;
@@ -590,12 +602,6 @@ fn load_app_config(
     config: &VirtualMachineAppConfig,
     temporary_directory: &Path,
 ) -> Result<VirtualMachineRawConfig> {
-    // Controlling CPUs is reserved for platform apps only, even when using
-    // VirtualMachineAppConfig.
-    if !config.taskProfiles.is_empty() {
-        check_use_custom_virtual_machine()?
-    }
-
     let apk_file = clone_file(config.apk.as_ref().unwrap())?;
     let idsig_file = clone_file(config.idsig.as_ref().unwrap())?;
     let instance_file = clone_file(config.instanceImage.as_ref().unwrap())?;
@@ -969,27 +975,27 @@ impl State {
         let vm = self.debug_held_vms.swap_remove(pos);
         Some(vm)
     }
-}
 
-/// Get the next available CID, or an error if we have run out. The last CID used is stored in
-/// a system property so that restart of virtualizationservice doesn't reuse CID while the host
-/// Android is up.
-fn next_cid() -> Result<Cid> {
-    let next = if let Some(val) = system_properties::read(SYSPROP_LAST_CID)? {
-        if let Ok(num) = val.parse::<u32>() {
-            num.checked_add(1).ok_or_else(|| anyhow!("run out of CID"))?
+    /// Get the next available CID, or an error if we have run out. The last CID used is stored in
+    /// a system property so that restart of virtualizationservice doesn't reuse CID while the host
+    /// Android is up.
+    fn next_cid(&mut self) -> Result<Cid> {
+        let next = if let Some(val) = system_properties::read(SYSPROP_LAST_CID)? {
+            if let Ok(num) = val.parse::<u32>() {
+                num.checked_add(1).ok_or_else(|| anyhow!("run out of CID"))?
+            } else {
+                error!("Invalid last CID {}. Using {}", &val, FIRST_GUEST_CID);
+                FIRST_GUEST_CID
+            }
         } else {
-            error!("Invalid last CID {}. Using {}", &val, FIRST_GUEST_CID);
+            // First VM since the boot
             FIRST_GUEST_CID
-        }
-    } else {
-        // First VM since the boot
-        FIRST_GUEST_CID
-    };
-    // Persist the last value for next use
-    let str_val = format!("{}", next);
-    system_properties::write(SYSPROP_LAST_CID, &str_val)?;
-    Ok(next)
+        };
+        // Persist the last value for next use
+        let str_val = format!("{}", next);
+        system_properties::write(SYSPROP_LAST_CID, &str_val)?;
+        Ok(next)
+    }
 }
 
 /// Gets the `VirtualMachineState` of the given `VmInstance`.
@@ -1069,7 +1075,7 @@ impl IVirtualMachineService for VirtualMachineService {
     fn notifyPayloadStarted(&self) -> binder::Result<()> {
         let cid = self.cid;
         if let Some(vm) = self.state.lock().unwrap().get_vm(cid) {
-            info!("VM having CID {} started payload", cid);
+            info!("VM with CID {} started payload", cid);
             vm.update_payload_state(PayloadState::Started).map_err(|e| {
                 Status::new_exception_str(ExceptionCode::ILLEGAL_STATE, Some(e.to_string()))
             })?;
@@ -1091,7 +1097,7 @@ impl IVirtualMachineService for VirtualMachineService {
     fn notifyPayloadReady(&self) -> binder::Result<()> {
         let cid = self.cid;
         if let Some(vm) = self.state.lock().unwrap().get_vm(cid) {
-            info!("VM having CID {} payload is ready", cid);
+            info!("VM with CID {} reported payload is ready", cid);
             vm.update_payload_state(PayloadState::Ready).map_err(|e| {
                 Status::new_exception_str(ExceptionCode::ILLEGAL_STATE, Some(e.to_string()))
             })?;
@@ -1109,7 +1115,7 @@ impl IVirtualMachineService for VirtualMachineService {
     fn notifyPayloadFinished(&self, exit_code: i32) -> binder::Result<()> {
         let cid = self.cid;
         if let Some(vm) = self.state.lock().unwrap().get_vm(cid) {
-            info!("VM having CID {} finished payload", cid);
+            info!("VM with CID {} finished payload", cid);
             vm.update_payload_state(PayloadState::Finished).map_err(|e| {
                 Status::new_exception_str(ExceptionCode::ILLEGAL_STATE, Some(e.to_string()))
             })?;
@@ -1127,7 +1133,7 @@ impl IVirtualMachineService for VirtualMachineService {
     fn notifyError(&self, error_code: ErrorCode, message: &str) -> binder::Result<()> {
         let cid = self.cid;
         if let Some(vm) = self.state.lock().unwrap().get_vm(cid) {
-            info!("VM having CID {} encountered an error", cid);
+            info!("VM with CID {} encountered an error", cid);
             vm.update_payload_state(PayloadState::Finished).map_err(|e| {
                 Status::new_exception_str(ExceptionCode::ILLEGAL_STATE, Some(e.to_string()))
             })?;
@@ -1145,7 +1151,7 @@ impl IVirtualMachineService for VirtualMachineService {
     fn notifyCpuStatus(&self, status: &VirtualMachineCpuStatus) -> binder::Result<()> {
         let cid = self.cid;
         if let Some(vm) = self.state.lock().unwrap().get_vm(cid) {
-            info!("VM having CID {} encountered an error", cid);
+            info!("VM with CID {} reported its CPU status", cid);
             write_vm_cpu_status_stats(vm.requester_uid as i32, &vm.name, status);
             Ok(())
         } else {
@@ -1160,7 +1166,7 @@ impl IVirtualMachineService for VirtualMachineService {
     fn notifyMemStatus(&self, status: &VirtualMachineMemStatus) -> binder::Result<()> {
         let cid = self.cid;
         if let Some(vm) = self.state.lock().unwrap().get_vm(cid) {
-            info!("VM having CID {} encountered an error", cid);
+            info!("VM with CID {} reported its memory status", cid);
             write_vm_mem_status_stats(vm.requester_uid as i32, &vm.name, status);
             Ok(())
         } else {

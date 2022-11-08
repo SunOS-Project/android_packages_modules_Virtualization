@@ -18,9 +18,12 @@ package android.system.virtualmachine;
 
 import static android.os.ParcelFileDescriptor.MODE_READ_ONLY;
 
+import static java.util.Objects.requireNonNull;
+
 import android.annotation.IntDef;
 import android.annotation.NonNull;
 import android.annotation.Nullable;
+import android.annotation.RequiresPermission;
 import android.content.Context;
 import android.os.ParcelFileDescriptor;
 import android.os.PersistableBundle;
@@ -56,7 +59,7 @@ public final class VirtualMachineConfig {
     private static final String KEY_MEMORY_MIB = "memoryMib";
     private static final String KEY_NUM_CPUS = "numCpus";
 
-    // Paths to the APK file of this application.
+    // Absolute path to the APK file containing the VM payload.
     @NonNull private final String mApkPath;
 
     /** @hide */
@@ -127,7 +130,11 @@ public final class VirtualMachineConfig {
             boolean protectedVm,
             int memoryMib,
             int numCpus) {
-        mApkPath = Objects.requireNonNull(apkPath);
+        requireNonNull(apkPath);
+        if (!apkPath.startsWith("/")) {
+            throw new IllegalArgumentException("APK path must be an absolute path");
+        }
+        mApkPath = apkPath;
         mPayloadConfigPath = payloadConfigPath;
         mPayloadBinaryPath = payloadBinaryPath;
         mDebugLevel = debugLevel;
@@ -184,6 +191,17 @@ public final class VirtualMachineConfig {
             b.putInt(KEY_MEMORY_MIB, mMemoryMib);
         }
         b.writeToStream(output);
+    }
+
+    /**
+     * Returns the absolute path of the APK which should contain the binary payload that will
+     * execute within the VM.
+     *
+     * @hide
+     */
+    @NonNull
+    public String getApkPath() {
+        return mApkPath;
     }
 
     /**
@@ -306,6 +324,7 @@ public final class VirtualMachineConfig {
      */
     public static final class Builder {
         private final Context mContext;
+        @Nullable private String mApkPath;
         @Nullable private String mPayloadConfigPath;
         @Nullable private String mPayloadBinaryPath;
         @DebugLevel private int mDebugLevel;
@@ -320,7 +339,7 @@ public final class VirtualMachineConfig {
          * @hide
          */
         public Builder(@NonNull Context context) {
-            mContext = Objects.requireNonNull(context);
+            mContext = requireNonNull(context);
             mDebugLevel = DEBUG_LEVEL_NONE;
             mNumCpus = 1;
         }
@@ -332,9 +351,9 @@ public final class VirtualMachineConfig {
          */
         @NonNull
         public VirtualMachineConfig build() {
-            final String apkPath = mContext.getPackageCodePath();
+            String apkPath = (mApkPath == null) ? mContext.getPackageCodePath() : mApkPath;
 
-            final int availableCpus = Runtime.getRuntime().availableProcessors();
+            int availableCpus = Runtime.getRuntime().availableProcessors();
             if (mNumCpus < 1 || mNumCpus > availableCpus) {
                 throw new IllegalArgumentException("Number of vCPUs (" + mNumCpus + ") is out of "
                         + "range [1, " + availableCpus + "]");
@@ -352,7 +371,7 @@ public final class VirtualMachineConfig {
             }
 
             if (!mProtectedVmSet) {
-                throw new IllegalStateException("protectedVm must be set explicitly");
+                throw new IllegalStateException("setProtectedVm(t/f) must be called explicitly");
             }
 
             if (mProtectedVm
@@ -371,26 +390,39 @@ public final class VirtualMachineConfig {
         }
 
         /**
+         * Sets the absolute path of the APK containing the binary payload that will execute within
+         * the VM. If not set explicitly, defaults to the primary APK of the context.
+         *
+         * @hide
+         */
+        @NonNull
+        public Builder setApkPath(@NonNull String apkPath) {
+            mApkPath = requireNonNull(apkPath);
+            return this;
+        }
+
+        /**
          * Sets the path within the APK to the payload config file that defines software aspects
          * of the VM.
          *
          * @hide
          */
+        @RequiresPermission(VirtualMachine.USE_CUSTOM_VIRTUAL_MACHINE_PERMISSION)
         @NonNull
         public Builder setPayloadConfigPath(@NonNull String payloadConfigPath) {
-            mPayloadConfigPath = Objects.requireNonNull(payloadConfigPath);
+            mPayloadConfigPath = requireNonNull(payloadConfigPath);
             return this;
         }
 
         /**
-         * Sets the path within the APK to the payload binary file that will be executed within
-         * the VM.
+         * Sets the path within the {@code lib/<ABI>} directory of the APK to the payload binary
+         * file that will be executed within the VM.
          *
          * @hide
          */
         @NonNull
         public Builder setPayloadBinaryPath(@NonNull String payloadBinaryPath) {
-            mPayloadBinaryPath = Objects.requireNonNull(payloadBinaryPath);
+            mPayloadBinaryPath = requireNonNull(payloadBinaryPath);
             return this;
         }
 

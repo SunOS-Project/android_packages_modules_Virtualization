@@ -73,7 +73,7 @@ android_system_image {
         "linker",
         "linkerconfig",
         "servicemanager.microdroid",
-        "tombstoned",
+        "tombstoned.microdroid",
         "tombstone_transmit.microdroid",
         "cgroups.json",
         "task_profiles.json",
@@ -89,6 +89,8 @@ android_system_image {
         // TODO(b/195425111) these should be added automatically
         "libcrypto", // used by many (init_second_stage, microdroid_manager, toybox, etc)
         "liblzma", // used by init_second_stage
+
+        "libvm_payload", // used by payload to interact with microdroid manager
     ] + microdroid_shell_and_utilities,
     multilib: {
         common: {
@@ -168,7 +170,8 @@ genrule {
         "grep ro\\.build\\.version\\.security_patch= $(location :buildinfo.prop) && " +
         "grep ro\\.build\\.version\\.known_codenames= $(location :buildinfo.prop) && " +
         "cat $(location build.prop) && " +
-        "echo ro.product.cpu.abilist=x86_64) > $(out)",
+        "echo ro.product.cpu.abilist=x86_64 && " +
+        "echo ro.product.cpu.abi=x86_64) > $(out)",
 }
 
 genrule {
@@ -185,7 +188,8 @@ genrule {
         "grep ro\\.build\\.version\\.security_patch= $(location :buildinfo.prop) && " +
         "grep ro\\.build\\.version\\.known_codenames= $(location :buildinfo.prop) && " +
         "cat $(location build.prop) && " +
-        "echo ro.product.cpu.abilist=arm64-v8a) > $(out)",
+        "echo ro.product.cpu.abilist=arm64-v8a && " +
+        "echo ro.product.cpu.abi=arm64-v8a) > $(out)",
 }
 
 android_filesystem {
@@ -299,21 +303,6 @@ bootimg {
     partition_name: "vendor_boot",
     use_avb: true,
     avb_private_key: ":microdroid_sign_key",
-}
-
-// TODO(b/231117670) remove this when VirtualizationTestCases moves to the
-// microdroid kernel
-prebuilt_kernel_modules {
-    name: "microdroid_kernel_modules",
-    arch: {
-        arm64: {
-            srcs: [":virt_device_prebuilts_kernel_modules_microdroid-5.15-arm64"],
-        },
-        x86_64: {
-            srcs: [":virt_device_prebuilts_kernel_modules_microdroid-5.15-x86_64"],
-        },
-    },
-    kernel_version: "5.15",
 }
 
 android_filesystem {

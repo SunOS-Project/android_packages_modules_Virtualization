@@ -24,7 +24,6 @@ import static com.google.common.truth.Truth.assertThat;
 
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.fail;
-import static org.junit.Assume.assumeTrue;
 
 import com.android.compatibility.common.tradefed.build.CompatibilityBuildHelper;
 import com.android.compatibility.common.util.PollingCheck;
@@ -100,14 +99,6 @@ public class AuthFsTestRule extends TestLogData {
         sTestInfo = testInfo;
         TestDevice androidDevice = getDevice();
         sAndroid = new CommandRunner(androidDevice);
-
-        // NB: We can't use assumeTrue because the assumption exception is NOT handled by the test
-        // infra when it is thrown from a class method (see b/37502066). We need to skip both here
-        // and in setUp.
-        if (!androidDevice.supportsMicrodroid()) {
-            CLog.i("Microdroid not supported. Skipping.");
-            return;
-        }
     }
 
     public static void tearDownAndroid() {
@@ -131,7 +122,7 @@ public class AuthFsTestRule extends TestLogData {
         return sMicrodroidDevice;
     }
 
-    public static void startMicrodroid() throws DeviceNotAvailableException {
+    public static void startMicrodroid(boolean protectedVm) throws DeviceNotAvailableException {
         CLog.i("Starting the shared VM");
         assertThat(sMicrodroidDevice).isNull();
         sMicrodroidDevice =
@@ -139,6 +130,7 @@ public class AuthFsTestRule extends TestLogData {
                                 findTestFile(sTestInfo.getBuildInfo(), TEST_APK_NAME),
                                 VM_CONFIG_PATH_IN_APK)
                         .debugLevel("full")
+                        .protectedVm(protectedVm)
                         .build(getDevice());
 
         // From this point on, we need to tear down the Microdroid instance
@@ -152,10 +144,11 @@ public class AuthFsTestRule extends TestLogData {
     }
 
     public static void shutdownMicrodroid() throws DeviceNotAvailableException {
-        assertNotNull(sMicrodroidDevice);
-        getDevice().shutdownMicrodroid(sMicrodroidDevice);
-        sMicrodroidDevice = null;
-        sMicrodroid = null;
+        if (sMicrodroidDevice != null) {
+            getDevice().shutdownMicrodroid(sMicrodroidDevice);
+            sMicrodroidDevice = null;
+            sMicrodroid = null;
+        }
     }
 
     @Override
@@ -224,7 +217,7 @@ public class AuthFsTestRule extends TestLogData {
         }
     }
 
-    private static TestDevice getDevice() {
+    public static TestDevice getDevice() {
         return (TestDevice) sTestInfo.getDevice();
     }
 
@@ -244,9 +237,10 @@ public class AuthFsTestRule extends TestLogData {
         return FUSE_SUPER_MAGIC_HEX.equals(fs_type);
     }
 
-    private void setUpTest() throws Exception {
-        assumeTrue(getDevice().supportsMicrodroid());
-        sAndroid.run("mkdir -p " + TEST_OUTPUT_DIR);
+    public void setUpTest() throws Exception {
+        if (sAndroid != null) {
+            sAndroid.run("mkdir -p " + TEST_OUTPUT_DIR);
+        }
     }
 
     private void tearDownTest(String testName) throws Exception {

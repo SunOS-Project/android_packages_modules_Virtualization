@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-#include <aidl/android/system/virtualmachineservice/IVirtualMachineService.h>
 #include <aidl/com/android/microdroid/testservice/BnBenchmarkService.h>
 #include <android-base/logging.h>
 #include <android-base/parseint.h>
@@ -29,14 +28,12 @@
 #include <vm_main.h>
 #include <vm_payload.h>
 
-#include <binder_rpc_unstable.hpp>
 #include <fstream>
 #include <random>
 #include <string>
 
 #include "io_vsock.h"
 
-using aidl::android::system::virtualmachineservice::IVirtualMachineService;
 using android::base::ErrnoError;
 using android::base::Error;
 using android::base::Result;
@@ -164,9 +161,8 @@ Result<void> run_io_benchmark_tests() {
             abort();
         }
     };
-
-    if (!RunVsockRpcServerCallback(test_service->asBinder().get(), test_service->SERVICE_PORT,
-                                   callback, nullptr)) {
+    if (!AVmPayload_runVsockRpcServer(test_service->asBinder().get(), test_service->SERVICE_PORT,
+                                      callback, nullptr)) {
         return Error() << "RPC Server failed to run";
     }
     return {};

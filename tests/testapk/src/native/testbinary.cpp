@@ -30,7 +30,6 @@
 #include <vm_main.h>
 #include <vm_payload.h>
 
-#include <binder_rpc_unstable.hpp>
 #include <string>
 
 using android::base::ErrnoError;
@@ -113,6 +112,17 @@ Result<void> start_test_service() {
             }
             return ndk::ScopedAStatus::ok();
         }
+
+        ndk::ScopedAStatus getApkContentsPath(std::string* out) override {
+            const char* path_c = AVmPayload_getApkContentsPath();
+            if (path_c == nullptr) {
+                return ndk::ScopedAStatus::
+                        fromServiceSpecificErrorWithMessage(0, "Failed to get APK contents path");
+            }
+            std::string path(path_c);
+            *out = path;
+            return ndk::ScopedAStatus::ok();
+        }
     };
     auto testService = ndk::SharedRefBase::make<TestService>();
 
@@ -122,8 +132,8 @@ Result<void> start_test_service() {
             abort();
         }
     };
-    if (!RunVsockRpcServerCallback(testService->asBinder().get(), testService->SERVICE_PORT,
-                                   callback, nullptr)) {
+    if (!AVmPayload_runVsockRpcServer(testService->asBinder().get(), testService->SERVICE_PORT,
+                                      callback, nullptr)) {
         return Error() << "RPC Server failed to run";
     }
 
