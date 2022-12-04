@@ -26,6 +26,8 @@ import android.annotation.SuppressLint;
 import android.content.Context;
 import android.sysprop.HypervisorProperties;
 
+import com.android.internal.annotations.GuardedBy;
+
 import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
 import java.lang.ref.WeakReference;
@@ -33,7 +35,14 @@ import java.util.Map;
 import java.util.WeakHashMap;
 
 /**
- * Manages {@link VirtualMachine} objects created for an application.
+ * Manages {@link VirtualMachine virtual machine} instances created by an app. Each instance is
+ * created from a {@link VirtualMachineConfig configuration} that defines the shape of the VM
+ * (RAM, CPUs), the code to execute within it, etc.
+ * <p>
+ * Each virtual machine instance is named; the configuration and related state of each is
+ * persisted in the app's private data directory and an instance can be retrieved given the name.
+ * <p>
+ * The app can then start, stop and otherwise interact with the VM.
  *
  * @hide
  */
@@ -44,6 +53,7 @@ public class VirtualMachineManager {
         mContext = context;
     }
 
+    @GuardedBy("sInstances")
     private static final Map<Context, WeakReference<VirtualMachineManager>> sInstances =
             new WeakHashMap<>();
 
@@ -89,9 +99,6 @@ public class VirtualMachineManager {
         }
     }
 
-    /** A lock used to synchronize the creation of virtual machines */
-    private static final Object sCreateLock = new Object();
-
     /**
      * Returns a set of flags indicating what this implementation of virtualization is capable of.
      *
@@ -129,7 +136,7 @@ public class VirtualMachineManager {
     public VirtualMachine create(
             @NonNull String name, @NonNull VirtualMachineConfig config)
             throws VirtualMachineException {
-        synchronized (sCreateLock) {
+        synchronized (VirtualMachine.sCreateLock) {
             return VirtualMachine.create(mContext, name, config);
         }
     }
@@ -138,12 +145,15 @@ public class VirtualMachineManager {
      * Returns an existing {@link VirtualMachine} with the given name. Returns null if there is no
      * such virtual machine.
      *
-     * @throws VirtualMachineException if the virtual machine could not be successfully retrieved.
+     * @throws VirtualMachineException if the virtual machine exists but could not be successfully
+     *                                 retrieved.
      * @hide
      */
     @Nullable
     public VirtualMachine get(@NonNull String name) throws VirtualMachineException {
-        return VirtualMachine.load(mContext, name);
+        synchronized (VirtualMachine.sCreateLock) {
+            return VirtualMachine.load(mContext, name);
+        }
     }
 
     /**
@@ -158,12 +168,30 @@ public class VirtualMachineManager {
             @NonNull String name, @NonNull VirtualMachineConfig config)
             throws VirtualMachineException {
         VirtualMachine vm;
-        synchronized (sCreateLock) {
+        synchronized (VirtualMachine.sCreateLock) {
             vm = get(name);
             if (vm == null) {
                 vm = create(name, config);
             }
         }
         return vm;
+    }
+
+    /**
+     * Deletes an existing {@link VirtualMachine}. Deleting a virtual machine means deleting any
+     * persisted data associated with it including the per-VM secret. This is an irreversible
+     * action. A virtual machine once deleted can never be restored. A new virtual machine created
+     * with the same name is different from an already deleted virtual machine even if it has the
+     * same config.
+     *
+     * @throws VirtualMachineException if the virtual machine does not exist, is not stopped,
+     *                                 or cannot be deleted.
+     * @hide
+     */
+    public void delete(@NonNull String name) throws VirtualMachineException {
+        requireNonNull(name);
+        synchronized (VirtualMachine.sCreateLock) {
+            VirtualMachine.delete(mContext, name);
+        }
     }
 }
