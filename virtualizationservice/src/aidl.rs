@@ -36,9 +36,13 @@ use android_system_virtualizationservice::aidl::android::system::virtualizations
     VirtualMachineRawConfig::VirtualMachineRawConfig,
     VirtualMachineState::VirtualMachineState,
 };
+use android_system_virtualizationservice_internal::aidl::android::system::virtualizationservice_internal::{
+    IGlobalVmContext::{BnGlobalVmContext, IGlobalVmContext},
+    IVirtualizationServiceInternal::{BnVirtualizationServiceInternal, IVirtualizationServiceInternal},
+};
 use android_system_virtualmachineservice::aidl::android::system::virtualmachineservice::IVirtualMachineService::{
         BnVirtualMachineService, IVirtualMachineService, VM_BINDER_SERVICE_PORT,
-        VM_STREAM_SERVICE_PORT, VM_TOMBSTONES_SERVICE_PORT,
+        VM_TOMBSTONES_SERVICE_PORT,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use apkverify::{HashAlgorithm, V4Signature};
@@ -94,10 +98,94 @@ const CHUNK_RECV_MAX_LEN: usize = 1024;
 
 const MICRODROID_OS_NAME: &str = "microdroid";
 
-/// Implementation of `IVirtualizationService`, the entry point of the AIDL service.
+/// Singleton service for allocating globally-unique VM resources, such as the CID, and running
+/// singleton servers, like tombstone receiver.
 #[derive(Debug, Default)]
+pub struct VirtualizationServiceInternal {
+    state: Arc<Mutex<GlobalState>>,
+}
+
+impl VirtualizationServiceInternal {
+    pub fn init() -> VirtualizationServiceInternal {
+        let service = VirtualizationServiceInternal::default();
+
+        std::thread::spawn(|| {
+            if let Err(e) = handle_stream_connection_tombstoned() {
+                warn!("Error receiving tombstone from guest or writing them. Error: {:?}", e);
+            }
+        });
+
+        service
+    }
+}
+
+impl Interface for VirtualizationServiceInternal {}
+
+impl IVirtualizationServiceInternal for VirtualizationServiceInternal {
+    fn allocateGlobalVmContext(&self) -> binder::Result<Strong<dyn IGlobalVmContext>> {
+        let state = &mut *self.state.lock().unwrap();
+        let cid = state.allocate_cid().map_err(|e| {
+            Status::new_exception_str(ExceptionCode::ILLEGAL_STATE, Some(e.to_string()))
+        })?;
+        Ok(GlobalVmContext::create(cid))
+    }
+}
+
+/// The mutable state of the VirtualizationServiceInternal. There should only be one instance
+/// of this struct.
+#[derive(Debug, Default)]
+struct GlobalState {}
+
+impl GlobalState {
+    /// Get the next available CID, or an error if we have run out. The last CID used is stored in
+    /// a system property so that restart of virtualizationservice doesn't reuse CID while the host
+    /// Android is up.
+    fn allocate_cid(&mut self) -> Result<Cid> {
+        let cid = match system_properties::read(SYSPROP_LAST_CID)? {
+            Some(val) => match val.parse::<Cid>() {
+                Ok(num) => num.checked_add(1).ok_or_else(|| anyhow!("ran out of CIDs"))?,
+                Err(_) => {
+                    error!("Invalid value '{}' of property '{}'", val, SYSPROP_LAST_CID);
+                    FIRST_GUEST_CID
+                }
+            },
+            None => FIRST_GUEST_CID,
+        };
+        system_properties::write(SYSPROP_LAST_CID, &format!("{}", cid))?;
+        Ok(cid)
+    }
+}
+
+/// Implementation of the AIDL `IGlobalVmContext` interface.
+#[derive(Debug, Default)]
+struct GlobalVmContext {
+    /// The unique CID assigned to the VM for vsock communication.
+    cid: Cid,
+    /// Keeps our service process running as long as this VM instance exists.
+    #[allow(dead_code)]
+    lazy_service_guard: LazyServiceGuard,
+}
+
+impl GlobalVmContext {
+    fn create(cid: Cid) -> Strong<dyn IGlobalVmContext> {
+        let binder = GlobalVmContext { cid, ..Default::default() };
+        BnGlobalVmContext::new_binder(binder, BinderFeatures::default())
+    }
+}
+
+impl Interface for GlobalVmContext {}
+
+impl IGlobalVmContext for GlobalVmContext {
+    fn getCid(&self) -> binder::Result<i32> {
+        Ok(self.cid as i32)
+    }
+}
+
+/// Implementation of `IVirtualizationService`, the entry point of the AIDL service.
+#[derive(Debug)]
 pub struct VirtualizationService {
     state: Arc<Mutex<State>>,
+    global_service: Strong<dyn IVirtualizationServiceInternal>,
 }
 
 impl Interface for VirtualizationService {
@@ -299,19 +387,11 @@ fn handle_tombstone(stream: &mut VsockStream) -> Result<()> {
 
 impl VirtualizationService {
     pub fn init() -> VirtualizationService {
-        let service = VirtualizationService::default();
+        let global_service = VirtualizationServiceInternal::init();
+        let global_service =
+            BnVirtualizationServiceInternal::new_binder(global_service, BinderFeatures::default());
 
-        // server for payload output
-        let state = service.state.clone(); // reference to state (not the state itself) is copied
-        std::thread::spawn(move || {
-            handle_stream_connection_from_vm(state).unwrap();
-        });
-
-        std::thread::spawn(|| {
-            if let Err(e) = handle_stream_connection_tombstoned() {
-                warn!("Error receiving tombstone from guest or writing them. Error: {:?}", e);
-            }
-        });
+        let service = VirtualizationService { global_service, state: Default::default() };
 
         // binder server for vm
         // reference to state (not the state itself) is copied
@@ -352,12 +432,14 @@ impl VirtualizationService {
             check_use_custom_virtual_machine()?;
         }
 
+        let vm_context = self.global_service.allocateGlobalVmContext()?;
+        let cid = vm_context.getCid()? as Cid;
+
         let state = &mut *self.state.lock().unwrap();
         let console_fd = console_fd.map(clone_file).transpose()?;
         let log_fd = log_fd.map(clone_file).transpose()?;
         let requester_uid = ThreadState::get_calling_uid();
         let requester_debug_pid = ThreadState::get_calling_pid();
-        let cid = state.next_cid().or(Err(ExceptionCode::ILLEGAL_STATE))?;
 
         // Counter to generate unique IDs for temporary image files.
         let mut next_temporary_image_id = 0;
@@ -474,45 +556,24 @@ impl VirtualizationService {
             detect_hangup: is_app_config,
         };
         let instance = Arc::new(
-            VmInstance::new(crosvm_config, temporary_directory, requester_uid, requester_debug_pid)
-                .map_err(|e| {
-                    error!("Failed to create VM with config {:?}: {:?}", config, e);
-                    Status::new_service_specific_error_str(
-                        -1,
-                        Some(format!("Failed to create VM: {:?}", e)),
-                    )
-                })?,
+            VmInstance::new(
+                crosvm_config,
+                temporary_directory,
+                requester_uid,
+                requester_debug_pid,
+                vm_context,
+            )
+            .map_err(|e| {
+                error!("Failed to create VM with config {:?}: {:?}", config, e);
+                Status::new_service_specific_error_str(
+                    -1,
+                    Some(format!("Failed to create VM: {:?}", e)),
+                )
+            })?,
         );
         state.add_vm(Arc::downgrade(&instance));
         Ok(VirtualMachine::create(instance))
     }
-}
-
-/// Waits for incoming connections from VM. If a new connection is made, stores the stream in the
-/// corresponding `VmInstance`.
-fn handle_stream_connection_from_vm(state: Arc<Mutex<State>>) -> Result<()> {
-    let listener =
-        VsockListener::bind_with_cid_port(VMADDR_CID_HOST, VM_STREAM_SERVICE_PORT as u32)?;
-    for stream in listener.incoming() {
-        let stream = match stream {
-            Err(e) => {
-                warn!("invalid incoming connection: {:?}", e);
-                continue;
-            }
-            Ok(s) => s,
-        };
-        if let Ok(addr) = stream.peer_addr() {
-            let cid = addr.cid();
-            let port = addr.port();
-            info!("payload stream connected from cid={}, port={}", cid, port);
-            if let Some(vm) = state.lock().unwrap().get_vm(cid) {
-                *vm.stream.lock().unwrap() = Some(stream);
-            } else {
-                error!("connection from cid={} is not from a guest VM", cid);
-            }
-        }
-    }
-    Ok(())
 }
 
 fn write_zero_filler(zero_filler_path: &Path) -> Result<()> {
@@ -533,8 +594,7 @@ fn format_as_android_vm_instance(part: &mut dyn Write) -> std::io::Result<()> {
 }
 
 fn prepare_ramdump_file(ramdump_path: &Path) -> Result<File> {
-    File::create(&ramdump_path)
-        .context(format!("Failed to create ramdump file {:?}", &ramdump_path))
+    File::create(ramdump_path).context(format!("Failed to create ramdump file {:?}", &ramdump_path))
 }
 
 /// Given the configuration for a disk image, assembles the `DiskFile` to pass to crosvm.
@@ -854,11 +914,10 @@ pub struct VirtualMachineCallbacks(Mutex<Vec<Strong<dyn IVirtualMachineCallback>
 
 impl VirtualMachineCallbacks {
     /// Call all registered callbacks to notify that the payload has started.
-    pub fn notify_payload_started(&self, cid: Cid, stream: Option<VsockStream>) {
+    pub fn notify_payload_started(&self, cid: Cid) {
         let callbacks = &*self.0.lock().unwrap();
-        let pfd = stream.map(vsock_stream_to_pfd);
         for callback in callbacks {
-            if let Err(e) = callback.onPayloadStarted(cid as i32, pfd.as_ref()) {
+            if let Err(e) = callback.onPayloadStarted(cid as i32) {
                 error!("Error notifying payload start event from VM CID {}: {:?}", cid, e);
             }
         }
@@ -968,27 +1027,6 @@ impl State {
         let vm = self.debug_held_vms.swap_remove(pos);
         Some(vm)
     }
-
-    /// Get the next available CID, or an error if we have run out. The last CID used is stored in
-    /// a system property so that restart of virtualizationservice doesn't reuse CID while the host
-    /// Android is up.
-    fn next_cid(&mut self) -> Result<Cid> {
-        let next = if let Some(val) = system_properties::read(SYSPROP_LAST_CID)? {
-            if let Ok(num) = val.parse::<u32>() {
-                num.checked_add(1).ok_or_else(|| anyhow!("run out of CID"))?
-            } else {
-                error!("Invalid last CID {}. Using {}", &val, FIRST_GUEST_CID);
-                FIRST_GUEST_CID
-            }
-        } else {
-            // First VM since the boot
-            FIRST_GUEST_CID
-        };
-        // Persist the last value for next use
-        let str_val = format!("{}", next);
-        system_properties::write(SYSPROP_LAST_CID, &str_val)?;
-        Ok(next)
-    }
 }
 
 /// Gets the `VirtualMachineState` of the given `VmInstance`.
@@ -1072,11 +1110,10 @@ impl IVirtualMachineService for VirtualMachineService {
             vm.update_payload_state(PayloadState::Started).map_err(|e| {
                 Status::new_exception_str(ExceptionCode::ILLEGAL_STATE, Some(e.to_string()))
             })?;
-            let stream = vm.stream.lock().unwrap().take();
-            vm.callbacks.notify_payload_started(cid, stream);
+            vm.callbacks.notify_payload_started(cid);
 
-            let vm_start_timestamp = vm.vm_start_timestamp.lock().unwrap();
-            write_vm_booted_stats(vm.requester_uid as i32, &vm.name, *vm_start_timestamp);
+            let vm_start_timestamp = vm.vm_metric.lock().unwrap().start_timestamp;
+            write_vm_booted_stats(vm.requester_uid as i32, &vm.name, vm_start_timestamp);
             Ok(())
         } else {
             error!("notifyPayloadStarted is called from an unknown CID {}", cid);

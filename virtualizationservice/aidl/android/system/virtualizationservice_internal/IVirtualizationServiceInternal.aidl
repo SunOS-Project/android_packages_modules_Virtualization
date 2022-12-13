@@ -13,14 +13,17 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+package android.system.virtualizationservice_internal;
 
-#include <stdio.h>
-#include <stdlib.h>
+import android.system.virtualizationservice_internal.IGlobalVmContext;
 
-#include "vm_main.h"
-
-// A VM payload that crashes as soon as it starts, to allow us to exercise that error path.
-extern "C" int AVmPayload_main() {
-    printf("test crash!!!!\n");
-    abort();
+interface IVirtualizationServiceInternal {
+    /**
+     * Allocates global context for a new VM.
+     *
+     * This allocates VM's globally unique resources such as the CID.
+     * The resources will not be recycled as long as there is a strong reference
+     * to the returned object.
+     */
+    IGlobalVmContext allocateGlobalVmContext();
 }

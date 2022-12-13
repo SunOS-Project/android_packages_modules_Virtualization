@@ -20,6 +20,7 @@ import static com.android.tradefed.testtype.DeviceJUnit4ClassRunner.TestMetrics;
 
 import static com.google.common.truth.Truth.assertThat;
 
+import static org.junit.Assume.assumeFalse;
 import static org.junit.Assume.assumeTrue;
 
 import android.cts.host.utils.DeviceJUnit4ClassRunnerWithParameters;
@@ -27,6 +28,7 @@ import android.cts.host.utils.DeviceJUnit4Parameterized;
 import android.platform.test.annotations.RootPermissionTest;
 
 import com.android.fs.common.AuthFsTestRule;
+import com.android.microdroid.test.common.DeviceProperties;
 import com.android.microdroid.test.common.MetricsProcessor;
 import com.android.tradefed.device.DeviceNotAvailableException;
 import com.android.tradefed.metrics.proto.MetricMeasurement.DataType;
@@ -82,9 +84,10 @@ public class AuthFsBenchmarks extends BaseHostJUnit4Test {
         AuthFsTestRule.setUpAndroid(getTestInformation());
         mAuthFsTestRule.setUpTest();
         assumeTrue(AuthFsTestRule.getDevice().supportsMicrodroid(mProtectedVm));
-        String metricsPrefix =
-                MetricsProcessor.getMetricPrefix(
-                        getDevice().getProperty("debug.hypervisor.metrics_tag"));
+        DeviceProperties deviceProperties = DeviceProperties.create(getDevice()::getProperty);
+        assumeFalse(
+                "Skip on CF; no need to collect metrics on CF", deviceProperties.isCuttlefish());
+        String metricsPrefix = MetricsProcessor.getMetricPrefix(deviceProperties.getMetricsTag());
         mMetricsProcessor = new MetricsProcessor(metricsPrefix + "authfs/");
         AuthFsTestRule.startMicrodroid(mProtectedVm);
     }

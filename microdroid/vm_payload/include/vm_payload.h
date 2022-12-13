@@ -18,12 +18,11 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <sys/cdefs.h>
 
 #include "vm_main.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+__BEGIN_DECLS
 
 struct AIBinder;
 typedef struct AIBinder AIBinder;
@@ -57,8 +56,9 @@ bool AVmPayload_runVsockRpcServer(AIBinder *service, unsigned int port,
                                   void (*on_ready)(void *param), void *param);
 
 /**
- * Get a secret that is uniquely bound to this VM instance. The secrets are 32-byte values and the
- * value associated with an identifier will not change over the lifetime of the VM instance.
+ * Get a secret that is uniquely bound to this VM instance. The secrets are
+ * values up to 32 bytes long and the value associated with an identifier will
+ * not change over the lifetime of the VM instance.
  *
  * \param identifier identifier of the secret to return.
  * \param identifier_size size of the secret identifier.
@@ -71,32 +71,6 @@ bool AVmPayload_getVmInstanceSecret(const void *identifier, size_t identifier_si
                                     size_t size);
 
 /**
- * Get the VM's DICE attestation chain.
- *
- * This function will fail if the use of restricted APIs is not permitted.
- *
- * \param data pointer to size bytes where the chain is written.
- * \param size number of bytes that can be written to data.
- * \param total outputs the total size of the chain if the function succeeds
- *
- * \return true on success and false on failure.
- */
-bool AVmPayload_getDiceAttestationChain(void *data, size_t size, size_t *total);
-
-/**
- * Get the VM's DICE attestation CDI.
- *
- * This function will fail if the use of restricted APIs is not permitted.
- *
- * \param data pointer to size bytes where the CDI is written.
- * \param size number of bytes that can be written to data.
- * \param total outputs the total size of the CDI if the function succeeds
- *
- * \return true on success and false on failure.
- */
-bool AVmPayload_getDiceAttestationCdi(void *data, size_t size, size_t *total);
-
-/**
  * Gets the path to the APK contents. It is a directory, under which are
  * the unzipped contents of the APK containing the payload, all read-only
  * but accessible to the payload.
@@ -107,6 +81,17 @@ bool AVmPayload_getDiceAttestationCdi(void *data, size_t size, size_t *total);
  */
 const char *AVmPayload_getApkContentsPath(void);
 
-#ifdef __cplusplus
-} // extern "C"
-#endif
+/**
+ * Gets the path to the encrypted persistent storage for the VM, if any. This is
+ * a directory under which any files or directories created will be stored on
+ * behalf of the VM by the host app. All data is encrypted using a key known
+ * only to the VM, so the host cannot decrypt it, but may delete it.
+ *
+ * \return the path to the APK contents, or NULL if no encrypted storage was
+ * requested in the VM configuration. If non-null the returned string should not
+ * be deleted or freed by the application and remains valid for the lifetime of
+ * the VM.
+ */
+const char *AVmPayload_getEncryptedStoragePath(void);
+
+__END_DECLS

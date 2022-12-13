@@ -23,19 +23,44 @@ use log::{error, info, Level};
 use rpcbinder::{get_unix_domain_rpc_interface, run_vsock_rpc_server};
 use std::ffi::CString;
 use std::os::raw::{c_char, c_void};
+use std::ptr;
+use std::sync::Mutex;
 
 lazy_static! {
     static ref VM_APK_CONTENTS_PATH_C: CString =
         CString::new(VM_APK_CONTENTS_PATH).expect("CString::new failed");
+    static ref PAYLOAD_CONNECTION: Mutex<Option<Strong<dyn IVmPayloadService>>> = Mutex::default();
+}
+
+/// Return a connection to the payload service in Microdroid Manager. Uses the existing connection
+/// if there is one, otherwise attempts to create a new one.
+fn get_vm_payload_service() -> Result<Strong<dyn IVmPayloadService>> {
+    let mut connection = PAYLOAD_CONNECTION.lock().unwrap();
+    if let Some(strong) = &*connection {
+        Ok(strong.clone())
+    } else {
+        let new_connection: Strong<dyn IVmPayloadService> = get_unix_domain_rpc_interface(
+            VM_PAYLOAD_SERVICE_SOCKET_NAME,
+        )
+        .context(format!("Failed to connect to service: {}", VM_PAYLOAD_SERVICE_SOCKET_NAME))?;
+        *connection = Some(new_connection.clone());
+        Ok(new_connection)
+    }
+}
+
+/// Make sure our logging goes to logcat. It is harmless to call this more than once.
+fn initialize_logging() {
+    android_logger::init_once(
+        android_logger::Config::default().with_tag("vm_payload").with_min_level(Level::Debug),
+    );
 }
 
 /// Notifies the host that the payload is ready.
 /// Returns true if the notification succeeds else false.
 #[no_mangle]
 pub extern "C" fn AVmPayload_notifyPayloadReady() -> bool {
-    android_logger::init_once(
-        android_logger::Config::default().with_tag("vm_payload").with_min_level(Level::Debug),
-    );
+    initialize_logging();
+
     if let Err(e) = try_notify_payload_ready() {
         error!("{:?}", e);
         false
@@ -74,6 +99,8 @@ pub unsafe extern "C" fn AVmPayload_runVsockRpcServer(
     on_ready: Option<unsafe extern "C" fn(param: *mut c_void)>,
     param: *mut c_void,
 ) -> bool {
+    initialize_logging();
+
     // SAFETY: AIBinder returned has correct reference count, and the ownership can
     // safely be taken by new_spibinder.
     let service = new_spibinder(service);
@@ -106,6 +133,8 @@ pub unsafe extern "C" fn AVmPayload_getVmInstanceSecret(
     secret: *mut u8,
     size: usize,
 ) -> bool {
+    initialize_logging();
+
     let identifier = std::slice::from_raw_parts(identifier, identifier_size);
     match try_get_vm_instance_secret(identifier, size) {
         Err(e) => {
@@ -145,6 +174,8 @@ pub unsafe extern "C" fn AVmPayload_getDiceAttestationChain(
     size: usize,
     total: *mut usize,
 ) -> bool {
+    initialize_logging();
+
     match try_get_dice_attestation_chain() {
         Err(e) => {
             error!("{:?}", e);
@@ -179,6 +210,8 @@ pub unsafe extern "C" fn AVmPayload_getDiceAttestationCdi(
     size: usize,
     total: *mut usize,
 ) -> bool {
+    initialize_logging();
+
     match try_get_dice_attestation_cdi() {
         Err(e) => {
             error!("{:?}", e);
@@ -198,11 +231,13 @@ pub extern "C" fn AVmPayload_getApkContentsPath() -> *const c_char {
     (*VM_APK_CONTENTS_PATH_C).as_ptr()
 }
 
-fn try_get_dice_attestation_cdi() -> Result<Vec<u8>> {
-    get_vm_payload_service()?.getDiceAttestationCdi().context("Cannot get attestation CDI")
+/// Gets the path to the VM's encrypted storage.
+#[no_mangle]
+pub extern "C" fn AVmPayload_getEncryptedStoragePath() -> *const c_char {
+    // TODO(b/254454578): Return a real path if storage is present
+    ptr::null()
 }
 
-fn get_vm_payload_service() -> Result<Strong<dyn IVmPayloadService>> {
-    get_unix_domain_rpc_interface(VM_PAYLOAD_SERVICE_SOCKET_NAME)
-        .context(format!("Failed to connect to service: {}", VM_PAYLOAD_SERVICE_SOCKET_NAME))
+fn try_get_dice_attestation_cdi() -> Result<Vec<u8>> {
+    get_vm_payload_service()?.getDiceAttestationCdi().context("Cannot get attestation CDI")
 }

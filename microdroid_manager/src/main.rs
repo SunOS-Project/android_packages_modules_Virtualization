@@ -26,9 +26,12 @@ use crate::instance::{ApexData, ApkData, InstanceDisk, MicrodroidData, RootHash}
 use crate::vm_payload_service::register_vm_payload_service;
 use android_system_virtualizationcommon::aidl::android::system::virtualizationcommon::ErrorCode::ErrorCode;
 use android_system_virtualmachineservice::aidl::android::system::virtualmachineservice::IVirtualMachineService::{
-        IVirtualMachineService, VM_BINDER_SERVICE_PORT, VM_STREAM_SERVICE_PORT,
+        IVirtualMachineService, VM_BINDER_SERVICE_PORT,
 };
-use android_system_virtualization_payload::aidl::android::system::virtualization::payload::IVmPayloadService::VM_APK_CONTENTS_PATH;
+use android_system_virtualization_payload::aidl::android::system::virtualization::payload::IVmPayloadService::{
+    VM_APK_CONTENTS_PATH,
+    VM_PAYLOAD_SERVICE_SOCKET_NAME,
+};
 use anyhow::{anyhow, bail, ensure, Context, Error, Result};
 use apkverify::{get_public_key_der, verify, V4Signature};
 use binder::Strong;
@@ -36,25 +39,28 @@ use diced_utils::cbor::{encode_header, encode_number};
 use glob::glob;
 use itertools::sorted;
 use libc::VMADDR_CID_HOST;
-use log::{error, info};
+use log::{error, info, warn};
 use microdroid_metadata::{write_metadata, Metadata, PayloadMetadata};
 use microdroid_payload_config::{OsConfig, Task, TaskType, VmPayloadConfig};
+use nix::fcntl::{fcntl, F_SETFD, FdFlag};
+use nix::sys::signal::Signal;
 use openssl::sha::Sha512;
 use payload::{get_apex_data_from_payload, load_metadata, to_metadata};
 use rand::Fill;
 use rpcbinder::get_vsock_rpc_interface;
+use rustutils::sockets::android_get_control_socket;
 use rustutils::system_properties;
 use rustutils::system_properties::PropertyWatcher;
 use std::borrow::Cow::{Borrowed, Owned};
 use std::convert::TryInto;
-use std::fs::{self, create_dir, File, OpenOptions};
+use std::env;
+use std::fs::{self, create_dir, OpenOptions};
 use std::io::Write;
-use std::os::unix::io::{FromRawFd, IntoRawFd};
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::str;
 use std::time::{Duration, SystemTime};
-use vsock::VsockStream;
 
 const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAIN_APK_PATH: &str = "/dev/block/by-name/microdroid-apk";
@@ -76,6 +82,12 @@ const APK_MOUNT_DONE_PROP: &str = "microdroid_manager.apk.mounted";
 
 // SYNC WITH virtualizationservice/src/crosvm.rs
 const FAILURE_SERIAL_DEVICE: &str = "/dev/ttyS1";
+
+/// Identifier for the key used for encrypted store.
+const ENCRYPTEDSTORE_BACKING_DEVICE: &str = "/dev/block/by-name/encryptedstore";
+const ENCRYPTEDSTORE_BIN: &str = "/system/bin/encryptedstore";
+const ENCRYPTEDSTORE_KEY_IDENTIFIER: &str = "encryptedstore_key";
+const ENCRYPTEDSTORE_KEYSIZE: u32 = 64;
 
 #[derive(thiserror::Error, Debug)]
 enum MicrodroidError {
@@ -152,6 +164,11 @@ fn get_vms_rpc_binder() -> Result<Strong<dyn IVirtualMachineService>> {
 }
 
 fn main() -> Result<()> {
+    // If debuggable, print full backtrace to console log with stdio_to_kmsg
+    if system_properties::read_bool(APP_DEBUGGABLE_PROP, true)? {
+        env::set_var("RUST_BACKTRACE", "full");
+    }
+
     scopeguard::defer! {
         info!("Shutting down...");
         if let Err(e) = system_properties::write("sys.powerctl", "shutdown") {
@@ -168,9 +185,21 @@ fn main() -> Result<()> {
     })
 }
 
+fn set_cloexec_on_vm_payload_service_socket() -> Result<()> {
+    let fd = android_get_control_socket(VM_PAYLOAD_SERVICE_SOCKET_NAME)?;
+
+    fcntl(fd, F_SETFD(FdFlag::FD_CLOEXEC))?;
+
+    Ok(())
+}
+
 fn try_main() -> Result<()> {
     let _ = kernlog::init();
     info!("started.");
+
+    if let Err(e) = set_cloexec_on_vm_payload_service_socket() {
+        warn!("Failed to set cloexec on vm payload socket: {:?}", e);
+    }
 
     load_crashkernel_if_supported().context("Failed to load crashkernel")?;
 
@@ -342,7 +371,15 @@ fn try_run_payload(service: &Strong<dyn IVirtualMachineService>) -> Result<i32> 
 
     // To minimize the exposure to untrusted data, derive dice profile as soon as possible.
     info!("DICE derivation for payload");
-    let dice = dice_derivation(dice, &verified_data, &payload_metadata)?;
+    let dice_context = dice_derivation(dice, &verified_data, &payload_metadata)?;
+
+    // Run encryptedstore binary to prepare the storage
+    let encryptedstore_child = if Path::new(ENCRYPTEDSTORE_BACKING_DEVICE).exists() {
+        info!("Preparing encryptedstore ...");
+        Some(prepare_encryptedstore(&dice_context).context("encryptedstore run")?)
+    } else {
+        None
+    };
 
     // Before reading a file from the APK, start zipfuse
     run_zipfuse(
@@ -396,7 +433,12 @@ fn try_run_payload(service: &Strong<dyn IVirtualMachineService>) -> Result<i32> 
     // Wait until zipfuse has mounted the APK so we can access the payload
     wait_for_property_true(APK_MOUNT_DONE_PROP).context("Failed waiting for APK mount done")?;
 
-    register_vm_payload_service(allow_restricted_apis, service.clone(), dice)?;
+    register_vm_payload_service(allow_restricted_apis, service.clone(), dice_context)?;
+
+    if let Some(mut child) = encryptedstore_child {
+        let exitcode = child.wait().context("Wait for encryptedstore child")?;
+        ensure!(exitcode.success(), "Unable to prepare encrypted storage. Exitcode={}", exitcode);
+    }
 
     system_properties::write("dev.bootcomplete", "1").context("set dev.bootcomplete")?;
     exec_task(task, service).context("Failed to run payload")
@@ -416,8 +458,6 @@ struct ApkDmverityArgument<'a> {
 
 fn run_apkdmverity(args: &[ApkDmverityArgument]) -> Result<Child> {
     let mut cmd = Command::new(APKDMVERITY_BIN);
-
-    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
 
     for argument in args {
         cmd.arg("--apk").arg(argument.apk).arg(argument.idsig).arg(argument.name);
@@ -450,15 +490,7 @@ fn run_zipfuse(
     if let Some(property_name) = ready_prop {
         cmd.args(["-p", property_name]);
     }
-    cmd.arg("-o")
-        .arg(option)
-        .arg(zip_path)
-        .arg(mount_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("Spawn zipfuse")
+    cmd.arg("-o").arg(option).arg(zip_path).arg(mount_dir).spawn().context("Spawn zipfuse")
 }
 
 fn write_apex_payload_data(
@@ -720,20 +752,9 @@ fn load_crashkernel_if_supported() -> Result<()> {
     Ok(())
 }
 
-/// Executes the given task. Stdout of the task is piped into the vsock stream to the
-/// virtualizationservice in the host side.
+/// Executes the given task.
 fn exec_task(task: &Task, service: &Strong<dyn IVirtualMachineService>) -> Result<i32> {
     info!("executing main task {:?}...", task);
-    let mut command = build_command(task)?;
-
-    info!("notifying payload started");
-    service.notifyPayloadStarted()?;
-
-    let exit_status = command.spawn()?.wait()?;
-    exit_status.code().ok_or_else(|| anyhow!("Failed to get exit_code from the paylaod."))
-}
-
-fn build_command(task: &Task) -> Result<Command> {
     let mut command = match task.type_ {
         TaskType::Executable => Command::new(&task.command),
         TaskType::MicrodroidLauncher => {
@@ -742,29 +763,23 @@ fn build_command(task: &Task) -> Result<Command> {
             command
         }
     };
+    command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
 
-    match VsockStream::connect_with_cid_port(VMADDR_CID_HOST, VM_STREAM_SERVICE_PORT as u32) {
-        Ok(stream) => {
-            // SAFETY: the ownership of the underlying file descriptor is transferred from stream
-            // to the file object, and then into the Command object. When the command is finished,
-            // the file descriptor is closed.
-            let file = unsafe { File::from_raw_fd(stream.into_raw_fd()) };
-            command
-                .stdin(Stdio::from(file.try_clone()?))
-                .stdout(Stdio::from(file.try_clone()?))
-                .stderr(Stdio::from(file));
-        }
-        Err(e) => {
-            error!("failed to connect to virtualization service: {}", e);
-            // Don't fail hard here. Even if we failed to connect to the virtualizationservice,
-            // we keep executing the task. This can happen if the owner of the VM doesn't register
-            // callback to accept the stream. Use /dev/null as the stream so that the task can
-            // make progress without waiting for someone to consume the output.
-            command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-        }
+    info!("notifying payload started");
+    service.notifyPayloadStarted()?;
+
+    let exit_status = command.spawn()?.wait()?;
+    match exit_status.code() {
+        Some(exit_code) => Ok(exit_code),
+        None => Err(match exit_status.signal() {
+            Some(signal) => anyhow!(
+                "Payload exited due to signal: {} ({})",
+                signal,
+                Signal::try_from(signal).map_or("unknown", |s| s.as_str())
+            ),
+            None => anyhow!("Payload has neither exit code nor signal"),
+        }),
     }
-
-    Ok(command)
 }
 
 fn find_library_path(name: &str) -> Result<String> {
@@ -783,4 +798,28 @@ fn find_library_path(name: &str) -> Result<String> {
 
 fn to_hex_string(buf: &[u8]) -> String {
     buf.iter().map(|b| format!("{:02X}", b)).collect()
+}
+
+fn prepare_encryptedstore(dice: &DiceContext) -> Result<Child> {
+    // Use a fixed salt to scope the derivation to this API.
+    // Generated using hexdump -vn32 -e'14/1 "0x%02X, " 1 "\n"' /dev/urandom
+    // TODO(b/241541860) : Move this (& other salts) to a salt container, i.e. a global enum
+    let salt = [
+        0xFC, 0x1D, 0x35, 0x7B, 0x96, 0xF3, 0xEF, 0x17, 0x78, 0x7D, 0x70, 0xED, 0xEA, 0xFE, 0x1D,
+        0x6F, 0xB3, 0xF9, 0x40, 0xCE, 0xDD, 0x99, 0x40, 0xAA, 0xA7, 0x0E, 0x92, 0x73, 0x90, 0x86,
+        0x4A, 0x75,
+    ];
+    let key = dice.get_sealing_key(
+        &salt,
+        ENCRYPTEDSTORE_KEY_IDENTIFIER.as_bytes(),
+        ENCRYPTEDSTORE_KEYSIZE,
+    )?;
+
+    let mut cmd = Command::new(ENCRYPTEDSTORE_BIN);
+    cmd.arg("--blkdevice")
+        .arg(ENCRYPTEDSTORE_BACKING_DEVICE)
+        .arg("--key")
+        .arg(hex::encode(&*key))
+        .spawn()
+        .context("encryptedstore failed")
 }

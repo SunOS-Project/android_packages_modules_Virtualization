@@ -15,9 +15,9 @@
  */
 package com.android.microdroid.test.device;
 
-import static com.google.common.truth.TruthJUnit.assume;
+import static android.content.pm.PackageManager.FEATURE_VIRTUALIZATION_FRAMEWORK;
 
-import static org.junit.Assume.assumeNoException;
+import static com.google.common.truth.TruthJUnit.assume;
 
 import android.app.Instrumentation;
 import android.app.UiAutomation;
@@ -35,8 +35,8 @@ import androidx.annotation.CallSuper;
 import androidx.test.core.app.ApplicationProvider;
 import androidx.test.platform.app.InstrumentationRegistry;
 
+import com.android.microdroid.test.common.DeviceProperties;
 import com.android.microdroid.test.common.MetricsProcessor;
-import com.android.virt.VirtualizationTestHelper;
 
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
@@ -51,13 +51,12 @@ import java.util.concurrent.TimeUnit;
 
 public abstract class MicrodroidDeviceTestBase {
     public static boolean isCuttlefish() {
-        return VirtualizationTestHelper.isCuttlefish(
-                SystemProperties.get("ro.product.vendor.device"));
+        return DeviceProperties.create(SystemProperties::get).isCuttlefish();
     }
 
     public static String getMetricPrefix() {
         return MetricsProcessor.getMetricPrefix(
-                SystemProperties.get("debug.hypervisor.metrics_tag"));
+                DeviceProperties.create(SystemProperties::get).getMetricsTag());
     }
 
     protected final void grantPermission(String permission) {
@@ -119,17 +118,12 @@ public abstract class MicrodroidDeviceTestBase {
     }
 
     public void prepareTestSetup(boolean protectedVm) {
-        // In case when the virt APEX doesn't exist on the device, classes in the
-        // android.system.virtualmachine package can't be loaded. Therefore, before using the
-        // classes, check the existence of a class in the package and skip this test if not exist.
-        try {
-            Class.forName("android.system.virtualmachine.VirtualMachineManager");
-        } catch (ClassNotFoundException e) {
-            assumeNoException(e);
-            return;
-        }
-        Context context = ApplicationProvider.getApplicationContext();
-        mInner = new Inner(context, protectedVm, VirtualMachineManager.getInstance(context));
+        Context ctx = ApplicationProvider.getApplicationContext();
+        assume().withMessage("Device doesn't support AVF")
+                .that(ctx.getPackageManager().hasSystemFeature(FEATURE_VIRTUALIZATION_FRAMEWORK))
+                .isTrue();
+
+        mInner = new Inner(ctx, protectedVm, VirtualMachineManager.getInstance(ctx));
 
         int capabilities = mInner.getVirtualMachineManager().getCapabilities();
         if (protectedVm) {
@@ -202,8 +196,8 @@ public abstract class MicrodroidDeviceTestBase {
                 throws VirtualMachineException, InterruptedException {
             vm.setCallback(mExecutorService, this);
             vm.run();
-            logVmOutputAndMonitorBootEvents(logTag, vm.getConsoleOutputStream(), "Console");
-            logVmOutput(logTag, vm.getLogOutputStream(), "Log");
+            logVmOutputAndMonitorBootEvents(logTag, vm.getConsoleOutput(), "Console");
+            logVmOutput(logTag, vm.getLogOutput(), "Log");
             mExecutorService.awaitTermination(300, TimeUnit.SECONDS);
         }
 
@@ -232,7 +226,7 @@ public abstract class MicrodroidDeviceTestBase {
         }
 
         @Override
-        public void onPayloadStarted(VirtualMachine vm, ParcelFileDescriptor stream) {}
+        public void onPayloadStarted(VirtualMachine vm) {}
 
         @Override
         public void onPayloadReady(VirtualMachine vm) {}
@@ -327,7 +321,7 @@ public abstract class MicrodroidDeviceTestBase {
         VmEventListener listener =
                 new VmEventListener() {
                     @Override
-                    public void onPayloadStarted(VirtualMachine vm, ParcelFileDescriptor stream) {
+                    public void onPayloadStarted(VirtualMachine vm) {
                         endTime.complete(System.nanoTime());
                         payloadStarted.complete(true);
                         forceStop(vm);

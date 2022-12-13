@@ -23,20 +23,18 @@ import android.os.Parcel;
 import android.os.ParcelFileDescriptor;
 import android.os.Parcelable;
 
-import com.android.internal.annotations.VisibleForTesting;
-
 /**
- * A parcelable that captures the state of a Virtual Machine.
+ * A VM descriptor that captures the state of a Virtual Machine.
  *
  * <p>You can capture the current state of VM by creating an instance of this class with {@link
- * VirtualMachine#toParcelVirtualMachine()}, optionally pass it to another App, and then build an
- * identical VM with the parcel received.
+ * VirtualMachine#toDescriptor()}, optionally pass it to another App, and then build an identical VM
+ * with the descriptor received.
  *
  * @hide
  */
-public final class ParcelVirtualMachine implements Parcelable {
-    private final @NonNull ParcelFileDescriptor mConfigFd;
-    private final @NonNull ParcelFileDescriptor mInstanceImgFd;
+public final class VirtualMachineDescriptor implements Parcelable {
+    @NonNull private final ParcelFileDescriptor mConfigFd;
+    @NonNull private final ParcelFileDescriptor mInstanceImgFd;
     // TODO(b/243129654): Add trusted storage fd once it is available.
 
     @Override
@@ -45,47 +43,46 @@ public final class ParcelVirtualMachine implements Parcelable {
     }
 
     @Override
-    public void writeToParcel(Parcel out, int flags) {
+    public void writeToParcel(@NonNull Parcel out, int flags) {
         mConfigFd.writeToParcel(out, flags);
         mInstanceImgFd.writeToParcel(out, flags);
     }
 
-    public static final Parcelable.Creator<ParcelVirtualMachine> CREATOR =
-            new Parcelable.Creator<ParcelVirtualMachine>() {
-                public ParcelVirtualMachine createFromParcel(Parcel in) {
-                    return new ParcelVirtualMachine(in);
+    @NonNull
+    public static final Parcelable.Creator<VirtualMachineDescriptor> CREATOR =
+            new Parcelable.Creator<>() {
+                public VirtualMachineDescriptor createFromParcel(Parcel in) {
+                    return new VirtualMachineDescriptor(in);
                 }
 
-                public ParcelVirtualMachine[] newArray(int size) {
-                    return new ParcelVirtualMachine[size];
+                public VirtualMachineDescriptor[] newArray(int size) {
+                    return new VirtualMachineDescriptor[size];
                 }
             };
 
     /**
      * @return File descriptor of the VM configuration file config.xml.
-     * @hide
      */
-    @VisibleForTesting
-    public @NonNull ParcelFileDescriptor getConfigFd() {
+    @NonNull
+    ParcelFileDescriptor getConfigFd() {
         return mConfigFd;
     }
 
     /**
      * @return File descriptor of the instance.img of the VM.
-     * @hide
      */
-    @VisibleForTesting
-    public @NonNull ParcelFileDescriptor getInstanceImgFd() {
+    @NonNull
+    ParcelFileDescriptor getInstanceImgFd() {
         return mInstanceImgFd;
     }
 
-    ParcelVirtualMachine(
+    VirtualMachineDescriptor(
             @NonNull ParcelFileDescriptor configFd, @NonNull ParcelFileDescriptor instanceImgFd) {
         mConfigFd = configFd;
         mInstanceImgFd = instanceImgFd;
     }
 
-    private ParcelVirtualMachine(Parcel in) {
+    private VirtualMachineDescriptor(Parcel in) {
         mConfigFd = requireNonNull(in.readFileDescriptor());
         mInstanceImgFd = requireNonNull(in.readFileDescriptor());
     }

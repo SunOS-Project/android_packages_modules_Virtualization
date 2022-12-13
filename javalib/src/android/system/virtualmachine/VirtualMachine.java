@@ -16,6 +16,7 @@
 
 package android.system.virtualmachine;
 
+import static android.os.ParcelFileDescriptor.AutoCloseInputStream;
 import static android.os.ParcelFileDescriptor.MODE_READ_ONLY;
 import static android.os.ParcelFileDescriptor.MODE_READ_WRITE;
 import static android.system.virtualmachine.VirtualMachineCallback.ERROR_PAYLOAD_CHANGED;
@@ -75,7 +76,7 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
-import java.lang.ref.WeakReference;
+import java.nio.channels.FileChannel;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
@@ -84,10 +85,7 @@ import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
-import java.util.WeakHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
@@ -105,11 +103,6 @@ import java.util.zip.ZipFile;
  * @hide
  */
 public class VirtualMachine implements AutoCloseable {
-    /** Map from context to a map of all that context's VMs by name. */
-    @GuardedBy("sCreateLock")
-    private static final Map<Context, Map<String, WeakReference<VirtualMachine>>> sInstances =
-            new WeakHashMap<>();
-
     /** Name of the directory under the files directory where all VMs created for the app exist. */
     private static final String VM_DIR = "vm";
 
@@ -206,16 +199,9 @@ public class VirtualMachine implements AutoCloseable {
     private static final long INSTANCE_FILE_SIZE = 10 * 1024 * 1024;
 
     // A note on lock ordering:
-    // You can take mLock while holding sCreateLock, but not vice versa.
+    // You can take mLock while holding VirtualMachineManager.sCreateLock, but not vice versa.
     // We never take any other lock while holding mCallbackLock; therefore you can
     // take mCallbackLock while holding any other lock.
-
-    /**
-     * A lock used to synchronize the creation of virtual machines. It protects
-     * {@link #sInstances}, but is also held throughout VM creation / retrieval / deletion, to
-     * prevent these actions racing with each other.
-     */
-    static final Object sCreateLock = new Object();
 
     /** Lock protecting our mutable state (other than callbacks). */
     private final Object mLock = new Object();
@@ -279,23 +265,44 @@ public class VirtualMachine implements AutoCloseable {
         mExtraApks = setupExtraApks(context, config, thisVmDir);
     }
 
-    @GuardedBy("sCreateLock")
+    /**
+     * Builds a virtual machine from an {@link VirtualMachineDescriptor} object and associates it
+     * with the given name.
+     *
+     * <p>The new virtual machine will be in the same state as the descriptor indicates.
+     *
+     * <p>Once a virtual machine is imported it is persisted until it is deleted by calling {@link
+     * #delete}. The imported virtual machine is in {@link #STATUS_STOPPED} state. To run the VM,
+     * call {@link #run}.
+     */
+    @GuardedBy("VirtualMachineManager.sCreateLock")
     @NonNull
-    private static Map<String, WeakReference<VirtualMachine>> getInstancesMap(Context context) {
-        Map<String, WeakReference<VirtualMachine>> instancesMap;
-        if (sInstances.containsKey(context)) {
-            instancesMap = sInstances.get(context);
-        } else {
-            instancesMap = new HashMap<>();
-            sInstances.put(context, instancesMap);
+    static VirtualMachine fromDescriptor(
+            @NonNull Context context,
+            @NonNull String name,
+            @NonNull VirtualMachineDescriptor vmDescriptor)
+            throws VirtualMachineException {
+        VirtualMachineConfig config = VirtualMachineConfig.from(vmDescriptor.getConfigFd());
+        File vmDir = createVmDir(context, name);
+        try {
+            VirtualMachine vm = new VirtualMachine(context, name, config);
+            config.serialize(vm.mConfigFilePath);
+            try {
+                vm.mInstanceFilePath.createNewFile();
+            } catch (IOException e) {
+                throw new VirtualMachineException("failed to create instance image", e);
+            }
+            vm.importInstanceFrom(vmDescriptor.getInstanceImgFd());
+            return vm;
+        } catch (VirtualMachineException | RuntimeException e) {
+            // If anything goes wrong, delete any files created so far and the VM's directory
+            try {
+                deleteRecursively(vmDir);
+            } catch (IOException innerException) {
+                e.addSuppressed(innerException);
+            }
+            throw e;
         }
-        return instancesMap;
-    }
-
-    @NonNull
-    private static File getVmDir(Context context, String name) {
-        File vmRoot = new File(context.getDataDir(), VM_DIR);
-        return new File(vmRoot, name);
     }
 
     /**
@@ -303,36 +310,16 @@ public class VirtualMachine implements AutoCloseable {
      * it is persisted until it is deleted by calling {@link #delete}. The created virtual machine
      * is in {@link #STATUS_STOPPED} state. To run the VM, call {@link #run}.
      */
-    @GuardedBy("sCreateLock")
+    @GuardedBy("VirtualMachineManager.sCreateLock")
     @NonNull
     static VirtualMachine create(
             @NonNull Context context, @NonNull String name, @NonNull VirtualMachineConfig config)
             throws VirtualMachineException {
-        File vmDir = getVmDir(context, name);
-
-        try {
-            // We don't need to undo this even if VM creation fails.
-            Files.createDirectories(vmDir.getParentFile().toPath());
-
-            // The checking of the existence of this directory and the creation of it is done
-            // atomically. If the directory already exists (i.e. the VM with the same name was
-            // already created), FileAlreadyExistsException is thrown.
-            Files.createDirectory(vmDir.toPath());
-        } catch (FileAlreadyExistsException e) {
-            throw new VirtualMachineException("virtual machine already exists", e);
-        } catch (IOException e) {
-            throw new VirtualMachineException("failed to create directory for VM", e);
-        }
+        File vmDir = createVmDir(context, name);
 
         try {
             VirtualMachine vm = new VirtualMachine(context, name, config);
-
-            try (FileOutputStream output = new FileOutputStream(vm.mConfigFilePath)) {
-                config.serialize(output);
-            } catch (IOException e) {
-                throw new VirtualMachineException("failed to write VM config", e);
-            }
-
+            config.serialize(vm.mConfigFilePath);
             try {
                 vm.mInstanceFilePath.createNewFile();
             } catch (IOException e) {
@@ -355,9 +342,6 @@ public class VirtualMachine implements AutoCloseable {
             } catch (ServiceSpecificException | IllegalArgumentException e) {
                 throw new VirtualMachineException("failed to create instance partition", e);
             }
-
-            getInstancesMap(context).put(name, new WeakReference<>(vm));
-
             return vm;
         } catch (VirtualMachineException | RuntimeException e) {
             // If anything goes wrong, delete any files created so far and the VM's directory
@@ -371,65 +355,68 @@ public class VirtualMachine implements AutoCloseable {
     }
 
     /** Loads a virtual machine that is already created before. */
-    @GuardedBy("sCreateLock")
+    @GuardedBy("VirtualMachineManager.sCreateLock")
     @Nullable
-    static VirtualMachine load(
-            @NonNull Context context, @NonNull String name) throws VirtualMachineException {
+    static VirtualMachine load(@NonNull Context context, @NonNull String name)
+            throws VirtualMachineException {
         File thisVmDir = getVmDir(context, name);
         if (!thisVmDir.exists()) {
             // The VM doesn't exist.
             return null;
         }
         File configFilePath = new File(thisVmDir, CONFIG_FILE);
-        VirtualMachineConfig config;
-        try (FileInputStream input = new FileInputStream(configFilePath)) {
-            config = VirtualMachineConfig.from(input);
-        } catch (IOException e) {
-            throw new VirtualMachineException("Failed to read config file", e);
-        }
-
-        Map<String, WeakReference<VirtualMachine>> instancesMap = getInstancesMap(context);
-
-        VirtualMachine vm = null;
-        if (instancesMap.containsKey(name)) {
-            vm = instancesMap.get(name).get();
-        }
-        if (vm == null) {
-            vm = new VirtualMachine(context, name, config);
-        }
+        VirtualMachineConfig config = VirtualMachineConfig.from(configFilePath);
+        VirtualMachine vm = new VirtualMachine(context, name, config);
 
         if (!vm.mInstanceFilePath.exists()) {
             throw new VirtualMachineException("instance image missing");
         }
 
-        instancesMap.put(name, new WeakReference<>(vm));
-
         return vm;
     }
 
-    @GuardedBy("sCreateLock")
-    static void delete(Context context, String name) throws VirtualMachineException {
-        Map<String, WeakReference<VirtualMachine>> instancesMap = sInstances.get(context);
-        VirtualMachine vm;
-        if (instancesMap != null && instancesMap.containsKey(name)) {
-            vm = instancesMap.get(name).get();
-        } else {
-            vm = null;
+    @GuardedBy("VirtualMachineManager.sCreateLock")
+    void delete(Context context, String name) throws VirtualMachineException {
+        synchronized (mLock) {
+            checkStopped();
         }
 
-        if (vm != null) {
-            synchronized (vm.mLock) {
-                vm.checkStopped();
-            }
-        }
+        deleteVmDirectory(context, name);
+    }
 
+    static void deleteVmDirectory(Context context, String name) throws VirtualMachineException {
         try {
             deleteRecursively(getVmDir(context, name));
         } catch (IOException e) {
             throw new VirtualMachineException(e);
         }
+    }
 
-        if (instancesMap != null) instancesMap.remove(name);
+    @GuardedBy("VirtualMachineManager.sCreateLock")
+    @NonNull
+    private static File createVmDir(@NonNull Context context, @NonNull String name)
+            throws VirtualMachineException {
+        File vmDir = getVmDir(context, name);
+        try {
+            // We don't need to undo this even if VM creation fails.
+            Files.createDirectories(vmDir.getParentFile().toPath());
+
+            // The checking of the existence of this directory and the creation of it is done
+            // atomically. If the directory already exists (i.e. the VM with the same name was
+            // already created), FileAlreadyExistsException is thrown.
+            Files.createDirectory(vmDir.toPath());
+        } catch (FileAlreadyExistsException e) {
+            throw new VirtualMachineException("virtual machine already exists", e);
+        } catch (IOException e) {
+            throw new VirtualMachineException("failed to create directory for VM", e);
+        }
+        return vmDir;
+    }
+
+    @NonNull
+    private static File getVmDir(Context context, String name) {
+        File vmRoot = new File(context.getDataDir(), VM_DIR);
+        return new File(vmRoot, name);
     }
 
     /**
@@ -650,9 +637,8 @@ public class VirtualMachine implements AutoCloseable {
                 mVirtualMachine.registerCallback(
                         new IVirtualMachineCallback.Stub() {
                             @Override
-                            public void onPayloadStarted(int cid, ParcelFileDescriptor stream) {
-                                executeCallback(
-                                        (cb) -> cb.onPayloadStarted(VirtualMachine.this, stream));
+                            public void onPayloadStarted(int cid) {
+                                executeCallback((cb) -> cb.onPayloadStarted(VirtualMachine.this));
                             }
 
                             @Override
@@ -663,16 +649,20 @@ public class VirtualMachine implements AutoCloseable {
                             @Override
                             public void onPayloadFinished(int cid, int exitCode) {
                                 executeCallback(
-                                        (cb) -> cb.onPayloadFinished(VirtualMachine.this,
-                                                exitCode));
+                                        (cb) ->
+                                                cb.onPayloadFinished(
+                                                        VirtualMachine.this, exitCode));
                             }
 
                             @Override
                             public void onError(int cid, int errorCode, String message) {
                                 int translatedError = getTranslatedError(errorCode);
                                 executeCallback(
-                                        (cb) -> cb.onError(VirtualMachine.this, translatedError,
-                                                message));
+                                        (cb) ->
+                                                cb.onError(
+                                                        VirtualMachine.this,
+                                                        translatedError,
+                                                        message));
                             }
 
                             @Override
@@ -681,18 +671,17 @@ public class VirtualMachine implements AutoCloseable {
                                 int translatedReason = getTranslatedReason(reason);
                                 if (onDiedCalled.compareAndSet(false, true)) {
                                     executeCallback(
-                                            (cb) -> cb.onStopped(VirtualMachine.this,
-                                                    translatedReason));
+                                            (cb) ->
+                                                    cb.onStopped(
+                                                            VirtualMachine.this, translatedReason));
                                 }
                             }
 
                             @Override
                             public void onRamdump(int cid, ParcelFileDescriptor ramdump) {
-                                executeCallback(
-                                        (cb) -> cb.onRamdump(VirtualMachine.this, ramdump));
+                                executeCallback((cb) -> cb.onRamdump(VirtualMachine.this, ramdump));
                             }
-                        }
-                );
+                        });
                 service.asBinder().linkToDeath(deathRecipient, 0);
                 mVirtualMachine.start();
             } catch (IOException | IllegalStateException | ServiceSpecificException e) {
@@ -729,7 +718,7 @@ public class VirtualMachine implements AutoCloseable {
      * @hide
      */
     @NonNull
-    public InputStream getConsoleOutputStream() throws VirtualMachineException {
+    public InputStream getConsoleOutput() throws VirtualMachineException {
         synchronized (mLock) {
             createVmPipes();
             return new FileInputStream(mConsoleReader.getFileDescriptor());
@@ -743,7 +732,7 @@ public class VirtualMachine implements AutoCloseable {
      * @hide
      */
     @NonNull
-    public InputStream getLogOutputStream() throws VirtualMachineException {
+    public InputStream getLogOutput() throws VirtualMachineException {
         synchronized (mLock) {
             createVmPipes();
             return new FileInputStream(mLogReader.getFileDescriptor());
@@ -845,14 +834,7 @@ public class VirtualMachine implements AutoCloseable {
                 throw new VirtualMachineException("incompatible config");
             }
             checkStopped();
-
-            try {
-                FileOutputStream output = new FileOutputStream(mConfigFilePath);
-                newConfig.serialize(output);
-                output.close();
-            } catch (IOException e) {
-                throw new VirtualMachineException("Failed to persist config", e);
-            }
+            newConfig.serialize(mConfigFilePath);
             mConfig = newConfig;
             return oldConfig;
         }
@@ -902,22 +884,23 @@ public class VirtualMachine implements AutoCloseable {
     }
 
     /**
-     * Captures the current state of the VM in a {@link ParcelVirtualMachine} instance.
-     * The VM needs to be stopped to avoid inconsistency in its state representation.
+     * Captures the current state of the VM in a {@link VirtualMachineDescriptor} instance. The VM
+     * needs to be stopped to avoid inconsistency in its state representation.
      *
-     * @return a {@link ParcelVirtualMachine} instance that represents the VM's state.
+     * @return a {@link VirtualMachineDescriptor} instance that represents the VM's state.
      * @throws VirtualMachineException if the virtual machine is not stopped, or the state could not
      *     be captured.
+     * @hide
      */
     @NonNull
-    public ParcelVirtualMachine toParcelVirtualMachine() throws VirtualMachineException {
+    public VirtualMachineDescriptor toDescriptor() throws VirtualMachineException {
         synchronized (mLock) {
             checkStopped();
         }
         try {
-            return new ParcelVirtualMachine(
-                ParcelFileDescriptor.open(mConfigFilePath, MODE_READ_ONLY),
-                ParcelFileDescriptor.open(mInstanceFilePath, MODE_READ_ONLY));
+            return new VirtualMachineDescriptor(
+                    ParcelFileDescriptor.open(mConfigFilePath, MODE_READ_ONLY),
+                    ParcelFileDescriptor.open(mInstanceFilePath, MODE_READ_ONLY));
         } catch (IOException e) {
             throw new VirtualMachineException(e);
         }
@@ -1070,6 +1053,16 @@ public class VirtualMachine implements AutoCloseable {
             return Collections.unmodifiableList(extraApks);
         } catch (IOException e) {
             throw new VirtualMachineException("Couldn't parse extra apks from the vm config", e);
+        }
+    }
+
+    private void importInstanceFrom(@NonNull ParcelFileDescriptor instanceFd)
+            throws VirtualMachineException {
+        try (FileChannel instance = new FileOutputStream(mInstanceFilePath).getChannel();
+                FileChannel instanceInput = new AutoCloseInputStream(instanceFd).getChannel()) {
+            instance.transferFrom(instanceInput, /*position=*/ 0, instanceInput.size());
+        } catch (IOException e) {
+            throw new VirtualMachineException("failed to transfer instance image", e);
         }
     }
 }

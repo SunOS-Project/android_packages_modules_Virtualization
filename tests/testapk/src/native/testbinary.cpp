@@ -28,7 +28,7 @@
 #include <sys/system_properties.h>
 #include <unistd.h>
 #include <vm_main.h>
-#include <vm_payload.h>
+#include <vm_payload_restricted.h>
 
 #include <string>
 
@@ -79,7 +79,7 @@ Result<void> start_test_service() {
             if (!AVmPayload_getVmInstanceSecret(identifier, sizeof(identifier), out->data(),
                                                 out->size())) {
                 return ndk::ScopedAStatus::
-                        fromServiceSpecificErrorWithMessage(0, "Failed to VM instance secret");
+                        fromServiceSpecificErrorWithMessage(0, "Failed to get VM instance secret");
             }
             return ndk::ScopedAStatus::ok();
         }
@@ -121,6 +121,16 @@ Result<void> start_test_service() {
             }
             std::string path(path_c);
             *out = path;
+            return ndk::ScopedAStatus::ok();
+        }
+
+        ndk::ScopedAStatus getEncryptedStoragePath(std::string* out) override {
+            const char* path_c = AVmPayload_getEncryptedStoragePath();
+            if (path_c == nullptr) {
+                out->clear();
+            } else {
+                *out = path_c;
+            }
             return ndk::ScopedAStatus::ok();
         }
     };
