@@ -25,9 +25,7 @@ use crate::dice::{DiceContext, DiceDriver};
 use crate::instance::{ApexData, ApkData, InstanceDisk, MicrodroidData, RootHash};
 use crate::vm_payload_service::register_vm_payload_service;
 use android_system_virtualizationcommon::aidl::android::system::virtualizationcommon::ErrorCode::ErrorCode;
-use android_system_virtualmachineservice::aidl::android::system::virtualmachineservice::IVirtualMachineService::{
-        IVirtualMachineService, VM_BINDER_SERVICE_PORT,
-};
+use android_system_virtualmachineservice::aidl::android::system::virtualmachineservice::IVirtualMachineService::IVirtualMachineService;
 use android_system_virtualization_payload::aidl::android::system::virtualization::payload::IVmPayloadService::{
     VM_APK_CONTENTS_PATH,
     VM_PAYLOAD_SERVICE_SOCKET_NAME,
@@ -87,7 +85,8 @@ const FAILURE_SERIAL_DEVICE: &str = "/dev/ttyS1";
 const ENCRYPTEDSTORE_BACKING_DEVICE: &str = "/dev/block/by-name/encryptedstore";
 const ENCRYPTEDSTORE_BIN: &str = "/system/bin/encryptedstore";
 const ENCRYPTEDSTORE_KEY_IDENTIFIER: &str = "encryptedstore_key";
-const ENCRYPTEDSTORE_KEYSIZE: u32 = 64;
+const ENCRYPTEDSTORE_KEYSIZE: u32 = 32;
+const ENCRYPTEDSTORE_MOUNTPOINT: &str = "/mnt/encryptedstore";
 
 #[derive(thiserror::Error, Debug)]
 enum MicrodroidError {
@@ -159,8 +158,11 @@ fn write_death_reason_to_serial(err: &Error) -> Result<()> {
 }
 
 fn get_vms_rpc_binder() -> Result<Strong<dyn IVirtualMachineService>> {
-    get_vsock_rpc_interface(VMADDR_CID_HOST, VM_BINDER_SERVICE_PORT as u32)
-        .context("Cannot connect to RPC service")
+    // The host is running a VirtualMachineService for this VM on a port equal
+    // to the CID of this VM.
+    let port = vsock::get_local_cid().context("Could not determine local CID")?;
+    get_vsock_rpc_interface(VMADDR_CID_HOST, port)
+        .context("Could not connect to IVirtualMachineService")
 }
 
 fn main() -> Result<()> {
@@ -415,19 +417,15 @@ fn try_run_payload(service: &Strong<dyn IVirtualMachineService>) -> Result<i32> 
     mount_extra_apks(&config)?;
 
     // Wait until apex config is done. (e.g. linker configuration for apexes)
-    // TODO(jooyung): wait until sys.boot_completed?
     wait_for_apex_config_done()?;
+
+    setup_config_sysprops(&config)?;
 
     // Start tombstone_transmit if enabled
     if config.export_tombstones {
         control_service("start", "tombstone_transmit")?;
     } else {
         control_service("stop", "tombstoned")?;
-    }
-
-    // Start authfs if enabled
-    if config.enable_authfs {
-        control_service("start", "authfs_service")?;
     }
 
     // Wait until zipfuse has mounted the APK so we can access the payload
@@ -440,7 +438,8 @@ fn try_run_payload(service: &Strong<dyn IVirtualMachineService>) -> Result<i32> 
         ensure!(exitcode.success(), "Unable to prepare encrypted storage. Exitcode={}", exitcode);
     }
 
-    system_properties::write("dev.bootcomplete", "1").context("set dev.bootcomplete")?;
+    wait_for_property_true("dev.bootcomplete").context("failed waiting for dev.bootcomplete")?;
+    info!("boot completed, time to run payload");
     exec_task(task, service).context("Failed to run payload")
 }
 
@@ -680,6 +679,16 @@ fn mount_extra_apks(config: &VmPayloadConfig) -> Result<()> {
     Ok(())
 }
 
+fn setup_config_sysprops(config: &VmPayloadConfig) -> Result<()> {
+    if config.enable_authfs {
+        system_properties::write("microdroid_manager.authfs.enabled", "1")
+            .context("failed to write microdroid_manager.authfs.enabled")?;
+    }
+    system_properties::write("microdroid_manager.config_done", "1")
+        .context("failed to write microdroid_manager.config_done")?;
+    Ok(())
+}
+
 // Waits until linker config is generated
 fn wait_for_apex_config_done() -> Result<()> {
     wait_for_property_true(APEX_CONFIG_DONE_PROP).context("Failed waiting for apex config done")
@@ -820,6 +829,7 @@ fn prepare_encryptedstore(dice: &DiceContext) -> Result<Child> {
         .arg(ENCRYPTEDSTORE_BACKING_DEVICE)
         .arg("--key")
         .arg(hex::encode(&*key))
+        .args(["--mountpoint", ENCRYPTEDSTORE_MOUNTPOINT])
         .spawn()
         .context("encryptedstore failed")
 }

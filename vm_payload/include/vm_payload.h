@@ -18,6 +18,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdnoreturn.h>
 #include <sys/cdefs.h>
 
 #include "vm_main.h"
@@ -30,9 +31,13 @@ typedef struct AIBinder AIBinder;
 /**
  * Notifies the host that the payload is ready.
  *
- * \return true if the notification succeeds else false.
+ * If the host app has set a `VirtualMachineCallback` for the VM, its
+ * `onPayloadReady` method will be called.
+ *
+ * Note that subsequent calls to this function after the first have no effect;
+ * `onPayloadReady` is never called more than once.
  */
-bool AVmPayload_notifyPayloadReady(void);
+void AVmPayload_notifyPayloadReady(void);
 
 /**
  * Runs a binder RPC server, serving the supplied binder service implementation on the given vsock
@@ -42,32 +47,29 @@ bool AVmPayload_notifyPayloadReady(void);
  * called to allow appropriate action to be taken - e.g. to notify clients that they may now
  * attempt to connect with `AVmPayload_notifyPayloadReady`.
  *
- * The current thread is joined to the binder thread pool to handle incoming messages.
+ * Note that this function does not return. The calling thread joins the binder
+ * thread pool to handle incoming messages.
  *
  * \param service the service to bind to the given port.
  * \param port vsock port.
  * \param on_ready the callback to execute once the server is ready for connections. The callback
  *                 will be called at most once.
  * \param param param for the `on_ready` callback.
- *
- * \return true if the server has shutdown normally, false if it failed in some way.
  */
-bool AVmPayload_runVsockRpcServer(AIBinder *service, unsigned int port,
-                                  void (*on_ready)(void *param), void *param);
+noreturn void AVmPayload_runVsockRpcServer(AIBinder *service, unsigned int port,
+                                           void (*on_ready)(void *param), void *param);
 
 /**
  * Get a secret that is uniquely bound to this VM instance. The secrets are
- * values up to 32 bytes long and the value associated with an identifier will
- * not change over the lifetime of the VM instance.
+ * 32-byte values and the value associated with an identifier will not change
+ * over the lifetime of the VM instance.
  *
  * \param identifier identifier of the secret to return.
  * \param identifier_size size of the secret identifier.
  * \param secret pointer to size bytes where the secret is written.
- * \param size number of bytes of the secret to get, up to the secret size.
- *
- * \return true on success and false on failure.
+ * \param size number of bytes of the secret to get, <= 32.
  */
-bool AVmPayload_getVmInstanceSecret(const void *identifier, size_t identifier_size, void *secret,
+void AVmPayload_getVmInstanceSecret(const void *identifier, size_t identifier_size, void *secret,
                                     size_t size);
 
 /**

@@ -48,6 +48,7 @@ import android.annotation.IntDef;
 import android.annotation.NonNull;
 import android.annotation.Nullable;
 import android.annotation.RequiresPermission;
+import android.annotation.SystemApi;
 import android.content.Context;
 import android.os.Binder;
 import android.os.IBinder;
@@ -64,6 +65,7 @@ import android.system.virtualizationservice.PartitionType;
 import android.system.virtualizationservice.VirtualMachineAppConfig;
 import android.system.virtualizationservice.VirtualMachineState;
 import android.util.JsonReader;
+import android.util.Log;
 
 import com.android.internal.annotations.GuardedBy;
 
@@ -94,33 +96,16 @@ import java.util.zip.ZipFile;
 /**
  * Represents an VM instance, with its own configuration and state. Instances are persistent and are
  * created or retrieved via {@link VirtualMachineManager}.
- * <p>
- * The {@link #run} method actually starts up the VM and allows the payload code to execute. It
- * will continue until it exits or {@link #stop} is called. Updates on the state of the VM can
- * be received using {@link #setCallback}. The app can communicate with the VM using
- * {@link #connectToVsockServer} or {@link #connectVsock}.
+ *
+ * <p>The {@link #run} method actually starts up the VM and allows the payload code to execute. It
+ * will continue until it exits or {@link #stop} is called. Updates on the state of the VM can be
+ * received using {@link #setCallback}. The app can communicate with the VM using {@link
+ * #connectToVsockServer} or {@link #connectVsock}.
  *
  * @hide
  */
+@SystemApi
 public class VirtualMachine implements AutoCloseable {
-    /** Name of the directory under the files directory where all VMs created for the app exist. */
-    private static final String VM_DIR = "vm";
-
-    /** Name of the persisted config file for a VM. */
-    private static final String CONFIG_FILE = "config.xml";
-
-    /** Name of the instance image file for a VM. (Not implemented) */
-    private static final String INSTANCE_IMAGE_FILE = "instance.img";
-
-    /** Name of the idsig file for a VM */
-    private static final String IDSIG_FILE = "idsig";
-
-    /** Name of the idsig files for extra APKs. */
-    private static final String EXTRA_IDSIG_FILE_PREFIX = "extra_idsig_";
-
-    /** Name of the virtualization service. */
-    private static final String SERVICE_NAME = "android.system.virtualizationservice";
-
     /** The permission needed to create or run a virtual machine. */
     public static final String MANAGE_VIRTUAL_MACHINE_PERMISSION =
             "android.permission.MANAGE_VIRTUAL_MACHINE";
@@ -157,6 +142,29 @@ public class VirtualMachine implements AutoCloseable {
      */
     public static final int STATUS_DELETED = 2;
 
+    private static final String TAG = "VirtualMachine";
+
+    /** Name of the directory under the files directory where all VMs created for the app exist. */
+    private static final String VM_DIR = "vm";
+
+    /** Name of the persisted config file for a VM. */
+    private static final String CONFIG_FILE = "config.xml";
+
+    /** Name of the instance image file for a VM. (Not implemented) */
+    private static final String INSTANCE_IMAGE_FILE = "instance.img";
+
+    /** Name of the idsig file for a VM */
+    private static final String IDSIG_FILE = "idsig";
+
+    /** Name of the idsig files for extra APKs. */
+    private static final String EXTRA_IDSIG_FILE_PREFIX = "extra_idsig_";
+
+    /** Name of the virtualization service. */
+    private static final String SERVICE_NAME = "android.system.virtualizationservice";
+
+    /** Size of the instance image. 10 MB. */
+    private static final long INSTANCE_FILE_SIZE = 10 * 1024 * 1024;
+
     /** The package which owns this VM. */
     @NonNull private final String mPackageName;
 
@@ -179,24 +187,11 @@ public class VirtualMachine implements AutoCloseable {
     /** Path to the idsig file for this VM. */
     @NonNull private final File mIdsigFilePath;
 
-    private static class ExtraApkSpec {
-        public final File apk;
-        public final File idsig;
-
-        ExtraApkSpec(File apk, File idsig) {
-            this.apk = apk;
-            this.idsig = idsig;
-        }
-    }
-
     /**
      * Unmodifiable list of extra apks. Apks are specified by the vm config, and corresponding
      * idsigs are to be generated.
      */
     @NonNull private final List<ExtraApkSpec> mExtraApks;
-
-    /** Size of the instance image. 10 MB. */
-    private static final long INSTANCE_FILE_SIZE = 10 * 1024 * 1024;
 
     // A note on lock ordering:
     // You can take mLock while holding VirtualMachineManager.sCreateLock, but not vice versa.
@@ -245,6 +240,16 @@ public class VirtualMachine implements AutoCloseable {
     @GuardedBy("mCallbackLock")
     @Nullable
     private Executor mCallbackExecutor;
+
+    private static class ExtraApkSpec {
+        public final File apk;
+        public final File idsig;
+
+        ExtraApkSpec(File apk, File idsig) {
+            this.apk = apk;
+            this.idsig = idsig;
+        }
+    }
 
     static {
         System.loadLibrary("virtualmachine_jni");
@@ -379,9 +384,8 @@ public class VirtualMachine implements AutoCloseable {
     void delete(Context context, String name) throws VirtualMachineException {
         synchronized (mLock) {
             checkStopped();
+            deleteVmDirectory(context, name);
         }
-
-        deleteVmDirectory(context, name);
     }
 
     static void deleteVmDirectory(Context context, String name) throws VirtualMachineException {
@@ -425,6 +429,7 @@ public class VirtualMachine implements AutoCloseable {
      *
      * @hide
      */
+    @SystemApi
     @NonNull
     public String getName() {
         return mName;
@@ -439,6 +444,7 @@ public class VirtualMachine implements AutoCloseable {
      *
      * @hide
      */
+    @SystemApi
     @NonNull
     public VirtualMachineConfig getConfig() {
         synchronized (mLock) {
@@ -451,6 +457,7 @@ public class VirtualMachine implements AutoCloseable {
      *
      * @hide
      */
+    @SystemApi
     @Status
     public int getStatus() {
         IVirtualMachine virtualMachine;
@@ -525,7 +532,9 @@ public class VirtualMachine implements AutoCloseable {
      *
      * @hide
      */
-    public void setCallback(@NonNull @CallbackExecutor Executor executor,
+    @SystemApi
+    public void setCallback(
+            @NonNull @CallbackExecutor Executor executor,
             @NonNull VirtualMachineCallback callback) {
         synchronized (mCallbackLock) {
             mCallback = callback;
@@ -538,6 +547,7 @@ public class VirtualMachine implements AutoCloseable {
      *
      * @hide
      */
+    @SystemApi
     public void clearCallback() {
         synchronized (mCallbackLock) {
             mCallback = null;
@@ -571,9 +581,10 @@ public class VirtualMachine implements AutoCloseable {
      * calling {@code run()}.
      *
      * @throws VirtualMachineException if the virtual machine is not stopped or could not be
-     *         started.
+     *     started.
      * @hide
      */
+    @SystemApi
     @RequiresPermission(MANAGE_VIRTUAL_MACHINE_PERMISSION)
     public void run() throws VirtualMachineException {
         synchronized (mLock) {
@@ -717,6 +728,7 @@ public class VirtualMachine implements AutoCloseable {
      * @throws VirtualMachineException if the stream could not be created.
      * @hide
      */
+    @SystemApi
     @NonNull
     public InputStream getConsoleOutput() throws VirtualMachineException {
         synchronized (mLock) {
@@ -731,6 +743,7 @@ public class VirtualMachine implements AutoCloseable {
      * @throws VirtualMachineException if the stream could not be created.
      * @hide
      */
+    @SystemApi
     @NonNull
     public InputStream getLogOutput() throws VirtualMachineException {
         synchronized (mLock) {
@@ -742,12 +755,13 @@ public class VirtualMachine implements AutoCloseable {
     /**
      * Stops this virtual machine. Stopping a virtual machine is like pulling the plug on a real
      * computer; the machine halts immediately. Software running on the virtual machine is not
-     * notified of the event. A stopped virtual machine can be re-started by calling {@link
-     * #run()}.
+     * notified of the event. A stopped virtual machine can be re-started by calling {@link #run()}.
      *
-     * @throws VirtualMachineException if the virtual machine could not be stopped.
+     * @throws VirtualMachineException if the virtual machine is not running or could not be
+     *     stopped.
      * @hide
      */
+    @SystemApi
     public void stop() throws VirtualMachineException {
         synchronized (mLock) {
             if (mVirtualMachine == null) {
@@ -765,14 +779,31 @@ public class VirtualMachine implements AutoCloseable {
     }
 
     /**
-     * Stops this virtual machine. See {@link #stop()}.
+     * Stops this virtual machine, if it is running.
      *
-     * @throws VirtualMachineException if the virtual machine could not be stopped.
+     * @see #stop()
      * @hide
      */
+    @SystemApi
     @Override
-    public void close() throws VirtualMachineException {
-        stop();
+    public void close() {
+        synchronized (mLock) {
+            if (mVirtualMachine == null) {
+                return;
+            }
+            try {
+                if (stateToStatus(mVirtualMachine.getState()) == STATUS_RUNNING) {
+                    mVirtualMachine.stop();
+                    mVirtualMachine = null;
+                }
+            } catch (RemoteException e) {
+                throw e.rethrowAsRuntimeException();
+            } catch (ServiceSpecificException e) {
+                // Deliberately ignored; this almost certainly means the VM exited just as
+                // we tried to stop it.
+                Log.i(TAG, "Ignoring error on close()", e);
+            }
+        }
     }
 
     private static void deleteRecursively(File dir) throws IOException {
@@ -802,6 +833,7 @@ public class VirtualMachine implements AutoCloseable {
      * @throws VirtualMachineException if the virtual machine is not running.
      * @hide
      */
+    @SystemApi
     public int getCid() throws VirtualMachineException {
         synchronized (mLock) {
             try {
@@ -817,14 +849,15 @@ public class VirtualMachine implements AutoCloseable {
      * like the number of CPU and size of the RAM, depending on the situation (e.g. the size of the
      * application to run on the virtual machine, etc.)
      *
-     * The new config must be {@link VirtualMachineConfig#isCompatibleWith compatible with} the
+     * <p>The new config must be {@link VirtualMachineConfig#isCompatibleWith compatible with} the
      * existing config.
      *
      * @return the old config
      * @throws VirtualMachineException if the virtual machine is not stopped, or the new config is
-     *         incompatible.
+     *     incompatible.
      * @hide
      */
+    @SystemApi
     @NonNull
     public VirtualMachineConfig setConfig(@NonNull VirtualMachineConfig newConfig)
             throws VirtualMachineException {
@@ -834,6 +867,10 @@ public class VirtualMachine implements AutoCloseable {
                 throw new VirtualMachineException("incompatible config");
             }
             checkStopped();
+
+            // Delete any existing file before recreating; that ensures any VirtualMachineDescriptor
+            // that refers to the old file does not see the new config.
+            mConfigFilePath.delete();
             newConfig.serialize(mConfigFilePath);
             mConfig = newConfig;
             return oldConfig;
@@ -846,13 +883,14 @@ public class VirtualMachine implements AutoCloseable {
     /**
      * Connect to a VM's binder service via vsock and return the root IBinder object. Guest VMs are
      * expected to set up vsock servers in their payload. After the host app receives the {@link
-     * VirtualMachineCallback#onPayloadReady(VirtualMachine)}, it can use this method to
-     * establish a connection to the guest VM.
+     * VirtualMachineCallback#onPayloadReady(VirtualMachine)}, it can use this method to establish a
+     * connection to the guest VM.
      *
      * @throws VirtualMachineException if the virtual machine is not running or the connection
-     *         failed.
+     *     failed.
      * @hide
      */
+    @SystemApi
     @NonNull
     public IBinder connectToVsockServer(int port) throws VirtualMachineException {
         synchronized (mLock) {
@@ -870,6 +908,7 @@ public class VirtualMachine implements AutoCloseable {
      * @throws VirtualMachineException if connecting fails.
      * @hide
      */
+    @SystemApi
     @NonNull
     public ParcelFileDescriptor connectVsock(int port) throws VirtualMachineException {
         synchronized (mLock) {
@@ -887,22 +926,27 @@ public class VirtualMachine implements AutoCloseable {
      * Captures the current state of the VM in a {@link VirtualMachineDescriptor} instance. The VM
      * needs to be stopped to avoid inconsistency in its state representation.
      *
+     * <p>The state of the VM is not actually copied until {@link
+     * VirtualMachineManager#importFromDescriptor} is called. It is recommended that the VM not be
+     * started until that operation is complete.
+     *
      * @return a {@link VirtualMachineDescriptor} instance that represents the VM's state.
      * @throws VirtualMachineException if the virtual machine is not stopped, or the state could not
      *     be captured.
      * @hide
      */
+    @SystemApi
     @NonNull
     public VirtualMachineDescriptor toDescriptor() throws VirtualMachineException {
         synchronized (mLock) {
             checkStopped();
-        }
-        try {
-            return new VirtualMachineDescriptor(
-                    ParcelFileDescriptor.open(mConfigFilePath, MODE_READ_ONLY),
-                    ParcelFileDescriptor.open(mInstanceFilePath, MODE_READ_ONLY));
-        } catch (IOException e) {
-            throw new VirtualMachineException(e);
+            try {
+                return new VirtualMachineDescriptor(
+                        ParcelFileDescriptor.open(mConfigFilePath, MODE_READ_ONLY),
+                        ParcelFileDescriptor.open(mInstanceFilePath, MODE_READ_ONLY));
+            } catch (IOException e) {
+                throw new VirtualMachineException(e);
+            }
         }
     }
 

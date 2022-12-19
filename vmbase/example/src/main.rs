@@ -27,9 +27,14 @@ use crate::layout::{
     bionic_tls, dtb_range, print_addresses, rodata_range, stack_chk_guard, text_range,
     writable_region, DEVICE_REGION,
 };
-use aarch64_paging::{idmap::IdMap, paging::Attributes};
+use aarch64_paging::{
+    idmap::IdMap,
+    paging::{Attributes, MemoryRegion},
+};
 use alloc::{vec, vec::Vec};
 use buddy_system_allocator::LockedHeap;
+use core::ffi::CStr;
+use libfdt::Fdt;
 use log::{info, LevelFilter};
 use vmbase::{logger, main, println};
 
@@ -57,6 +62,7 @@ pub fn main(arg0: u64, arg1: u64, arg2: u64, arg3: u64) {
     assert_eq!(arg0, dtb_range().start.0 as u64);
     check_data();
     check_stack_guard();
+    check_fdt();
 
     unsafe {
         HEAP_ALLOCATOR.lock().init(HEAP.as_mut_ptr() as usize, HEAP.len());
@@ -136,6 +142,51 @@ fn check_data() {
         assert_eq!(MUTABLE_DATA[0], 1);
     }
     info!("Data looks good");
+}
+
+fn check_fdt() {
+    info!("Checking FDT...");
+    let fdt = MemoryRegion::from(layout::dtb_range());
+    let fdt = unsafe { core::slice::from_raw_parts_mut(fdt.start().0 as *mut u8, fdt.len()) };
+
+    let reader = Fdt::from_slice(fdt).unwrap();
+    info!("FDT passed verification.");
+    for reg in reader.memory().unwrap().unwrap() {
+        info!("memory @ {reg:#x?}");
+    }
+
+    let compatible = CStr::from_bytes_with_nul(b"ns16550a\0").unwrap();
+
+    for c in reader.compatible_nodes(compatible).unwrap() {
+        let reg = c.reg().unwrap().unwrap().next().unwrap();
+        info!("node compatible with '{}' at {reg:?}", compatible.to_str().unwrap());
+    }
+
+    let writer = Fdt::from_mut_slice(fdt).unwrap();
+    writer.unpack().unwrap();
+    info!("FDT successfully unpacked.");
+
+    let path = CStr::from_bytes_with_nul(b"/memory\0").unwrap();
+    let mut node = writer.node_mut(path).unwrap().unwrap();
+    let name = CStr::from_bytes_with_nul(b"child\0").unwrap();
+    let mut child = node.add_subnode(name).unwrap();
+    info!("Created subnode '{}/{}'.", path.to_str().unwrap(), name.to_str().unwrap());
+
+    let name = CStr::from_bytes_with_nul(b"str-property\0").unwrap();
+    child.appendprop(name, b"property-value\0").unwrap();
+    info!("Appended property '{}'.", name.to_str().unwrap());
+
+    let name = CStr::from_bytes_with_nul(b"pair-property\0").unwrap();
+    let addr = 0x0123_4567u64;
+    let size = 0x89ab_cdefu64;
+    child.appendprop_addrrange(name, addr, size).unwrap();
+    info!("Appended property '{}'.", name.to_str().unwrap());
+
+    let writer = child.fdt();
+    writer.pack().unwrap();
+    info!("FDT successfully packed.");
+
+    info!("FDT checks done.");
 }
 
 fn check_alloc() {
