@@ -31,14 +31,8 @@ use core::mem;
 use core::ops::Range;
 use core::ptr;
 use core::result;
+use cstr::cstr;
 use zerocopy::AsBytes as _;
-
-// TODO(b/308694211): Use cstr!() from vmbase
-macro_rules! cstr {
-    ($str:literal) => {{
-        core::ffi::CStr::from_bytes_with_nul(concat!($str, "\0").as_bytes()).unwrap()
-    }};
-}
 
 /// Error type corresponding to libfdt error codes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -504,6 +498,18 @@ impl<'a> FdtNode<'a> {
 
         fdt_err_or_option(ret)?.map(|offset| FdtProperty::new(self.fdt, offset)).transpose()
     }
+
+    /// Returns the phandle
+    pub fn get_phandle(&self) -> Result<Option<Phandle>> {
+        // This rewrites the fdt_get_phandle() because it doesn't return error code.
+        if let Some(prop) = self.getprop_u32(cstr!("phandle"))? {
+            Ok(Some(prop.try_into()?))
+        } else if let Some(prop) = self.getprop_u32(cstr!("linux,phandle"))? {
+            Ok(Some(prop.try_into()?))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 impl<'a> PartialEq for FdtNode<'a> {
@@ -514,7 +520,7 @@ impl<'a> PartialEq for FdtNode<'a> {
 
 /// Phandle of a FDT node
 #[repr(transparent)]
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
 pub struct Phandle(u32);
 
 impl Phandle {
@@ -1012,9 +1018,20 @@ impl Fdt {
 
     /// Returns a node with the phandle
     pub fn node_with_phandle(&self, phandle: Phandle) -> Result<Option<FdtNode>> {
-        // SAFETY: Accesses (read-only) are constrained to the DT totalsize.
+        let offset = self.node_offset_with_phandle(phandle)?;
+        Ok(offset.map(|offset| FdtNode { fdt: self, offset }))
+    }
+
+    /// Returns a mutable node with the phandle
+    pub fn node_mut_with_phandle(&mut self, phandle: Phandle) -> Result<Option<FdtNodeMut>> {
+        let offset = self.node_offset_with_phandle(phandle)?;
+        Ok(offset.map(|offset| FdtNodeMut { fdt: self, offset }))
+    }
+
+    fn node_offset_with_phandle(&self, phandle: Phandle) -> Result<Option<c_int>> {
+        // SAFETY: Accesses are constrained to the DT totalsize.
         let ret = unsafe { libfdt_bindgen::fdt_node_offset_by_phandle(self.as_ptr(), phandle.0) };
-        Ok(fdt_err_or_option(ret)?.map(|offset| FdtNode { fdt: self, offset }))
+        fdt_err_or_option(ret)
     }
 
     /// Returns the mutable root node of the tree.
