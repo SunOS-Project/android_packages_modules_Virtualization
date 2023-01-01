@@ -24,18 +24,22 @@ mod cbs;
 mod digest;
 mod ec_key;
 mod err;
+mod evp;
 mod hkdf;
 mod hmac;
 mod rand;
+mod sha;
 mod util;
 
-pub use bssl_avf_error::{ApiName, CipherError, Error, ReasonCode, Result};
+pub use bssl_avf_error::{ApiName, CipherError, EcError, EcdsaError, Error, ReasonCode, Result};
 
 pub use aead::{Aead, AeadContext, AES_GCM_NONCE_LENGTH};
 pub use cbb::CbbFixed;
 pub use cbs::Cbs;
 pub use digest::Digester;
 pub use ec_key::{EcKey, ZVec};
+pub use evp::EvpPKey;
 pub use hkdf::hkdf;
 pub use hmac::hmac_sha256;
 pub use rand::rand_bytes;
+pub use sha::sha256;
