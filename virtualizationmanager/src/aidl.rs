@@ -24,6 +24,7 @@ use crate::payload::{add_microdroid_payload_images, add_microdroid_system_images
 use crate::selinux::{getfilecon, SeContext};
 use android_os_permissions_aidl::aidl::android::os::IPermissionController;
 use android_system_virtualizationcommon::aidl::android::system::virtualizationcommon::{
+    Certificate::Certificate,
     DeathReason::DeathReason,
     ErrorCode::ErrorCode,
 };
@@ -1029,6 +1030,7 @@ pub fn clone_file(file: &ParcelFileDescriptor) -> binder::Result<File> {
         .try_clone()
         .context("Failed to clone File from ParcelFileDescriptor")
         .or_binder_exception(ExceptionCode::BAD_PARCELABLE)
+        .map(File::from)
 }
 
 /// Converts an `&Option<ParcelFileDescriptor>` to an `Option<File>` by cloning the file.
@@ -1245,7 +1247,7 @@ impl IVirtualMachineService for VirtualMachineService {
         }
     }
 
-    fn requestAttestation(&self, csr: &[u8]) -> binder::Result<Vec<u8>> {
+    fn requestAttestation(&self, csr: &[u8]) -> binder::Result<Vec<Certificate>> {
         GLOBAL_SERVICE.requestAttestation(csr)
     }
 }
