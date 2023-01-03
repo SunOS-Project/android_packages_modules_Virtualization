@@ -31,6 +31,9 @@ import static java.nio.file.StandardCopyOption.REPLACE_EXISTING;
 
 import android.content.Context;
 import android.os.Build;
+import android.os.ParcelFileDescriptor;
+import android.os.ParcelFileDescriptor.AutoCloseInputStream;
+import android.os.ParcelFileDescriptor.AutoCloseOutputStream;
 import android.os.SystemProperties;
 import android.system.virtualmachine.VirtualMachine;
 import android.system.virtualmachine.VirtualMachineCallback;
@@ -55,11 +58,17 @@ import org.junit.rules.Timeout;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 
+import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.io.OutputStreamWriter;
 import java.io.RandomAccessFile;
+import java.io.Writer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -68,6 +77,7 @@ import java.util.List;
 import java.util.OptionalLong;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicReference;
 
 import co.nstant.in.cbor.CborDecoder;
 import co.nstant.in.cbor.model.Array;
@@ -113,6 +123,7 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
                 newVmConfigBuilder()
                         .setPayloadBinaryPath("MicrodroidTestNativeLib.so")
                         .setMemoryMib(minMemoryRequired())
+                        .setDebugLevel(DEBUG_LEVEL_FULL)
                         .build();
         VirtualMachine vm = forceCreateNewVirtualMachine("test_vm", config);
 
@@ -123,6 +134,25 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
         assertThat(testResults.mSublibRunProp).isEqualTo("true");
         assertThat(testResults.mApkContentsPath).isEqualTo("/mnt/apk");
         assertThat(testResults.mEncryptedStoragePath).isEqualTo("");
+    }
+
+    @Test
+    @CddTest(requirements = {"9.17/C-1-1", "9.17/C-2-1"})
+    public void createAndRunNoDebugVm() throws Exception {
+        assumeSupportedKernel();
+
+        // For most of our tests we use a debug VM so failures can be diagnosed.
+        // But we do need non-debug VMs to work, so run one.
+        VirtualMachineConfig config =
+                newVmConfigBuilder()
+                        .setPayloadBinaryPath("MicrodroidTestNativeLib.so")
+                        .setMemoryMib(minMemoryRequired())
+                        .setDebugLevel(DEBUG_LEVEL_NONE)
+                        .build();
+        VirtualMachine vm = forceCreateNewVirtualMachine("test_vm", config);
+
+        TestResults testResults = runVmTestService(vm);
+        assertThat(testResults.mException).isNull();
     }
 
     @Test
@@ -160,6 +190,7 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
                 newVmConfigBuilder()
                         .setPayloadBinaryPath("MicrodroidTestNativeLib.so")
                         .setMemoryMib(minMemoryRequired())
+                        .setDebugLevel(DEBUG_LEVEL_FULL)
                         .build();
 
         try (VirtualMachine vm = forceCreateNewVirtualMachine("test_vm", config)) {
@@ -179,6 +210,56 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
             assertThat(vm.getStatus()).isEqualTo(STATUS_DELETED);
             // close() implicitly called on deleted VM.
         }
+    }
+
+    @Test
+    @CddTest(requirements = {"9.17/C-1-1"})
+    public void connectVsock() throws Exception {
+        assumeSupportedKernel();
+
+        VirtualMachineConfig config =
+                newVmConfigBuilder()
+                        .setPayloadBinaryPath("MicrodroidTestNativeLib.so")
+                        .setMemoryMib(minMemoryRequired())
+                        .setDebugLevel(DEBUG_LEVEL_FULL)
+                        .build();
+        VirtualMachine vm = forceCreateNewVirtualMachine("test_vm_vsock", config);
+
+        AtomicReference<Exception> exception = new AtomicReference<>();
+        AtomicReference<String> response = new AtomicReference<>();
+        String request = "Look not into the abyss";
+
+        VmEventListener listener =
+                new VmEventListener() {
+                    @Override
+                    public void onPayloadReady(VirtualMachine vm) {
+                        try (vm) {
+                            ITestService testService =
+                                    ITestService.Stub.asInterface(
+                                            vm.connectToVsockServer(ITestService.SERVICE_PORT));
+                            testService.runEchoReverseServer();
+
+                            ParcelFileDescriptor pfd =
+                                    vm.connectVsock(ITestService.ECHO_REVERSE_PORT);
+                            try (InputStream input = new AutoCloseInputStream(pfd);
+                                    OutputStream output = new AutoCloseOutputStream(pfd)) {
+                                BufferedReader reader =
+                                        new BufferedReader(new InputStreamReader(input));
+                                Writer writer = new OutputStreamWriter(output);
+                                writer.write(request + "\n");
+                                writer.flush();
+                                response.set(reader.readLine());
+                            }
+                        } catch (Exception e) {
+                            exception.set(e);
+                        }
+                    }
+                };
+        listener.runToFinish(TAG, vm);
+        if (exception.get() != null) {
+            throw new RuntimeException(exception.get());
+        }
+        assertThat(response.get()).isEqualTo(new StringBuilder(request).reverse().toString());
     }
 
     @Test
@@ -244,6 +325,52 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
     }
 
     @Test
+    @CddTest(requirements = {"9.17/C-1-1"})
+    public void vmFilesStoredInDeDirWhenCreatedFromDEContext() throws Exception {
+        final Context ctx = getContext().createDeviceProtectedStorageContext();
+        final int userId = ctx.getUserId();
+        final VirtualMachineManager vmm = ctx.getSystemService(VirtualMachineManager.class);
+        VirtualMachineConfig config =
+                newVmConfigBuilder().setPayloadBinaryPath("binary/path").build();
+        try {
+            VirtualMachine vm = vmm.create("vm-name", config);
+            // TODO(b/261430346): what about non-primary user?
+            assertThat(vm.getRootDir().getAbsolutePath())
+                    .isEqualTo(
+                            "/data/user_de/" + userId + "/com.android.microdroid.test/vm/vm-name");
+        } finally {
+            vmm.delete("vm-name");
+        }
+    }
+
+    @Test
+    @CddTest(requirements = {"9.17/C-1-1"})
+    public void vmFilesStoredInCeDirWhenCreatedFromCEContext() throws Exception {
+        final Context ctx = getContext().createCredentialProtectedStorageContext();
+        final int userId = ctx.getUserId();
+        final VirtualMachineManager vmm = ctx.getSystemService(VirtualMachineManager.class);
+        VirtualMachineConfig config =
+                newVmConfigBuilder().setPayloadBinaryPath("binary/path").build();
+        try {
+            VirtualMachine vm = vmm.create("vm-name", config);
+            // TODO(b/261430346): what about non-primary user?
+            assertThat(vm.getRootDir().getAbsolutePath())
+                    .isEqualTo("/data/user/" + userId + "/com.android.microdroid.test/vm/vm-name");
+        } finally {
+            vmm.delete("vm-name");
+        }
+    }
+
+    @Test
+    @CddTest(requirements = {"9.17/C-1-1"})
+    public void differentManagersForDifferentContexts() throws Exception {
+        final Context ceCtx = getContext().createCredentialProtectedStorageContext();
+        final Context deCtx = getContext().createDeviceProtectedStorageContext();
+        assertThat(ceCtx.getSystemService(VirtualMachineManager.class))
+                .isNotSameInstanceAs(deCtx.getSystemService(VirtualMachineManager.class));
+    }
+
+    @Test
     @CddTest(requirements = {
             "9.17/C-1-1",
             "9.17/C-1-2",
@@ -305,6 +432,7 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
                         .setPayloadBinaryPath("MicrodroidTestNativeLib.so")
                         .setApkPath(getContext().getPackageCodePath())
                         .setMemoryMib(minMemoryRequired())
+                        .setDebugLevel(DEBUG_LEVEL_FULL)
                         .build();
 
         VirtualMachine vm = forceCreateNewVirtualMachine("test_vm_explicit_apk_path", config);
@@ -318,14 +446,21 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
             "9.17/C-1-1",
     })
     public void invalidApkPathIsRejected() {
-        assumeSupportedKernel();
-
         VirtualMachineConfig.Builder builder =
                 newVmConfigBuilder()
                         .setPayloadBinaryPath("MicrodroidTestNativeLib.so")
                         .setApkPath("relative/path/to.apk")
+                        .setDebugLevel(DEBUG_LEVEL_FULL)
                         .setMemoryMib(minMemoryRequired());
         assertThrows(IllegalArgumentException.class, () -> builder.build());
+    }
+
+    @Test
+    @CddTest(requirements = {"9.17/C-1-1"})
+    public void invalidVmNameIsRejected() {
+        VirtualMachineManager vmm = getVirtualMachineManager();
+        assertThrows(IllegalArgumentException.class, () -> vmm.get("../foo"));
+        assertThrows(IllegalArgumentException.class, () -> vmm.get(".."));
     }
 
     @Test
@@ -341,6 +476,7 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
                 newVmConfigBuilder()
                         .setPayloadConfigPath("assets/vm_config_extra_apk.json")
                         .setMemoryMib(minMemoryRequired())
+                        .setDebugLevel(DEBUG_LEVEL_FULL)
                         .build();
         VirtualMachine vm = forceCreateNewVirtualMachine("test_vm_extra_apk", config);
 
@@ -707,7 +843,6 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
         VirtualMachineConfig config =
                 newVmConfigBuilder()
                         .setPayloadBinaryPath("MicrodroidTestNativeLib.so")
-                        .setDebugLevel(DEBUG_LEVEL_NONE)
                         .build();
 
         VirtualMachine vm = forceCreateNewVirtualMachine("test_vm", config);
@@ -757,7 +892,7 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
         VirtualMachineConfig config =
                 newVmConfigBuilder()
                         .setPayloadBinaryPath("MicrodroidTestNativeLib.so")
-                        .setDebugLevel(DEBUG_LEVEL_NONE)
+                        .setDebugLevel(DEBUG_LEVEL_FULL)
                         .build();
         String vmNameOrig = "test_vm_orig";
         String vmNameImport = "test_vm_import";
