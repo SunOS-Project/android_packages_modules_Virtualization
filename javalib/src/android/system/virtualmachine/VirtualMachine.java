@@ -45,9 +45,11 @@ import static java.util.Objects.requireNonNull;
 
 import android.annotation.CallbackExecutor;
 import android.annotation.IntDef;
+import android.annotation.IntRange;
 import android.annotation.NonNull;
 import android.annotation.Nullable;
 import android.annotation.RequiresPermission;
+import android.annotation.SuppressLint;
 import android.annotation.SystemApi;
 import android.annotation.TestApi;
 import android.content.ComponentCallbacks2;
@@ -59,8 +61,8 @@ import android.os.ParcelFileDescriptor;
 import android.os.RemoteException;
 import android.os.ServiceManager;
 import android.os.ServiceSpecificException;
+import android.system.virtualizationcommon.DeathReason;
 import android.system.virtualizationcommon.ErrorCode;
-import android.system.virtualizationservice.DeathReason;
 import android.system.virtualizationservice.IVirtualMachine;
 import android.system.virtualizationservice.IVirtualMachineCallback;
 import android.system.virtualizationservice.IVirtualizationService;
@@ -121,6 +123,24 @@ public class VirtualMachine implements AutoCloseable {
             "android.permission.USE_CUSTOM_VIRTUAL_MACHINE";
 
     /**
+     * The lowest port number that can be used to communicate with the virtual machine payload.
+     *
+     * @see #connectToVsockServer
+     * @see #connectVsock
+     */
+    @SuppressLint("MinMaxConstant") // Won't change: see man 7 vsock.
+    public static final long MIN_VSOCK_PORT = 1024;
+
+    /**
+     * The highest port number that can be used to communicate with the virtual machine payload.
+     *
+     * @see #connectToVsockServer
+     * @see #connectVsock
+     */
+    @SuppressLint("MinMaxConstant") // Won't change: see man 7 vsock.
+    public static final long MAX_VSOCK_PORT = (1L << 32) - 1;
+
+    /**
      * Status of a virtual machine
      *
      * @hide
@@ -169,6 +189,9 @@ public class VirtualMachine implements AutoCloseable {
     /** Size of the instance image. 10 MB. */
     private static final long INSTANCE_FILE_SIZE = 10 * 1024 * 1024;
 
+    /** Name of the file backing the encrypted storage */
+    private static final String ENCRYPTED_STORE_FILE = "storage.img";
+
     /** The package which owns this VM. */
     @NonNull private final String mPackageName;
 
@@ -190,6 +213,9 @@ public class VirtualMachine implements AutoCloseable {
 
     /** Path to the idsig file for this VM. */
     @NonNull private final File mIdsigFilePath;
+
+    /** File that backs the encrypted storage - Will be null if not enabled. */
+    @Nullable private final File mEncryptedStoreFilePath;
 
     /**
      * Unmodifiable list of extra apks. Apks are specified by the vm config, and corresponding
@@ -324,6 +350,10 @@ public class VirtualMachine implements AutoCloseable {
         mExtraApks = setupExtraApks(context, config, thisVmDir);
         mMemoryManagementCallbacks = new MemoryManagementCallbacks();
         mContext = context;
+        mEncryptedStoreFilePath =
+                (config.isEncryptedStorageEnabled())
+                        ? new File(thisVmDir, ENCRYPTED_STORE_FILE)
+                        : null;
     }
 
     /**
@@ -354,6 +384,16 @@ public class VirtualMachine implements AutoCloseable {
                 throw new VirtualMachineException("failed to create instance image", e);
             }
             vm.importInstanceFrom(vmDescriptor.getInstanceImgFd());
+
+            if (vmDescriptor.getEncryptedStoreFd() != null) {
+                try {
+                    vm.mEncryptedStoreFilePath.createNewFile();
+                } catch (IOException e) {
+                    throw new VirtualMachineException(
+                            "failed to create encrypted storage image", e);
+                }
+                vm.importEncryptedStoreFrom(vmDescriptor.getEncryptedStoreFd());
+            }
             return vm;
         } catch (VirtualMachineException | RuntimeException e) {
             // If anything goes wrong, delete any files created so far and the VM's directory
@@ -386,6 +426,14 @@ public class VirtualMachine implements AutoCloseable {
             } catch (IOException e) {
                 throw new VirtualMachineException("failed to create instance image", e);
             }
+            if (config.isEncryptedStorageEnabled()) {
+                try {
+                    vm.mEncryptedStoreFilePath.createNewFile();
+                } catch (IOException e) {
+                    throw new VirtualMachineException(
+                            "failed to create encrypted storage image", e);
+                }
+            }
 
             IVirtualizationService service =
                     IVirtualizationService.Stub.asInterface(
@@ -402,6 +450,22 @@ public class VirtualMachine implements AutoCloseable {
                 throw e.rethrowAsRuntimeException();
             } catch (ServiceSpecificException | IllegalArgumentException e) {
                 throw new VirtualMachineException("failed to create instance partition", e);
+            }
+
+            if (config.isEncryptedStorageEnabled()) {
+                try {
+                    service.initializeWritablePartition(
+                            ParcelFileDescriptor.open(vm.mEncryptedStoreFilePath, MODE_READ_WRITE),
+                            config.getEncryptedStorageKib() * 1024L,
+                            PartitionType.ENCRYPTEDSTORE);
+                } catch (FileNotFoundException e) {
+                    throw new VirtualMachineException("encrypted storage image missing", e);
+                } catch (RemoteException e) {
+                    throw e.rethrowAsRuntimeException();
+                } catch (ServiceSpecificException | IllegalArgumentException e) {
+                    throw new VirtualMachineException(
+                            "failed to create encrypted storage partition", e);
+                }
             }
             return vm;
         } catch (VirtualMachineException | RuntimeException e) {
@@ -432,7 +496,9 @@ public class VirtualMachine implements AutoCloseable {
         if (!vm.mInstanceFilePath.exists()) {
             throw new VirtualMachineException("instance image missing");
         }
-
+        if (config.isEncryptedStorageEnabled() && !vm.mEncryptedStoreFilePath.exists()) {
+            throw new VirtualMachineException("Storage image missing");
+        }
         return vm;
     }
 
@@ -564,9 +630,22 @@ public class VirtualMachine implements AutoCloseable {
         } catch (RemoteException e) {
             throw e.rethrowAsRuntimeException();
         }
+        // It's stopped, but we still have a reference to it - we can fix that.
+        dropVm();
     }
 
-    // If we have an IVirtualMachine in the running state return it, otherwise throw.
+    /**
+     * This should only be called when we know our VM has stopped; we no longer need to hold a
+     * reference to it (this allows resources to be GC'd) and we no longer need to be informed of
+     * memory pressure.
+     */
+    @GuardedBy("mLock")
+    private void dropVm() {
+        mContext.unregisterComponentCallbacks(mMemoryManagementCallbacks);
+        mVirtualMachine = null;
+    }
+
+    /** If we have an IVirtualMachine in the running state return it, otherwise throw. */
     @GuardedBy("mLock")
     private IVirtualMachine getRunningVm() throws VirtualMachineException {
         try {
@@ -681,8 +760,12 @@ public class VirtualMachine implements AutoCloseable {
 
                 // Re-open idsig file in read-only mode
                 appConfig.idsig = ParcelFileDescriptor.open(mIdsigFilePath, MODE_READ_ONLY);
-                appConfig.instanceImage = ParcelFileDescriptor.open(mInstanceFilePath,
-                        MODE_READ_WRITE);
+                appConfig.instanceImage =
+                        ParcelFileDescriptor.open(mInstanceFilePath, MODE_READ_WRITE);
+                if (mEncryptedStoreFilePath != null) {
+                    appConfig.encryptedStorageImage =
+                            ParcelFileDescriptor.open(mEncryptedStoreFilePath, MODE_READ_WRITE);
+                }
                 List<ParcelFileDescriptor> extraIdsigs = new ArrayList<>();
                 for (ExtraApkSpec extraApk : mExtraApks) {
                     extraIdsigs.add(ParcelFileDescriptor.open(extraApk.idsig, MODE_READ_ONLY));
@@ -745,11 +828,6 @@ public class VirtualMachine implements AutoCloseable {
                                                     cb.onStopped(
                                                             VirtualMachine.this, translatedReason));
                                 }
-                            }
-
-                            @Override
-                            public void onRamdump(int cid, ParcelFileDescriptor ramdump) {
-                                executeCallback((cb) -> cb.onRamdump(VirtualMachine.this, ramdump));
                             }
                         });
                 mContext.registerComponentCallbacks(mMemoryManagementCallbacks);
@@ -829,8 +907,7 @@ public class VirtualMachine implements AutoCloseable {
             }
             try {
                 mVirtualMachine.stop();
-                mContext.unregisterComponentCallbacks(mMemoryManagementCallbacks);
-                mVirtualMachine = null;
+                dropVm();
             } catch (RemoteException e) {
                 throw e.rethrowAsRuntimeException();
             } catch (ServiceSpecificException e) {
@@ -855,8 +932,7 @@ public class VirtualMachine implements AutoCloseable {
             try {
                 if (stateToStatus(mVirtualMachine.getState()) == STATUS_RUNNING) {
                     mVirtualMachine.stop();
-                    mContext.unregisterComponentCallbacks(mMemoryManagementCallbacks);
-                    mVirtualMachine = null;
+                    dropVm();
                 }
             } catch (RemoteException e) {
                 throw e.rethrowAsRuntimeException();
@@ -887,23 +963,6 @@ public class VirtualMachine implements AutoCloseable {
                 return FileVisitResult.CONTINUE;
             }
         });
-    }
-
-    /**
-     * Returns the CID of this virtual machine, if it is running.
-     *
-     * @throws VirtualMachineException if the virtual machine is not running.
-     * @hide
-     */
-    @SystemApi
-    public int getCid() throws VirtualMachineException {
-        synchronized (mLock) {
-            try {
-                return getRunningVm().getCid();
-            } catch (RemoteException e) {
-                throw e.rethrowAsRuntimeException();
-            }
-        }
     }
 
     /**
@@ -954,9 +1013,13 @@ public class VirtualMachine implements AutoCloseable {
      */
     @SystemApi
     @NonNull
-    public IBinder connectToVsockServer(int port) throws VirtualMachineException {
+    public IBinder connectToVsockServer(
+            @IntRange(from = MIN_VSOCK_PORT, to = MAX_VSOCK_PORT) long port)
+            throws VirtualMachineException {
+
         synchronized (mLock) {
-            IBinder iBinder = nativeConnectToVsockServer(getRunningVm().asBinder(), port);
+            IBinder iBinder =
+                    nativeConnectToVsockServer(getRunningVm().asBinder(), validatePort(port));
             if (iBinder == null) {
                 throw new VirtualMachineException("Failed to connect to vsock server");
             }
@@ -972,16 +1035,28 @@ public class VirtualMachine implements AutoCloseable {
      */
     @SystemApi
     @NonNull
-    public ParcelFileDescriptor connectVsock(int port) throws VirtualMachineException {
+    public ParcelFileDescriptor connectVsock(
+            @IntRange(from = MIN_VSOCK_PORT, to = MAX_VSOCK_PORT) long port)
+            throws VirtualMachineException {
         synchronized (mLock) {
             try {
-                return getRunningVm().connectVsock(port);
+                return getRunningVm().connectVsock(validatePort(port));
             } catch (RemoteException e) {
                 throw e.rethrowAsRuntimeException();
             } catch (ServiceSpecificException e) {
                 throw new VirtualMachineException(e);
             }
         }
+    }
+
+    private int validatePort(long port) {
+        // Ports below 1024 are "privileged" (payload code can't bind to these), and port numbers
+        // are 32-bit unsigned numbers at the OS level, even though we pass them as 32-bit signed
+        // numbers internally.
+        if (port < MIN_VSOCK_PORT || port > MAX_VSOCK_PORT) {
+            throw new IllegalArgumentException("Bad port " + port);
+        }
+        return (int) port;
     }
 
     /**
@@ -1017,7 +1092,10 @@ public class VirtualMachine implements AutoCloseable {
             try {
                 return new VirtualMachineDescriptor(
                         ParcelFileDescriptor.open(mConfigFilePath, MODE_READ_ONLY),
-                        ParcelFileDescriptor.open(mInstanceFilePath, MODE_READ_ONLY));
+                        ParcelFileDescriptor.open(mInstanceFilePath, MODE_READ_ONLY),
+                        mEncryptedStoreFilePath != null
+                                ? ParcelFileDescriptor.open(mEncryptedStoreFilePath, MODE_READ_ONLY)
+                                : null);
             } catch (IOException e) {
                 throw new VirtualMachineException(e);
             }
@@ -1181,6 +1259,16 @@ public class VirtualMachine implements AutoCloseable {
             instance.transferFrom(instanceInput, /*position=*/ 0, instanceInput.size());
         } catch (IOException e) {
             throw new VirtualMachineException("failed to transfer instance image", e);
+        }
+    }
+
+    private void importEncryptedStoreFrom(@NonNull ParcelFileDescriptor encryptedStoreFd)
+            throws VirtualMachineException {
+        try (FileChannel storeOutput = new FileOutputStream(mEncryptedStoreFilePath).getChannel();
+                FileChannel storeInput = new AutoCloseInputStream(encryptedStoreFd).getChannel()) {
+            storeOutput.transferFrom(storeInput, /*position=*/ 0, storeInput.size());
+        } catch (IOException e) {
+            throw new VirtualMachineException("failed to transfer encryptedstore image", e);
         }
     }
 }

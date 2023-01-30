@@ -81,11 +81,7 @@ enum Opt {
         #[clap(long)]
         log: Option<PathBuf>,
 
-        /// Path to file where ramdump is recorded on kernel panic
-        #[clap(long)]
-        ramdump: Option<PathBuf>,
-
-        /// Debug level of the VM. Supported values: "none" (default), "app_only", and "full".
+        /// Debug level of the VM. Supported values: "none" (default), and "full".
         #[clap(long, default_value = "none", value_parser = parse_debug_level)]
         debug: DebugLevel,
 
@@ -144,11 +140,7 @@ enum Opt {
         #[clap(long)]
         log: Option<PathBuf>,
 
-        /// Path to file where ramdump is recorded on kernel panic
-        #[clap(long)]
-        ramdump: Option<PathBuf>,
-
-        /// Debug level of the VM. Supported values: "none" (default), "app_only", and "full".
+        /// Debug level of the VM. Supported values: "none" (default), and "full".
         #[clap(long, default_value = "full", value_parser = parse_debug_level)]
         debug: DebugLevel,
 
@@ -233,7 +225,6 @@ enum Opt {
 fn parse_debug_level(s: &str) -> Result<DebugLevel, String> {
     match s {
         "none" => Ok(DebugLevel::NONE),
-        "app_only" => Ok(DebugLevel::APP_ONLY),
         "full" => Ok(DebugLevel::FULL),
         _ => Err(format!("Invalid debug level {}", s)),
     }
@@ -269,7 +260,6 @@ fn main() -> Result<(), Error> {
             daemonize,
             console,
             log,
-            ramdump,
             debug,
             protected,
             mem,
@@ -289,7 +279,6 @@ fn main() -> Result<(), Error> {
             daemonize,
             console.as_deref(),
             log.as_deref(),
-            ramdump.as_deref(),
             debug,
             protected,
             mem,
@@ -305,7 +294,6 @@ fn main() -> Result<(), Error> {
             daemonize,
             console,
             log,
-            ramdump,
             debug,
             protected,
             mem,
@@ -320,7 +308,6 @@ fn main() -> Result<(), Error> {
             daemonize,
             console.as_deref(),
             log.as_deref(),
-            ramdump.as_deref(),
             debug,
             protected,
             mem,

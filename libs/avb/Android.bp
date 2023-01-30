@@ -12,6 +12,7 @@ rust_bindgen {
     source_stem: "bindings",
     bindgen_flags: [
         "--size_t-is-usize",
+        "--default-enum-style rust",
         "--allowlist-function=.*",
         "--use-core",
         "--raw-line=#![no_std]",
@@ -35,19 +36,4 @@ rust_test {
     auto_gen_config: true,
     clippy_lints: "none",
     lints: "none",
-}
-
-rust_library_rlib {
-    name: "libavb_nostd",
-    crate_name: "avb_nostd",
-    srcs: ["src/lib.rs"],
-    no_stdlibs: true,
-    prefer_rlib: true,
-    stdlibs: [
-        "libcore.rust_sysroot",
-    ],
-    rustlibs: [
-        "libavb_bindgen",
-        "liblog_rust_nostd",
-    ],
 }

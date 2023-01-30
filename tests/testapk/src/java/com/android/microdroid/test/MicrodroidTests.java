@@ -18,7 +18,6 @@ package com.android.microdroid.test;
 import static android.system.virtualmachine.VirtualMachine.STATUS_DELETED;
 import static android.system.virtualmachine.VirtualMachine.STATUS_RUNNING;
 import static android.system.virtualmachine.VirtualMachine.STATUS_STOPPED;
-import static android.system.virtualmachine.VirtualMachineConfig.DEBUG_LEVEL_APP_ONLY;
 import static android.system.virtualmachine.VirtualMachineConfig.DEBUG_LEVEL_FULL;
 import static android.system.virtualmachine.VirtualMachineConfig.DEBUG_LEVEL_NONE;
 
@@ -54,6 +53,7 @@ import org.junit.Before;
 import org.junit.Ignore;
 import org.junit.Rule;
 import org.junit.Test;
+import org.junit.function.ThrowingRunnable;
 import org.junit.rules.Timeout;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
@@ -213,6 +213,55 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
     }
 
     @Test
+    @CddTest(requirements = {"9.17/C-1-1", "9.17/C-2-1"})
+    public void vmLifecycleChecks() throws Exception {
+        assumeSupportedKernel();
+
+        VirtualMachineConfig config =
+                newVmConfigBuilder()
+                        .setPayloadBinaryPath("MicrodroidTestNativeLib.so")
+                        .setMemoryMib(minMemoryRequired())
+                        .setDebugLevel(DEBUG_LEVEL_FULL)
+                        .build();
+
+        VirtualMachine vm = forceCreateNewVirtualMachine("test_vm", config);
+        assertThat(vm.getStatus()).isEqualTo(STATUS_STOPPED);
+
+        // These methods require a running VM
+        assertThrowsVmExceptionContaining(
+                () -> vm.connectVsock(VirtualMachine.MIN_VSOCK_PORT), "not in running state");
+        assertThrowsVmExceptionContaining(
+                () -> vm.connectToVsockServer(VirtualMachine.MIN_VSOCK_PORT),
+                "not in running state");
+
+        vm.run();
+        assertThat(vm.getStatus()).isEqualTo(STATUS_RUNNING);
+
+        // These methods require a stopped VM
+        assertThrowsVmExceptionContaining(() -> vm.run(), "not in stopped state");
+        assertThrowsVmExceptionContaining(() -> vm.setConfig(config), "not in stopped state");
+        assertThrowsVmExceptionContaining(() -> vm.toDescriptor(), "not in stopped state");
+        assertThrowsVmExceptionContaining(
+                () -> getVirtualMachineManager().delete("test_vm"), "not in stopped state");
+
+        vm.stop();
+        getVirtualMachineManager().delete("test_vm");
+        assertThat(vm.getStatus()).isEqualTo(STATUS_DELETED);
+
+        // None of these should work for a deleted VM
+        assertThrowsVmExceptionContaining(
+                () -> vm.connectVsock(VirtualMachine.MIN_VSOCK_PORT), "deleted");
+        assertThrowsVmExceptionContaining(
+                () -> vm.connectToVsockServer(VirtualMachine.MIN_VSOCK_PORT), "deleted");
+        assertThrowsVmExceptionContaining(() -> vm.run(), "deleted");
+        assertThrowsVmExceptionContaining(() -> vm.setConfig(config), "deleted");
+        assertThrowsVmExceptionContaining(() -> vm.toDescriptor(), "deleted");
+        // This is indistinguishable from the VM having never existed, so the message
+        // is non-specific.
+        assertThrowsVmException(() -> getVirtualMachineManager().delete("test_vm"));
+    }
+
+    @Test
     @CddTest(requirements = {"9.17/C-1-1"})
     public void connectVsock() throws Exception {
         assumeSupportedKernel();
@@ -265,8 +314,9 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
     @Test
     @CddTest(requirements = {"9.17/C-1-1"})
     public void vmConfigUnitTests() {
-        VirtualMachineConfig minimal =
-                newVmConfigBuilder().setPayloadBinaryPath("binary/path").build();
+
+        VirtualMachineConfig.Builder minimalBuilder = newVmConfigBuilder();
+        VirtualMachineConfig minimal = minimalBuilder.setPayloadBinaryPath("binary/path").build();
 
         assertThat(minimal.getApkPath()).isEqualTo(getContext().getPackageCodePath());
         assertThat(minimal.getDebugLevel()).isEqualTo(DEBUG_LEVEL_NONE);
@@ -275,6 +325,8 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
         assertThat(minimal.getPayloadBinaryPath()).isEqualTo("binary/path");
         assertThat(minimal.getPayloadConfigPath()).isNull();
         assertThat(minimal.isProtectedVm()).isEqualTo(isProtectedVm());
+        assertThat(minimal.isEncryptedStorageEnabled()).isFalse();
+        assertThat(minimal.getEncryptedStorageKib()).isEqualTo(0);
 
         int maxCpus = Runtime.getRuntime().availableProcessors();
         VirtualMachineConfig.Builder maximalBuilder =
@@ -283,7 +335,8 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
                         .setApkPath("/apk/path")
                         .setNumCpus(maxCpus)
                         .setDebugLevel(DEBUG_LEVEL_FULL)
-                        .setMemoryMib(42);
+                        .setMemoryMib(42)
+                        .setEncryptedStorageKib(1024);
         VirtualMachineConfig maximal = maximalBuilder.build();
 
         assertThat(maximal.getApkPath()).isEqualTo("/apk/path");
@@ -293,6 +346,8 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
         assertThat(maximal.getPayloadBinaryPath()).isNull();
         assertThat(maximal.getPayloadConfigPath()).isEqualTo("config/path");
         assertThat(maximal.isProtectedVm()).isEqualTo(isProtectedVm());
+        assertThat(maximal.isEncryptedStorageEnabled()).isTrue();
+        assertThat(maximal.getEncryptedStorageKib()).isEqualTo(1024);
 
         assertThat(minimal.isCompatibleWith(maximal)).isFalse();
         assertThat(minimal.isCompatibleWith(minimal)).isTrue();
@@ -300,6 +355,41 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
 
         VirtualMachineConfig compatible = maximalBuilder.setNumCpus(1).setMemoryMib(99).build();
         assertThat(compatible.isCompatibleWith(maximal)).isTrue();
+
+        // Assert that different encrypted storage size would imply the configs are incompatible
+        VirtualMachineConfig incompatible = minimalBuilder.setEncryptedStorageKib(1048).build();
+        assertThat(incompatible.isCompatibleWith(minimal)).isFalse();
+    }
+
+    @Test
+    @CddTest(requirements = {"9.17/C-1-1"})
+    public void vmConfigBuilderUnitTests() {
+        VirtualMachineConfig.Builder builder = newVmConfigBuilder();
+
+        // All your null are belong to me.
+        assertThrows(NullPointerException.class, () -> new VirtualMachineConfig.Builder(null));
+        assertThrows(NullPointerException.class, () -> builder.setApkPath(null));
+        assertThrows(NullPointerException.class, () -> builder.setPayloadConfigPath(null));
+        assertThrows(NullPointerException.class, () -> builder.setPayloadBinaryPath(null));
+        assertThrows(NullPointerException.class, () -> builder.setPayloadConfigPath(null));
+
+        // Individual property checks.
+        assertThrows(
+                IllegalArgumentException.class, () -> builder.setApkPath("relative/path/to.apk"));
+        assertThrows(IllegalArgumentException.class, () -> builder.setDebugLevel(-1));
+        assertThrows(IllegalArgumentException.class, () -> builder.setMemoryMib(0));
+        assertThrows(IllegalArgumentException.class, () -> builder.setNumCpus(0));
+        assertThrows(IllegalArgumentException.class, () -> builder.setEncryptedStorageKib(0));
+
+        // Consistency checks enforced at build time.
+        Exception e;
+        e = assertThrows(IllegalStateException.class, () -> builder.build());
+        assertThat(e).hasMessageThat().contains("setPayloadBinaryPath must be called");
+
+        VirtualMachineConfig.Builder protectedNotSet =
+                new VirtualMachineConfig.Builder(getContext()).setPayloadBinaryPath("binary/path");
+        e = assertThrows(IllegalStateException.class, () -> protectedNotSet.build());
+        assertThat(e).hasMessageThat().contains("setProtectedVm must be called");
     }
 
     @Test
@@ -322,6 +412,48 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
         assertThat(vm.getConfig().getMemoryMib()).isEqualTo(42);
 
         assertThat(getVirtualMachineManager().get("vm_name")).isSameInstanceAs(vm);
+    }
+
+    @Test
+    @CddTest(requirements = {"9.17/C-1-1"})
+    public void vmmGetAndCreate() throws Exception {
+        assumeSupportedKernel();
+
+        VirtualMachineConfig config =
+                newVmConfigBuilder()
+                        .setPayloadBinaryPath("MicrodroidTestNativeLib.so")
+                        .setMemoryMib(minMemoryRequired())
+                        .setDebugLevel(DEBUG_LEVEL_FULL)
+                        .build();
+
+        VirtualMachineManager vmm = getVirtualMachineManager();
+        String vmName = "vmName";
+
+        // VM does not yet exist
+        assertThat(vmm.get(vmName)).isNull();
+
+        VirtualMachine vm1 = vmm.create(vmName, config);
+
+        // Now it does, and we should get the same instance back
+        assertThat(vmm.get(vmName)).isSameInstanceAs(vm1);
+        assertThat(vmm.getOrCreate(vmName, config)).isSameInstanceAs(vm1);
+
+        // Can't recreate it though
+        assertThrowsVmException(() -> vmm.create(vmName, config));
+
+        vmm.delete(vmName);
+        assertThat(vmm.get(vmName)).isNull();
+
+        // Now that we deleted the old one, this should create rather than get, and it should be a
+        // new instance.
+        VirtualMachine vm2 = vmm.getOrCreate(vmName, config);
+        assertThat(vm2).isNotSameInstanceAs(vm1);
+
+        // Subsequent gets should return this new one.
+        assertThat(vmm.get(vmName)).isSameInstanceAs(vm2);
+        assertThat(vmm.getOrCreate(vmName, config)).isSameInstanceAs(vm2);
+
+        vmm.delete(vmName);
     }
 
     @Test
@@ -414,10 +546,10 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
         assertThat(vmm.get("test_vm_delete")).isNull();
 
         // Can't start the VM even with an existing reference
-        assertThrows(VirtualMachineException.class, vm::run);
+        assertThrowsVmException(vm::run);
 
         // Can't delete the VM since it no longer exists
-        assertThrows(VirtualMachineException.class, () -> vmm.delete("test_vm_delete"));
+        assertThrowsVmException(() -> vmm.delete("test_vm_delete"));
     }
 
     @Test
@@ -439,20 +571,6 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
 
         TestResults testResults = runVmTestService(vm);
         assertThat(testResults.mException).isNull();
-    }
-
-    @Test
-    @CddTest(requirements = {
-            "9.17/C-1-1",
-    })
-    public void invalidApkPathIsRejected() {
-        VirtualMachineConfig.Builder builder =
-                newVmConfigBuilder()
-                        .setPayloadBinaryPath("MicrodroidTestNativeLib.so")
-                        .setApkPath("relative/path/to.apk")
-                        .setDebugLevel(DEBUG_LEVEL_FULL)
-                        .setMemoryMib(minMemoryRequired());
-        assertThrows(IllegalArgumentException.class, () -> builder.build());
     }
 
     @Test
@@ -520,15 +638,12 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
     @CddTest(requirements = {"9.17/C-1-1", "9.17/C-2-7"})
     public void changingNonDebuggableVmDebuggableInvalidatesVmIdentity() throws Exception {
         changeDebugLevel(DEBUG_LEVEL_NONE, DEBUG_LEVEL_FULL);
-        changeDebugLevel(DEBUG_LEVEL_NONE, DEBUG_LEVEL_APP_ONLY);
     }
 
     @Test
     @CddTest(requirements = {"9.17/C-1-1", "9.17/C-2-7"})
-    @Ignore("b/260067026")
-    public void changingAppDebuggableVmFullyDebuggableInvalidatesVmIdentity() throws Exception {
-        assume().withMessage("Skip for non-protected VM. b/239158757").that(mProtectedVm).isTrue();
-        changeDebugLevel(DEBUG_LEVEL_APP_ONLY, DEBUG_LEVEL_FULL);
+    public void changingDebuggableVmNonDebuggableInvalidatesVmIdentity() throws Exception {
+        changeDebugLevel(DEBUG_LEVEL_FULL, DEBUG_LEVEL_NONE);
     }
 
     private void changeDebugLevel(int fromLevel, int toLevel) throws Exception {
@@ -838,6 +953,50 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
                 VirtualMachineCallback.STOP_REASON_MICRODROID_UNKNOWN_RUNTIME_ERROR);
     }
 
+    // Checks whether microdroid_launcher started but payload failed. reason must be recorded in the
+    // console output.
+    private void assertThatPayloadFailsDueTo(VirtualMachine vm, String reason) throws Exception {
+        final CompletableFuture<Boolean> payloadStarted = new CompletableFuture<>();
+        final CompletableFuture<Integer> exitCodeFuture = new CompletableFuture<>();
+        VmEventListener listener =
+                new VmEventListener() {
+                    @Override
+                    public void onPayloadStarted(VirtualMachine vm) {
+                        payloadStarted.complete(true);
+                    }
+
+                    @Override
+                    public void onPayloadFinished(VirtualMachine vm, int exitCode) {
+                        exitCodeFuture.complete(exitCode);
+                    }
+                };
+        listener.runToFinish(TAG, vm);
+
+        assertThat(payloadStarted.getNow(false)).isTrue();
+        assertThat(exitCodeFuture.getNow(0)).isNotEqualTo(0);
+        assertThat(listener.getConsoleOutput()).contains(reason);
+    }
+
+    @Test
+    public void bootFailsWhenBinaryIsMissingEntryFunction() throws Exception {
+        VirtualMachineConfig.Builder builder =
+                newVmConfigBuilder().setPayloadBinaryPath("MicrodroidEmptyNativeLib.so");
+        VirtualMachineConfig normalConfig = builder.setDebugLevel(DEBUG_LEVEL_FULL).build();
+        VirtualMachine vm = forceCreateNewVirtualMachine("test_vm_missing_entry", normalConfig);
+
+        assertThatPayloadFailsDueTo(vm, "Failed to find entrypoint");
+    }
+
+    @Test
+    public void bootFailsWhenBinaryTriesToLinkAgainstPrivateLibs() throws Exception {
+        VirtualMachineConfig.Builder builder =
+                newVmConfigBuilder().setPayloadBinaryPath("MicrodroidPrivateLinkingNativeLib.so");
+        VirtualMachineConfig normalConfig = builder.setDebugLevel(DEBUG_LEVEL_FULL).build();
+        VirtualMachine vm = forceCreateNewVirtualMachine("test_vm_private_linking", normalConfig);
+
+        assertThatPayloadFailsDueTo(vm, "Failed to dlopen");
+    }
+
     @Test
     public void sameInstancesShareTheSameVmObject() throws Exception {
         VirtualMachineConfig config =
@@ -887,13 +1046,28 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
     }
 
     @Test
-    public void importedVmIsEqualToTheOriginalVm() throws Exception {
+    @CddTest(requirements = {"9.17/C-1-1", "9.17/C-2-1"})
+    public void importedVmIsEqualToTheOriginalVm_WithoutStorage() throws Exception {
+        TestResults testResults = importedVmIsEqualToTheOriginalVm(false);
+        assertThat(testResults.mEncryptedStoragePath).isEqualTo("");
+    }
+
+    @Test
+    @CddTest(requirements = {"9.17/C-1-1", "9.17/C-2-1"})
+    public void importedVmIsEqualToTheOriginalVm_WithStorage() throws Exception {
+        TestResults testResults = importedVmIsEqualToTheOriginalVm(true);
+        assertThat(testResults.mEncryptedStoragePath).isEqualTo("/mnt/encryptedstore");
+    }
+
+    private TestResults importedVmIsEqualToTheOriginalVm(boolean encryptedStoreEnabled)
+            throws Exception {
         // Arrange
-        VirtualMachineConfig config =
+        VirtualMachineConfig.Builder builder =
                 newVmConfigBuilder()
                         .setPayloadBinaryPath("MicrodroidTestNativeLib.so")
-                        .setDebugLevel(DEBUG_LEVEL_FULL)
-                        .build();
+                        .setDebugLevel(DEBUG_LEVEL_FULL);
+        if (encryptedStoreEnabled) builder = builder.setEncryptedStorageKib(4096);
+        VirtualMachineConfig config = builder.build();
         String vmNameOrig = "test_vm_orig";
         String vmNameImport = "test_vm_import";
         VirtualMachine vmOrig = forceCreateNewVirtualMachine(vmNameOrig, config);
@@ -913,12 +1087,34 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
         // Asserts
         assertFileContentsAreEqualInTwoVms("config.xml", vmNameOrig, vmNameImport);
         assertFileContentsAreEqualInTwoVms("instance.img", vmNameOrig, vmNameImport);
+        if (encryptedStoreEnabled) {
+            assertFileContentsAreEqualInTwoVms("storage.img", vmNameOrig, vmNameImport);
+        }
         assertThat(vmImport).isNotEqualTo(vmOrig);
         vmm.delete(vmNameOrig);
         assertThat(vmImport).isEqualTo(vmm.get(vmNameImport));
         TestResults testResults = runVmTestService(vmImport);
         assertThat(testResults.mException).isNull();
         assertThat(testResults.mAddInteger).isEqualTo(123 + 456);
+        return testResults;
+    }
+
+    @Test
+    @CddTest(requirements = {"9.17/C-1-1", "9.17/C-2-1"})
+    public void encryptedStorageAvailable() throws Exception {
+        assumeSupportedKernel();
+
+        VirtualMachineConfig config =
+                newVmConfigBuilder()
+                        .setPayloadBinaryPath("MicrodroidTestNativeLib.so")
+                        .setMemoryMib(minMemoryRequired())
+                        .setEncryptedStorageKib(4096)
+                        .setDebugLevel(DEBUG_LEVEL_FULL)
+                        .build();
+        VirtualMachine vm = forceCreateNewVirtualMachine("test_vm", config);
+
+        TestResults testResults = runVmTestService(vm);
+        assertThat(testResults.mEncryptedStoragePath).isEqualTo("/mnt/encryptedstore");
     }
 
     private void assertFileContentsAreEqualInTwoVms(String fileName, String vmName1, String vmName2)
@@ -935,6 +1131,16 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
         Context context = ApplicationProvider.getApplicationContext();
         Path filePath = Paths.get(context.getDataDir().getPath(), "vm", vmName, fileName);
         return filePath.toFile();
+    }
+
+    private void assertThrowsVmException(ThrowingRunnable runnable) {
+        assertThrows(VirtualMachineException.class, runnable);
+    }
+
+    private void assertThrowsVmExceptionContaining(
+            ThrowingRunnable runnable, String expectedContents) {
+        Exception e = assertThrows(VirtualMachineException.class, runnable);
+        assertThat(e).hasMessageThat().contains(expectedContents);
     }
 
     private int minMemoryRequired() {

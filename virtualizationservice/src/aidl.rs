@@ -14,15 +14,19 @@
 
 //! Implementation of the AIDL interface of the VirtualizationService.
 
-use crate::atom::{write_vm_booted_stats, write_vm_creation_stats};
+use crate::atom::{
+    forward_vm_booted_atom, forward_vm_creation_atom, forward_vm_exited_atom,
+    write_vm_booted_stats, write_vm_creation_stats};
 use crate::composite::make_composite_image;
 use crate::crosvm::{CrosvmConfig, DiskFile, PayloadState, VmContext, VmInstance, VmState};
 use crate::payload::{add_microdroid_payload_images, add_microdroid_system_images};
 use crate::selinux::{getfilecon, SeContext};
 use android_os_permissions_aidl::aidl::android::os::IPermissionController;
-use android_system_virtualizationcommon::aidl::android::system::virtualizationcommon::ErrorCode::ErrorCode;
-use android_system_virtualizationservice::aidl::android::system::virtualizationservice::{
+use android_system_virtualizationcommon::aidl::android::system::virtualizationcommon::{
     DeathReason::DeathReason,
+    ErrorCode::ErrorCode,
+};
+use android_system_virtualizationservice::aidl::android::system::virtualizationservice::{
     DiskImage::DiskImage,
     IVirtualMachine::{BnVirtualMachine, IVirtualMachine},
     IVirtualMachineCallback::IVirtualMachineCallback,
@@ -38,6 +42,9 @@ use android_system_virtualizationservice::aidl::android::system::virtualizations
     VirtualMachineState::VirtualMachineState,
 };
 use android_system_virtualizationservice_internal::aidl::android::system::virtualizationservice_internal::{
+    AtomVmBooted::AtomVmBooted,
+    AtomVmCreationRequested::AtomVmCreationRequested,
+    AtomVmExited::AtomVmExited,
     IGlobalVmContext::{BnGlobalVmContext, IGlobalVmContext},
     IVirtualizationServiceInternal::{BnVirtualizationServiceInternal, IVirtualizationServiceInternal},
 };
@@ -51,6 +58,7 @@ use binder::{
     Status, StatusCode, Strong, ThreadState,
 };
 use disk::QcowFile;
+use lazy_static::lazy_static;
 use libc::VMADDR_CID_HOST;
 use log::{debug, error, info, warn};
 use microdroid_payload_config::{OsConfig, Task, TaskType, VmPayloadConfig};
@@ -102,6 +110,13 @@ const MICRODROID_OS_NAME: &str = "microdroid";
 
 const UNFORMATTED_STORAGE_MAGIC: &str = "UNFORMATTED-STORAGE";
 
+lazy_static! {
+    pub static ref GLOBAL_SERVICE: Strong<dyn IVirtualizationServiceInternal> = {
+        let service = VirtualizationServiceInternal::init();
+        BnVirtualizationServiceInternal::new_binder(service, BinderFeatures::default())
+    };
+}
+
 fn is_valid_guest_cid(cid: Cid) -> bool {
     (GUEST_CID_MIN..=GUEST_CID_MAX).contains(&cid)
 }
@@ -113,6 +128,24 @@ fn next_guest_cid(cid: Cid) -> Cid {
     } else {
         cid + 1
     }
+}
+
+fn create_or_update_idsig_file(
+    input_fd: &ParcelFileDescriptor,
+    idsig_fd: &ParcelFileDescriptor,
+) -> Result<()> {
+    let mut input = clone_file(input_fd)?;
+    let metadata = input.metadata().context("failed to get input metadata")?;
+    if !metadata.is_file() {
+        bail!("input is not a regular file");
+    }
+    let mut sig = V4Signature::create(&mut input, 4096, &[], HashAlgorithm::SHA256)
+        .context("failed to create idsig")?;
+
+    let mut output = clone_file(idsig_fd)?;
+    output.set_len(0).context("failed to set_len on the idsig output")?;
+    sig.write_into(&mut output).context("failed to write idsig")?;
+    Ok(())
 }
 
 /// Singleton service for allocating globally-unique VM resources, such as the CID, and running
@@ -145,6 +178,21 @@ impl IVirtualizationServiceInternal for VirtualizationServiceInternal {
             Status::new_exception_str(ExceptionCode::ILLEGAL_STATE, Some(e.to_string()))
         })?;
         Ok(GlobalVmContext::create(cid))
+    }
+
+    fn atomVmBooted(&self, atom: &AtomVmBooted) -> Result<(), Status> {
+        forward_vm_booted_atom(atom);
+        Ok(())
+    }
+
+    fn atomVmCreationRequested(&self, atom: &AtomVmCreationRequested) -> Result<(), Status> {
+        forward_vm_creation_atom(atom);
+        Ok(())
+    }
+
+    fn atomVmExited(&self, atom: &AtomVmExited) -> Result<(), Status> {
+        forward_vm_exited_atom(atom);
+        Ok(())
     }
 }
 
@@ -239,10 +287,9 @@ impl IGlobalVmContext for GlobalVmContext {
 }
 
 /// Implementation of `IVirtualizationService`, the entry point of the AIDL service.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct VirtualizationService {
     state: Arc<Mutex<State>>,
-    global_service: Strong<dyn IVirtualizationServiceInternal>,
 }
 
 impl Interface for VirtualizationService {
@@ -345,12 +392,8 @@ impl IVirtualizationService for VirtualizationService {
 
         check_manage_access()?;
 
-        let mut input = clone_file(input_fd)?;
-        let mut sig = V4Signature::create(&mut input, 4096, &[], HashAlgorithm::SHA256).unwrap();
-
-        let mut output = clone_file(idsig_fd)?;
-        output.set_len(0).unwrap();
-        sig.write_into(&mut output).unwrap();
+        create_or_update_idsig_file(input_fd, idsig_fd)
+            .map_err(|e| Status::new_service_specific_error_str(-1, Some(format!("{:?}", e))))?;
         Ok(())
     }
 
@@ -447,25 +490,20 @@ fn handle_tombstone(stream: &mut VsockStream) -> Result<()> {
 
 impl VirtualizationService {
     pub fn init() -> VirtualizationService {
-        let global_service = VirtualizationServiceInternal::init();
-        let global_service =
-            BnVirtualizationServiceInternal::new_binder(global_service, BinderFeatures::default());
-
-        VirtualizationService { global_service, state: Default::default() }
+        VirtualizationService::default()
     }
 
     fn create_vm_context(&self) -> Result<(VmContext, Cid)> {
         const NUM_ATTEMPTS: usize = 5;
 
         for _ in 0..NUM_ATTEMPTS {
-            let global_context = self.global_service.allocateGlobalVmContext()?;
+            let global_context = GLOBAL_SERVICE.allocateGlobalVmContext()?;
             let cid = global_context.getCid()? as Cid;
             let service = VirtualMachineService::new_binder(self.state.clone(), cid).as_binder();
 
             // Start VM service listening for connections from the new CID on port=CID.
-            // TODO(b/245727626): Only accept connections from the new VM.
             let port = cid;
-            match RpcServer::new_vsock(service, port) {
+            match RpcServer::new_vsock(service, cid, port) {
                 Ok(vm_server) => {
                     vm_server.start();
                     return Ok((VmContext::new(global_context, vm_server), cid));
@@ -881,8 +919,9 @@ fn check_label_for_partition(partition: &Partition) -> Result<()> {
 // Return whether a partition is exempt from selinux label checks, because we know that it does
 // not contain code and is likely to be generated in an app-writable directory.
 fn is_safe_app_partition(label: &str) -> bool {
-    // See make_payload_disk in payload.rs.
+    // See add_microdroid_system_images & add_microdroid_payload_images in payload.rs.
     label == "vm-instance"
+        || label == "encryptedstore"
         || label == "microdroid-apk-idsig"
         || label == "payload-metadata"
         || label.starts_with("extra-idsig-")
@@ -898,7 +937,7 @@ fn check_label_is_allowed(ctx: &SeContext) -> Result<()> {
     match ctx.selinux_type()? {
         | "system_file" // immutable dm-verity protected partition
         | "apk_data_file" // APKs of an installed app
-        | "staging_data_file" // updated/staged APEX imagess
+        | "staging_data_file" // updated/staged APEX images
         | "shell_data_file" // test files created via adb shell
          => Ok(()),
         _ => bail!("Label {} is not allowed", ctx),
@@ -973,13 +1012,16 @@ impl IVirtualMachine for VirtualMachine {
         if !matches!(&*self.instance.vm_state.lock().unwrap(), VmState::Running { .. }) {
             return Err(Status::new_service_specific_error_str(-1, Some("VM is not running")));
         }
-        let stream =
-            VsockStream::connect_with_cid_port(self.instance.cid, port as u32).map_err(|e| {
-                Status::new_service_specific_error_str(
-                    -1,
-                    Some(format!("Failed to connect: {:?}", e)),
-                )
-            })?;
+        let port = port as u32;
+        if port < 1024 {
+            return Err(Status::new_service_specific_error_str(
+                -1,
+                Some(format!("Can't connect to privileged port {port}")),
+            ));
+        }
+        let stream = VsockStream::connect_with_cid_port(self.instance.cid, port).map_err(|e| {
+            Status::new_service_specific_error_str(-1, Some(format!("Failed to connect: {:?}", e)))
+        })?;
         Ok(vsock_stream_to_pfd(stream))
     }
 }
@@ -1045,17 +1087,6 @@ impl VirtualMachineCallbacks {
         for callback in callbacks {
             if let Err(e) = callback.onDied(cid as i32, reason) {
                 error!("Error notifying exit of VM CID {}: {:?}", cid, e);
-            }
-        }
-    }
-
-    /// Call all registered callbacks to say that there was a ramdump to download.
-    pub fn callback_on_ramdump(&self, cid: Cid, ramdump: File) {
-        let callbacks = &*self.0.lock().unwrap();
-        let pfd = ParcelFileDescriptor::new(ramdump);
-        for callback in callbacks {
-            if let Err(e) = callback.onRamdump(cid as i32, &pfd) {
-                error!("Error notifying ramdump of VM CID {}: {:?}", cid, e);
             }
         }
     }
@@ -1300,6 +1331,52 @@ mod tests {
                 bail!("Expected label {} to be disallowed", label);
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_or_update_idsig_file_empty_apk() -> Result<()> {
+        let apk = tempfile::tempfile().unwrap();
+        let idsig = tempfile::tempfile().unwrap();
+
+        let ret = create_or_update_idsig_file(
+            &ParcelFileDescriptor::new(apk),
+            &ParcelFileDescriptor::new(idsig),
+        );
+        assert!(ret.is_err(), "should fail");
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_or_update_idsig_dir_instead_of_file_for_apk() -> Result<()> {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let apk = File::open(tmp_dir.path()).unwrap();
+        let idsig = tempfile::tempfile().unwrap();
+
+        let ret = create_or_update_idsig_file(
+            &ParcelFileDescriptor::new(apk),
+            &ParcelFileDescriptor::new(idsig),
+        );
+        assert!(ret.is_err(), "should fail");
+        Ok(())
+    }
+
+    /// Verifies that create_or_update_idsig_file won't oom if a fd that corresponds to a directory
+    /// on ext4 filesystem is passed.
+    /// On ext4 lseek on a directory fd will return (off_t)-1 (see:
+    /// https://bugzilla.kernel.org/show_bug.cgi?id=200043), which will result in
+    /// create_or_update_idsig_file ooming while attempting to allocate petabytes of memory.
+    #[test]
+    fn test_create_or_update_idsig_does_not_crash_dir_on_ext4() -> Result<()> {
+        // APEXes are backed by the ext4.
+        let apk = File::open("/apex/com.android.virt/").unwrap();
+        let idsig = tempfile::tempfile().unwrap();
+
+        let ret = create_or_update_idsig_file(
+            &ParcelFileDescriptor::new(apk),
+            &ParcelFileDescriptor::new(idsig),
+        );
+        assert!(ret.is_err(), "should fail");
         Ok(())
     }
 }

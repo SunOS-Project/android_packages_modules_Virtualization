@@ -76,8 +76,7 @@ const DEBUG_MICRODROID_NO_VERIFIED_BOOT: &str =
     "/sys/firmware/devicetree/base/virtualization/guest/debug-microdroid,no-verified-boot";
 
 const APEX_CONFIG_DONE_PROP: &str = "apex_config.done";
-const APP_DEBUGGABLE_PROP: &str = "ro.boot.microdroid.app_debuggable";
-const APK_MOUNT_DONE_PROP: &str = "microdroid_manager.apk.mounted";
+const DEBUGGABLE_PROP: &str = "ro.boot.microdroid.debuggable";
 
 // SYNC WITH virtualizationservice/src/crosvm.rs
 const FAILURE_SERIAL_DEVICE: &str = "/dev/ttyS1";
@@ -167,7 +166,7 @@ fn get_vms_rpc_binder() -> Result<Strong<dyn IVirtualMachineService>> {
 
 fn main() -> Result<()> {
     // If debuggable, print full backtrace to console log with stdio_to_kmsg
-    if system_properties::read_bool(APP_DEBUGGABLE_PROP, true)? {
+    if system_properties::read_bool(DEBUGGABLE_PROP, true)? {
         env::set_var("RUST_BACKTRACE", "full");
     }
 
@@ -281,12 +280,12 @@ fn dice_derivation(
         }
     }
 
-    // Check app debuggability, conervatively assuming it is debuggable
-    let app_debuggable = system_properties::read_bool(APP_DEBUGGABLE_PROP, true)?;
+    // Check debuggability, conservatively assuming it is debuggable
+    let debuggable = system_properties::read_bool(DEBUGGABLE_PROP, true)?;
 
     // Send the details to diced
     let hidden = verified_data.salt.clone().try_into().unwrap();
-    dice.derive(code_hash, &config_desc, authority_hash, app_debuggable, hidden)
+    dice.derive(code_hash, &config_desc, authority_hash, debuggable, hidden)
 }
 
 fn encode_tstr(tstr: &str, buffer: &mut Vec<u8>) -> Result<()> {
@@ -383,15 +382,16 @@ fn try_run_payload(service: &Strong<dyn IVirtualMachineService>) -> Result<i32> 
         None
     };
 
+    let mut zipfuse = Zipfuse::default();
+
     // Before reading a file from the APK, start zipfuse
-    run_zipfuse(
+    zipfuse.mount(
         MountForExec::Allowed,
         "fscontext=u:object_r:zipfusefs:s0,context=u:object_r:system_file:s0",
         Path::new("/dev/block/mapper/microdroid-apk"),
         Path::new(VM_APK_CONTENTS_PATH),
-        Some(APK_MOUNT_DONE_PROP),
-    )
-    .context("Failed to run zipfuse")?;
+        "microdroid_manager.apk.mounted".to_owned(),
+    )?;
 
     // Restricted APIs are only allowed to be used by platform or test components. Infer this from
     // the use of a VM config file since those can only be used by platform and test components.
@@ -414,7 +414,7 @@ fn try_run_payload(service: &Strong<dyn IVirtualMachineService>) -> Result<i32> 
             verified_data.extra_apks_data.len()
         ));
     }
-    mount_extra_apks(&config)?;
+    mount_extra_apks(&config, &mut zipfuse)?;
 
     // Wait until apex config is done. (e.g. linker configuration for apexes)
     wait_for_apex_config_done()?;
@@ -428,8 +428,8 @@ fn try_run_payload(service: &Strong<dyn IVirtualMachineService>) -> Result<i32> 
         control_service("stop", "tombstoned")?;
     }
 
-    // Wait until zipfuse has mounted the APK so we can access the payload
-    wait_for_property_true(APK_MOUNT_DONE_PROP).context("Failed waiting for APK mount done")?;
+    // Wait until zipfuse has mounted the APKs so we can access the payload
+    zipfuse.wait_until_done()?;
 
     register_vm_payload_service(allow_restricted_apis, service.clone(), dice_context)?;
 
@@ -480,21 +480,40 @@ enum MountForExec {
     Disallowed,
 }
 
-fn run_zipfuse(
-    noexec: MountForExec,
-    option: &str,
-    zip_path: &Path,
-    mount_dir: &Path,
-    ready_prop: Option<&str>,
-) -> Result<Child> {
-    let mut cmd = Command::new(ZIPFUSE_BIN);
-    if let MountForExec::Disallowed = noexec {
-        cmd.arg("--noexec");
+#[derive(Default)]
+struct Zipfuse {
+    ready_properties: Vec<String>,
+}
+
+impl Zipfuse {
+    fn mount(
+        &mut self,
+        noexec: MountForExec,
+        option: &str,
+        zip_path: &Path,
+        mount_dir: &Path,
+        ready_prop: String,
+    ) -> Result<Child> {
+        let mut cmd = Command::new(ZIPFUSE_BIN);
+        if let MountForExec::Disallowed = noexec {
+            cmd.arg("--noexec");
+        }
+        cmd.args(["-p", &ready_prop, "-o", option]);
+        cmd.arg(zip_path).arg(mount_dir);
+        self.ready_properties.push(ready_prop);
+        cmd.spawn().with_context(|| format!("Failed to run zipfuse for {mount_dir:?}"))
     }
-    if let Some(property_name) = ready_prop {
-        cmd.args(["-p", property_name]);
+
+    fn wait_until_done(self) -> Result<()> {
+        // We check the last-started check first in the hope that by the time it is done
+        // all or most of the others will also be done, minimising the number of times we
+        // block on a property.
+        for property in self.ready_properties.into_iter().rev() {
+            wait_for_property_true(&property)
+                .with_context(|| format!("Failed waiting for {property}"))?;
+        }
+        Ok(())
     }
-    cmd.arg("-o").arg(option).arg(zip_path).arg(mount_dir).spawn().context("Spawn zipfuse")
 }
 
 fn write_apex_payload_data(
@@ -664,21 +683,20 @@ fn verify_payload(
     })
 }
 
-fn mount_extra_apks(config: &VmPayloadConfig) -> Result<()> {
+fn mount_extra_apks(config: &VmPayloadConfig, zipfuse: &mut Zipfuse) -> Result<()> {
     // For now, only the number of apks is important, as the mount point and dm-verity name is fixed
     for i in 0..config.extra_apks.len() {
-        let mount_dir = format!("/mnt/extra-apk/{}", i);
+        let mount_dir = format!("/mnt/extra-apk/{i}");
         create_dir(Path::new(&mount_dir)).context("Failed to create mount dir for extra apks")?;
 
         // don't wait, just detach
-        run_zipfuse(
+        zipfuse.mount(
             MountForExec::Disallowed,
             "fscontext=u:object_r:zipfusefs:s0,context=u:object_r:extra_apk_file:s0",
-            Path::new(&format!("/dev/block/mapper/extra-apk-{}", i)),
+            Path::new(&format!("/dev/block/mapper/extra-apk-{i}")),
             Path::new(&mount_dir),
-            None,
-        )
-        .context("Failed to zipfuse extra apks")?;
+            format!("microdroid_manager.extra_apk.mounted.{i}"),
+        )?;
     }
 
     Ok(())

@@ -24,6 +24,7 @@ use crate::mmu;
 use core::arch::asm;
 use core::num::NonZeroUsize;
 use core::slice;
+use dice::bcc::Handover;
 use log::debug;
 use log::error;
 use log::info;
@@ -47,6 +48,8 @@ pub enum RebootReason {
     InvalidRamdisk,
     /// Failed to verify the payload.
     PayloadVerificationError,
+    /// Error interacting with a VirtIO PCI device.
+    PciError,
 }
 
 main!(start);
@@ -228,8 +231,9 @@ fn main_wrapper(fdt: usize, payload: usize, payload_size: usize) -> Result<(), R
         RebootReason::InvalidConfig
     })?;
 
-    let bcc = appended.get_bcc_mut().ok_or_else(|| {
-        error!("Invalid BCC");
+    let bcc_slice = appended.get_bcc_mut();
+    let bcc = Handover::new(bcc_slice).map_err(|e| {
+        error!("Invalid BCC Handover: {e:?}");
         RebootReason::InvalidBcc
     })?;
 
@@ -243,9 +247,9 @@ fn main_wrapper(fdt: usize, payload: usize, payload_size: usize) -> Result<(), R
     let slices = MemorySlices::new(fdt, payload, payload_size, &mut memory)?;
 
     // This wrapper allows main() to be blissfully ignorant of platform details.
-    crate::main(slices.fdt, slices.kernel, slices.ramdisk, bcc, &mut memory)?;
+    crate::main(slices.fdt, slices.kernel, slices.ramdisk, &bcc, &mut memory)?;
 
-    // TODO: Overwrite BCC before jumping to payload to avoid leaking our sealing key.
+    helpers::flushed_zeroize(bcc_slice);
 
     info!("Expecting a bug making MMIO_GUARD_UNMAP return NOT_SUPPORTED on success");
     memory.mmio_unmap_all().map_err(|e| {
@@ -328,6 +332,12 @@ unsafe fn get_appended_data_slice() -> &'static mut [u8] {
     slice::from_raw_parts_mut(base as *mut u8, size)
 }
 
+enum AppendedConfigType {
+    Valid,
+    Invalid,
+    NotFound,
+}
+
 enum AppendedPayload<'a> {
     /// Configuration data.
     Config(config::Config<'a>),
@@ -338,24 +348,32 @@ enum AppendedPayload<'a> {
 impl<'a> AppendedPayload<'a> {
     /// SAFETY - 'data' should respect the alignment of config::Header.
     unsafe fn new(data: &'a mut [u8]) -> Option<Self> {
-        if Self::is_valid_config(data) {
-            Some(Self::Config(config::Config::new(data).unwrap()))
-        } else if cfg!(feature = "legacy") {
-            const BCC_SIZE: usize = helpers::SIZE_4KB;
-            warn!("Assuming the appended data at {:?} to be a raw BCC", data.as_ptr());
-            Some(Self::LegacyBcc(&mut data[..BCC_SIZE]))
-        } else {
-            None
+        match Self::guess_config_type(data) {
+            AppendedConfigType::Valid => Some(Self::Config(config::Config::new(data).unwrap())),
+            AppendedConfigType::NotFound if cfg!(feature = "legacy") => {
+                const BCC_SIZE: usize = helpers::SIZE_4KB;
+                warn!("Assuming the appended data at {:?} to be a raw BCC", data.as_ptr());
+                Some(Self::LegacyBcc(&mut data[..BCC_SIZE]))
+            }
+            _ => None,
         }
     }
 
-    unsafe fn is_valid_config(data: &mut [u8]) -> bool {
+    unsafe fn guess_config_type(data: &mut [u8]) -> AppendedConfigType {
         // This function is necessary to prevent the borrow checker from getting confused
         // about the ownership of data in new(); see https://users.rust-lang.org/t/78467.
         let addr = data.as_ptr();
-        config::Config::new(data)
-            .map_err(|e| warn!("Invalid configuration data at {addr:?}: {e}"))
-            .is_ok()
+        match config::Config::new(data) {
+            Err(config::Error::InvalidMagic) => {
+                warn!("No configuration data found at {addr:?}");
+                AppendedConfigType::NotFound
+            }
+            Err(e) => {
+                error!("Invalid configuration data at {addr:?}: {e}");
+                AppendedConfigType::Invalid
+            }
+            Ok(_) => AppendedConfigType::Valid,
+        }
     }
 
     #[allow(dead_code)] // TODO(b/232900974)
@@ -366,12 +384,10 @@ impl<'a> AppendedPayload<'a> {
         }
     }
 
-    fn get_bcc_mut(&mut self) -> Option<&mut [u8]> {
-        let bcc = match self {
+    fn get_bcc_mut(&mut self) -> &mut [u8] {
+        match self {
             Self::LegacyBcc(ref mut bcc) => bcc,
             Self::Config(ref mut cfg) => cfg.get_bcc_mut(),
-        };
-        // TODO(b/256148034): return None if BccHandoverParse(bcc) != kDiceResultOk.
-        Some(bcc)
+        }
     }
 }
