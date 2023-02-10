@@ -48,8 +48,7 @@ pub fn command_run_app(
     storage: Option<&Path>,
     storage_size: Option<u64>,
     config_path: Option<String>,
-    payload_path: Option<String>,
-    daemonize: bool,
+    payload_binary_name: Option<String>,
     console_path: Option<&Path>,
     log_path: Option<&Path>,
     debug_level: DebugLevel,
@@ -117,14 +116,16 @@ pub fn command_run_app(
     let extra_idsig_fds = extra_idsig_files?.into_iter().map(ParcelFileDescriptor::new).collect();
 
     let payload = if let Some(config_path) = config_path {
-        if payload_path.is_some() {
-            bail!("Only one of --config-path or --payload-path can be defined")
+        if payload_binary_name.is_some() {
+            bail!("Only one of --config-path or --payload-binary-name can be defined")
         }
         Payload::ConfigPath(config_path)
-    } else if let Some(payload_path) = payload_path {
-        Payload::PayloadConfig(VirtualMachinePayloadConfig { payloadPath: payload_path })
+    } else if let Some(payload_binary_name) = payload_binary_name {
+        Payload::PayloadConfig(VirtualMachinePayloadConfig {
+            payloadBinaryName: payload_binary_name,
+        })
     } else {
-        bail!("Either --config-path or --payload-path must be defined")
+        bail!("Either --config-path or --payload-binary-name must be defined")
     };
 
     let payload_config_str = format!("{:?}!{:?}", apk, payload);
@@ -143,7 +144,7 @@ pub fn command_run_app(
         numCpus: cpus.unwrap_or(1) as i32,
         taskProfiles: task_profiles,
     });
-    run(service, &config, &payload_config_str, daemonize, console_path, log_path)
+    run(service, &config, &payload_config_str, console_path, log_path)
 }
 
 const EMPTY_PAYLOAD_APK: &str = "com.android.microdroid.empty_payload";
@@ -178,7 +179,6 @@ pub fn command_run_microdroid(
     work_dir: Option<PathBuf>,
     storage: Option<&Path>,
     storage_size: Option<u64>,
-    daemonize: bool,
     console_path: Option<&Path>,
     log_path: Option<&Path>,
     debug_level: DebugLevel,
@@ -197,7 +197,7 @@ pub fn command_run_microdroid(
     let instance_img = work_dir.join("instance.img");
     println!("instance.img path: {}", instance_img.display());
 
-    let payload_path = "MicrodroidEmptyPayloadJniLib.so";
+    let payload_binary_name = "MicrodroidEmptyPayloadJniLib.so";
     let extra_sig = [];
     command_run_app(
         name,
@@ -208,8 +208,7 @@ pub fn command_run_microdroid(
         storage,
         storage_size,
         /* config_path= */ None,
-        Some(payload_path.to_owned()),
-        daemonize,
+        Some(payload_binary_name.to_owned()),
         console_path,
         log_path,
         debug_level,
@@ -227,7 +226,6 @@ pub fn command_run(
     name: Option<String>,
     service: &dyn IVirtualizationService,
     config_path: &Path,
-    daemonize: bool,
     console_path: Option<&Path>,
     log_path: Option<&Path>,
     mem: Option<u32>,
@@ -253,7 +251,6 @@ pub fn command_run(
         service,
         &VirtualMachineConfig::RawConfig(config),
         &format!("{:?}", config_path),
-        daemonize,
         console_path,
         log_path,
     )
@@ -275,7 +272,6 @@ fn run(
     service: &dyn IVirtualizationService,
     config: &VirtualMachineConfig,
     payload_config: &str,
-    daemonize: bool,
     console_path: Option<&Path>,
     log_path: Option<&Path>,
 ) -> Result<(), Error> {
@@ -284,8 +280,6 @@ fn run(
             File::create(console_path)
                 .with_context(|| format!("Failed to open console file {:?}", console_path))?,
         )
-    } else if daemonize {
-        None
     } else {
         Some(duplicate_stdout()?)
     };
@@ -294,8 +288,6 @@ fn run(
             File::create(log_path)
                 .with_context(|| format!("Failed to open log file {:?}", log_path))?,
         )
-    } else if daemonize {
-        None
     } else {
         Some(duplicate_stdout()?)
     };
@@ -312,17 +304,10 @@ fn run(
         state_to_str(vm.state()?)
     );
 
-    if daemonize {
-        // Pass the VM reference back to VirtualizationService and have it hold it in the
-        // background.
-        service.debugHoldVmRef(&vm.vm).context("Failed to pass VM to VirtualizationService")?;
-    } else {
-        // Wait until the VM or VirtualizationService dies. If we just returned immediately then the
-        // IVirtualMachine Binder object would be dropped and the VM would be killed.
-        let death_reason = vm.wait_for_death();
-        println!("VM ended: {:?}", death_reason);
-    }
-
+    // Wait until the VM or VirtualizationService dies. If we just returned immediately then the
+    // IVirtualMachine Binder object would be dropped and the VM would be killed.
+    let death_reason = vm.wait_for_death();
+    println!("VM ended: {:?}", death_reason);
     Ok(())
 }
 

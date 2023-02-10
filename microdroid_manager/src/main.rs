@@ -46,7 +46,7 @@ use nix::sys::signal::Signal;
 use openssl::sha::Sha512;
 use payload::{get_apex_data_from_payload, load_metadata, to_metadata};
 use rand::Fill;
-use rpcbinder::get_vsock_rpc_interface;
+use rpcbinder::RpcSession;
 use rustutils::sockets::android_get_control_socket;
 use rustutils::system_properties;
 use rustutils::system_properties::PropertyWatcher;
@@ -55,6 +55,7 @@ use std::convert::TryInto;
 use std::env;
 use std::fs::{self, create_dir, OpenOptions};
 use std::io::Write;
+use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -160,7 +161,8 @@ fn get_vms_rpc_binder() -> Result<Strong<dyn IVirtualMachineService>> {
     // The host is running a VirtualMachineService for this VM on a port equal
     // to the CID of this VM.
     let port = vsock::get_local_cid().context("Could not determine local CID")?;
-    get_vsock_rpc_interface(VMADDR_CID_HOST, port)
+    RpcSession::new()
+        .setup_vsock_client(VMADDR_CID_HOST, port)
         .context("Could not connect to IVirtualMachineService")
 }
 
@@ -257,7 +259,7 @@ fn dice_derivation(
     //   ? -71001: PayloadConfig
     // }
     // PayloadConfig = {
-    //   1: tstr // payload_binary_path
+    //   1: tstr // payload_binary_name
     // }
 
     let mut config_desc = vec![
@@ -276,7 +278,7 @@ fn dice_derivation(
             encode_negative_number(-71001, &mut config_desc)?;
             encode_header(5, 1, &mut config_desc)?; // map(1)
             encode_number(1, &mut config_desc)?;
-            encode_tstr(&payload_config.payload_binary_path, &mut config_desc)?;
+            encode_tstr(&payload_config.payload_binary_name, &mut config_desc)?;
         }
     }
 
@@ -486,6 +488,8 @@ struct Zipfuse {
 }
 
 impl Zipfuse {
+    const MICRODROID_PAYLOAD_UID: u32 = 0; // TODO(b/264861173) should be non-root
+    const MICRODROID_PAYLOAD_GID: u32 = 0; // TODO(b/264861173) should be non-root
     fn mount(
         &mut self,
         noexec: MountForExec,
@@ -499,6 +503,8 @@ impl Zipfuse {
             cmd.arg("--noexec");
         }
         cmd.args(["-p", &ready_prop, "-o", option]);
+        cmd.args(["-u", &Self::MICRODROID_PAYLOAD_UID.to_string()]);
+        cmd.args(["-g", &Self::MICRODROID_PAYLOAD_GID.to_string()]);
         cmd.arg(zip_path).arg(mount_dir);
         self.ready_properties.push(ready_prop);
         cmd.spawn().with_context(|| format!("Failed to run zipfuse for {mount_dir:?}"))
@@ -755,7 +761,7 @@ fn load_config(payload_metadata: PayloadMetadata) -> Result<VmPayloadConfig> {
         PayloadMetadata::config(payload_config) => {
             let task = Task {
                 type_: TaskType::MicrodroidLauncher,
-                command: payload_config.payload_binary_path,
+                command: payload_config.payload_binary_name,
             };
             Ok(VmPayloadConfig {
                 os: OsConfig { name: "microdroid".to_owned() },
@@ -795,6 +801,24 @@ fn exec_task(task: &Task, service: &Strong<dyn IVirtualMachineService>) -> Resul
             command
         }
     };
+
+    unsafe {
+        // SAFETY: we are not accessing any resource of the parent process.
+        command.pre_exec(|| {
+            info!("dropping capabilities before executing payload");
+            // It is OK to continue with payload execution even if the calls below fail, since
+            // whether process can use a capability is controlled by the SELinux. Dropping the
+            // capabilities here is just another defense-in-depth layer.
+            if let Err(e) = cap::drop_inheritable_caps() {
+                error!("failed to drop inheritable capabilities: {:?}", e);
+            }
+            if let Err(e) = cap::drop_bounding_set() {
+                error!("failed to drop bounding set: {:?}", e);
+            }
+            Ok(())
+        });
+    }
+
     command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
 
     info!("notifying payload started");

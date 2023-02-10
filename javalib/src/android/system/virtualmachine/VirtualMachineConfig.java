@@ -62,7 +62,7 @@ public final class VirtualMachineConfig {
     private static final String KEY_VERSION = "version";
     private static final String KEY_APKPATH = "apkPath";
     private static final String KEY_PAYLOADCONFIGPATH = "payloadConfigPath";
-    private static final String KEY_PAYLOADBINARYPATH = "payloadBinaryPath";
+    private static final String KEY_PAYLOADBINARYNAME = "payloadBinaryPath";
     private static final String KEY_DEBUGLEVEL = "debugLevel";
     private static final String KEY_PROTECTED_VM = "protectedVm";
     private static final String KEY_MEMORY_MIB = "memoryMib";
@@ -118,10 +118,8 @@ public final class VirtualMachineConfig {
      */
     @Nullable private final String mPayloadConfigPath;
 
-    /**
-     * Path within the APK to the payload binary file that will be executed within the VM.
-     */
-    @Nullable private final String mPayloadBinaryPath;
+    /** Name of the payload binary file within the APK that will be executed within the VM. */
+    @Nullable private final String mPayloadBinaryName;
 
     /** The size of storage in KiB. 0 indicates that encryptedStorage is not required */
     private final long mEncryptedStorageKib;
@@ -129,7 +127,7 @@ public final class VirtualMachineConfig {
     private VirtualMachineConfig(
             @NonNull String apkPath,
             @Nullable String payloadConfigPath,
-            @Nullable String payloadBinaryPath,
+            @Nullable String payloadBinaryName,
             @DebugLevel int debugLevel,
             boolean protectedVm,
             int memoryMib,
@@ -138,7 +136,7 @@ public final class VirtualMachineConfig {
         // This is only called from Builder.build(); the builder handles parameter validation.
         mApkPath = apkPath;
         mPayloadConfigPath = payloadConfigPath;
-        mPayloadBinaryPath = payloadBinaryPath;
+        mPayloadBinaryName = payloadBinaryName;
         mDebugLevel = debugLevel;
         mProtectedVm = protectedVm;
         mMemoryMib = memoryMib;
@@ -192,7 +190,7 @@ public final class VirtualMachineConfig {
 
         String payloadConfigPath = b.getString(KEY_PAYLOADCONFIGPATH);
         if (payloadConfigPath == null) {
-            builder.setPayloadBinaryPath(b.getString(KEY_PAYLOADBINARYPATH));
+            builder.setPayloadBinaryName(b.getString(KEY_PAYLOADBINARYNAME));
         } else {
             builder.setPayloadConfigPath(payloadConfigPath);
         }
@@ -231,7 +229,7 @@ public final class VirtualMachineConfig {
         b.putInt(KEY_VERSION, VERSION);
         b.putString(KEY_APKPATH, mApkPath);
         b.putString(KEY_PAYLOADCONFIGPATH, mPayloadConfigPath);
-        b.putString(KEY_PAYLOADBINARYPATH, mPayloadBinaryPath);
+        b.putString(KEY_PAYLOADBINARYNAME, mPayloadBinaryName);
         b.putInt(KEY_DEBUGLEVEL, mDebugLevel);
         b.putBoolean(KEY_PROTECTED_VM, mProtectedVm);
         b.putInt(KEY_NUM_CPUS, mNumCpus);
@@ -269,15 +267,15 @@ public final class VirtualMachineConfig {
     }
 
     /**
-     * Returns the path within the {@code lib/<ABI>} directory of the APK to the payload binary file
+     * Returns the name of the payload binary file, in the {@code lib/<ABI>} directory of the APK,
      * that will be executed within the VM.
      *
      * @hide
      */
     @SystemApi
     @Nullable
-    public String getPayloadBinaryPath() {
-        return mPayloadBinaryPath;
+    public String getPayloadBinaryName() {
+        return mPayloadBinaryName;
     }
 
     /**
@@ -349,10 +347,12 @@ public final class VirtualMachineConfig {
 
     /**
      * Tests if this config is compatible with other config. Being compatible means that the configs
-     * can be interchangeably used for the same virtual machine. Compatible changes includes the
-     * number of CPUs and the size of the RAM. All other changes (e.g. using a different payload,
-     * change of the debug mode, etc.) are considered as incompatible.
+     * can be interchangeably used for the same virtual machine; they do not change the VM identity
+     * or secrets. Such changes include varying the number of CPUs or the size of the RAM. Changes
+     * that would alter the identity of the VM (e.g. using a different payload or changing the debug
+     * mode) are considered incompatible.
      *
+     * @see VirtualMachine#setConfig
      * @hide
      */
     @SystemApi
@@ -361,7 +361,7 @@ public final class VirtualMachineConfig {
                 && this.mProtectedVm == other.mProtectedVm
                 && this.mEncryptedStorageKib == other.mEncryptedStorageKib
                 && Objects.equals(this.mPayloadConfigPath, other.mPayloadConfigPath)
-                && Objects.equals(this.mPayloadBinaryPath, other.mPayloadBinaryPath)
+                && Objects.equals(this.mPayloadBinaryName, other.mPayloadBinaryName)
                 && this.mApkPath.equals(other.mApkPath);
     }
 
@@ -375,9 +375,9 @@ public final class VirtualMachineConfig {
     VirtualMachineAppConfig toVsConfig() throws FileNotFoundException {
         VirtualMachineAppConfig vsConfig = new VirtualMachineAppConfig();
         vsConfig.apk = ParcelFileDescriptor.open(new File(mApkPath), MODE_READ_ONLY);
-        if (mPayloadBinaryPath != null) {
+        if (mPayloadBinaryName != null) {
             VirtualMachinePayloadConfig payloadConfig = new VirtualMachinePayloadConfig();
-            payloadConfig.payloadPath = mPayloadBinaryPath;
+            payloadConfig.payloadBinaryName = mPayloadBinaryName;
             vsConfig.payload =
                     VirtualMachineAppConfig.Payload.payloadConfig(payloadConfig);
         } else {
@@ -410,7 +410,7 @@ public final class VirtualMachineConfig {
         @Nullable private final Context mContext;
         @Nullable private String mApkPath;
         @Nullable private String mPayloadConfigPath;
-        @Nullable private String mPayloadBinaryPath;
+        @Nullable private String mPayloadBinaryName;
         @DebugLevel private int mDebugLevel = DEBUG_LEVEL_NONE;
         private boolean mProtectedVm;
         private boolean mProtectedVmSet;
@@ -454,14 +454,14 @@ public final class VirtualMachineConfig {
                 apkPath = mApkPath;
             }
 
-            if (mPayloadBinaryPath == null) {
+            if (mPayloadBinaryName == null) {
                 if (mPayloadConfigPath == null) {
-                    throw new IllegalStateException("setPayloadBinaryPath must be called");
+                    throw new IllegalStateException("setPayloadBinaryName must be called");
                 }
             } else {
                 if (mPayloadConfigPath != null) {
                     throw new IllegalStateException(
-                            "setPayloadBinaryPath and setPayloadConfigPath may not both be called");
+                            "setPayloadBinaryName and setPayloadConfigPath may not both be called");
                 }
             }
 
@@ -472,7 +472,7 @@ public final class VirtualMachineConfig {
             return new VirtualMachineConfig(
                     apkPath,
                     mPayloadConfigPath,
-                    mPayloadBinaryPath,
+                    mPayloadBinaryName,
                     mDebugLevel,
                     mProtectedVm,
                     mMemoryMib,
@@ -514,21 +514,36 @@ public final class VirtualMachineConfig {
         }
 
         /**
-         * Sets the path within the {@code lib/<ABI>} directory of the APK to the payload binary
-         * file that will be executed within the VM.
+         * Sets the name of the payload binary file that will be executed within the VM, e.g.
+         * "payload.so". The file must reside in the {@code lib/<ABI>} directory of the APK.
+         *
+         * <p>Note that VMs only support 64-bit code, even if the owning app is running as a 32-bit
+         * process.
          *
          * @hide
          */
         @SystemApi
         @NonNull
-        public Builder setPayloadBinaryPath(@NonNull String payloadBinaryPath) {
-            mPayloadBinaryPath =
-                    requireNonNull(payloadBinaryPath, "payloadBinaryPath must not be null");
+        public Builder setPayloadBinaryName(@NonNull String payloadBinaryName) {
+            if (payloadBinaryName.contains(File.separator)) {
+                throw new IllegalArgumentException(
+                        "Invalid binary file name: " + payloadBinaryName);
+            }
+            mPayloadBinaryName =
+                    requireNonNull(payloadBinaryName, "payloadBinaryName must not be null");
             return this;
         }
 
         /**
          * Sets the debug level. Defaults to {@link #DEBUG_LEVEL_NONE}.
+         *
+         * <p>If {@link #DEBUG_LEVEL_FULL} is set then logs from inside the VM are exported to the
+         * host and adb connections from the host are possible. This is convenient for debugging but
+         * may compromise the integrity of the VM - including bypassing the protections offered by a
+         * {@linkplain #setProtectedVm protected VM}.
+         *
+         * <p>Note that it isn't possible to {@linkplain #isCompatibleWith change} the debug level
+         * of a VM instance; debug and non-debug VMs always have different secrets.
          *
          * @hide
          */
@@ -546,6 +561,13 @@ public final class VirtualMachineConfig {
          * Sets whether to protect the VM memory from the host. No default is provided, this must be
          * set explicitly.
          *
+         * <p>Note that if debugging is {@linkplain #setDebugLevel enabled} for a protected VM, the
+         * VM is not truly protected - direct memory access by the host is prevented, but e.g. the
+         * debugger can be used to access the VM's internals.
+         *
+         * <p>It isn't possible to {@linkplain #isCompatibleWith change} the protected status of a
+         * VM instance; protected and non-protected VMs always have different secrets.
+         *
          * @see VirtualMachineManager#getCapabilities
          * @hide
          */
@@ -560,7 +582,7 @@ public final class VirtualMachineConfig {
             } else {
                 if (!HypervisorProperties.hypervisor_vm_supported().orElse(false)) {
                     throw new UnsupportedOperationException(
-                            "Unprotected VMs are not supported on this device.");
+                            "Non-protected VMs are not supported on this device.");
                 }
             }
             mProtectedVm = protectedVm;
@@ -586,7 +608,7 @@ public final class VirtualMachineConfig {
 
         /**
          * Sets the number of vCPUs in the VM. Defaults to 1. Cannot be more than the number of real
-         * CPUs (as returned by {@link Runtime#availableProcessors()}).
+         * CPUs (as returned by {@link Runtime#availableProcessors}).
          *
          * @hide
          */

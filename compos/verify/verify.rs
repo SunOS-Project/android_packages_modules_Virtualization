@@ -106,7 +106,8 @@ fn try_main() -> Result<()> {
     // We need to start the thread pool to be able to receive Binder callbacks
     ProcessState::start_thread_pool();
 
-    let virtualization_service = vmclient::connect()?;
+    let virtmgr = vmclient::VirtualizationService::new()?;
+    let virtualization_service = virtmgr.connect()?;
     let vm_instance = ComposClient::start(
         &*virtualization_service,
         instance_image,
@@ -136,4 +137,16 @@ fn read_small_file(file: &Path) -> Result<Vec<u8>> {
     let mut data = Vec::new();
     file.read_to_end(&mut data)?;
     Ok(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn verify_args() {
+        // Check that the command parsing has been configured in a valid way.
+        Args::command().debug_assert();
+    }
 }

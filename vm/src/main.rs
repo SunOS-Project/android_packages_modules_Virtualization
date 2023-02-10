@@ -51,17 +51,14 @@ enum Opt {
         #[clap(long)]
         config_path: Option<String>,
 
-        /// Path to VM payload binary within APK (e.g. MicrodroidTestNativeLib.so)
+        /// Name of VM payload binary within APK (e.g. MicrodroidTestNativeLib.so)
         #[clap(long)]
-        payload_path: Option<String>,
+        #[clap(alias = "payload_path")]
+        payload_binary_name: Option<String>,
 
         /// Name of VM
         #[clap(long)]
         name: Option<String>,
-
-        /// Detach VM from the terminal and run in the background
-        #[clap(short, long)]
-        daemonize: bool,
 
         /// Path to the file backing the storage.
         /// Created if the option is used but the path does not exist in the device.
@@ -118,10 +115,6 @@ enum Opt {
         #[clap(long)]
         name: Option<String>,
 
-        /// Detach VM from the terminal and run in the background
-        #[clap(short, long)]
-        daemonize: bool,
-
         /// Path to the file backing the storage.
         /// Created if the option is used but the path does not exist in the device.
         #[clap(long)]
@@ -170,10 +163,6 @@ enum Opt {
         #[clap(long)]
         name: Option<String>,
 
-        /// Detach VM from the terminal and run in the background
-        #[clap(short, long)]
-        daemonize: bool,
-
         /// Number of vCPUs in the VM. If unspecified, defaults to 1.
         #[clap(long)]
         cpus: Option<u32>,
@@ -189,11 +178,6 @@ enum Opt {
         /// Path to file for VM log output.
         #[clap(long)]
         log: Option<PathBuf>,
-    },
-    /// Stop a virtual machine running in the background
-    Stop {
-        /// CID of the virtual machine
-        cid: u32,
     },
     /// List running virtual machines
     List,
@@ -245,7 +229,9 @@ fn main() -> Result<(), Error> {
     // We need to start the thread pool for Binder to work properly, especially link_to_death.
     ProcessState::start_thread_pool();
 
-    let service = vmclient::connect().context("Failed to find VirtualizationService")?;
+    let virtmgr =
+        vmclient::VirtualizationService::new().context("Failed to spawn VirtualizationService")?;
+    let service = virtmgr.connect().context("Failed to connect to VirtualizationService")?;
 
     match opt {
         Opt::RunApp {
@@ -256,8 +242,7 @@ fn main() -> Result<(), Error> {
             storage,
             storage_size,
             config_path,
-            payload_path,
-            daemonize,
+            payload_binary_name,
             console,
             log,
             debug,
@@ -275,8 +260,7 @@ fn main() -> Result<(), Error> {
             storage.as_deref(),
             storage_size,
             config_path,
-            payload_path,
-            daemonize,
+            payload_binary_name,
             console.as_deref(),
             log.as_deref(),
             debug,
@@ -291,7 +275,6 @@ fn main() -> Result<(), Error> {
             work_dir,
             storage,
             storage_size,
-            daemonize,
             console,
             log,
             debug,
@@ -305,7 +288,6 @@ fn main() -> Result<(), Error> {
             work_dir,
             storage.as_deref(),
             storage_size,
-            daemonize,
             console.as_deref(),
             log.as_deref(),
             debug,
@@ -314,12 +296,11 @@ fn main() -> Result<(), Error> {
             cpus,
             task_profiles,
         ),
-        Opt::Run { name, config, daemonize, cpus, task_profiles, console, log } => {
+        Opt::Run { name, config, cpus, task_profiles, console, log } => {
             command_run(
                 name,
                 service.as_ref(),
                 &config,
-                daemonize,
                 console.as_deref(),
                 log.as_deref(),
                 /* mem */ None,
@@ -327,7 +308,6 @@ fn main() -> Result<(), Error> {
                 task_profiles,
             )
         }
-        Opt::Stop { cid } => command_stop(service.as_ref(), cid),
         Opt::List => command_list(service.as_ref()),
         Opt::Info => command_info(),
         Opt::CreatePartition { path, size, partition_type } => {
@@ -335,15 +315,6 @@ fn main() -> Result<(), Error> {
         }
         Opt::CreateIdsig { apk, path } => command_create_idsig(service.as_ref(), &apk, &path),
     }
-}
-
-/// Retrieve reference to a previously daemonized VM and stop it.
-fn command_stop(service: &dyn IVirtualizationService, cid: u32) -> Result<(), Error> {
-    service
-        .debugDropVmRef(cid as i32)
-        .context("Failed to get VM from VirtualizationService")?
-        .context("CID does not correspond to a running background VM")?;
-    Ok(())
 }
 
 /// List the VMs currently running.
@@ -355,15 +326,15 @@ fn command_list(service: &dyn IVirtualizationService) -> Result<(), Error> {
 
 /// Print information about supported VM types.
 fn command_info() -> Result<(), Error> {
-    let unprotected_vm_supported =
+    let non_protected_vm_supported =
         system_properties::read_bool("ro.boot.hypervisor.vm.supported", false)?;
     let protected_vm_supported =
         system_properties::read_bool("ro.boot.hypervisor.protected_vm.supported", false)?;
-    match (unprotected_vm_supported, protected_vm_supported) {
+    match (non_protected_vm_supported, protected_vm_supported) {
         (false, false) => println!("VMs are not supported."),
         (false, true) => println!("Only protected VMs are supported."),
-        (true, false) => println!("Only unprotected VMs are supported."),
-        (true, true) => println!("Both protected and unprotected VMs are supported."),
+        (true, false) => println!("Only non-protected VMs are supported."),
+        (true, true) => println!("Both protected and non-protected VMs are supported."),
     }
 
     if let Some(version) = system_properties::read("ro.boot.hypervisor.version")? {
@@ -384,10 +355,11 @@ fn command_info() -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::IntoApp;
+    use clap::CommandFactory;
 
     #[test]
     fn verify_app() {
-        Opt::into_app().debug_assert();
+        // Check that the command parsing has been configured in a valid way.
+        Opt::command().debug_assert();
     }
 }

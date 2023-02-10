@@ -52,6 +52,7 @@ import android.annotation.RequiresPermission;
 import android.annotation.SuppressLint;
 import android.annotation.SystemApi;
 import android.annotation.TestApi;
+import android.annotation.WorkerThread;
 import android.content.ComponentCallbacks2;
 import android.content.Context;
 import android.content.res.Configuration;
@@ -59,7 +60,6 @@ import android.os.Binder;
 import android.os.IBinder;
 import android.os.ParcelFileDescriptor;
 import android.os.RemoteException;
-import android.os.ServiceManager;
 import android.os.ServiceSpecificException;
 import android.system.virtualizationcommon.DeathReason;
 import android.system.virtualizationcommon.ErrorCode;
@@ -108,6 +108,15 @@ import java.util.zip.ZipFile;
  * received using {@link #setCallback}. The app can communicate with the VM using {@link
  * #connectToVsockServer} or {@link #connectVsock}.
  *
+ * <p>The payload code running inside the VM has access to a set of native APIs; see the <a
+ * href="https://cs.android.com/android/platform/superproject/+/master:packages/modules/Virtualization/vm_payload/README.md">README
+ * file</a> for details.
+ *
+ * <p>Each VM has a unique secret, computed from the APK that contains the code running in it, the
+ * VM configuration, and a random per-instance salt. The secret can be accessed by the payload code
+ * running inside the VM (using {@code AVmPayload_getVmInstanceSecret}) but is not made available
+ * outside it.
+ *
  * @hide
  */
 @SystemApi
@@ -153,7 +162,7 @@ public class VirtualMachine implements AutoCloseable {
     })
     public @interface Status {}
 
-     /** The virtual machine has just been created, or {@link #stop()} was called on it. */
+    /** The virtual machine has just been created, or {@link #stop} was called on it. */
     public static final int STATUS_STOPPED = 0;
 
     /** The virtual machine is running. */
@@ -182,9 +191,6 @@ public class VirtualMachine implements AutoCloseable {
 
     /** Name of the idsig files for extra APKs. */
     private static final String EXTRA_IDSIG_FILE_PREFIX = "extra_idsig_";
-
-    /** Name of the virtualization service. */
-    private static final String SERVICE_NAME = "android.system.virtualizationservice";
 
     /** Size of the instance image. 10 MB. */
     private static final long INSTANCE_FILE_SIZE = 10 * 1024 * 1024;
@@ -269,6 +275,9 @@ public class VirtualMachine implements AutoCloseable {
         }
     }
 
+    /** Running instance of virtmgr that hosts VirtualizationService for this VM. */
+    @NonNull private final VirtualizationService mVirtualizationService;
+
     @NonNull private final MemoryManagementCallbacks mMemoryManagementCallbacks;
 
     @NonNull private final Context mContext;
@@ -311,6 +320,9 @@ public class VirtualMachine implements AutoCloseable {
     @Nullable
     private ParcelFileDescriptor mLogWriter;
 
+    @GuardedBy("mLock")
+    private boolean mWasDeleted = false;
+
     /** The registered callback */
     @GuardedBy("mCallbackLock")
     @Nullable
@@ -336,11 +348,15 @@ public class VirtualMachine implements AutoCloseable {
     }
 
     private VirtualMachine(
-            @NonNull Context context, @NonNull String name, @NonNull VirtualMachineConfig config)
+            @NonNull Context context,
+            @NonNull String name,
+            @NonNull VirtualMachineConfig config,
+            @NonNull VirtualizationService service)
             throws VirtualMachineException {
         mPackageName = context.getPackageName();
         mName = requireNonNull(name, "Name must not be null");
         mConfig = requireNonNull(config, "Config must not be null");
+        mVirtualizationService = service;
 
         File thisVmDir = getVmDir(context, mName);
         mVmRootPath = thisVmDir;
@@ -354,6 +370,7 @@ public class VirtualMachine implements AutoCloseable {
                 (config.isEncryptedStorageEnabled())
                         ? new File(thisVmDir, ENCRYPTED_STORE_FILE)
                         : null;
+
     }
 
     /**
@@ -376,7 +393,8 @@ public class VirtualMachine implements AutoCloseable {
         VirtualMachineConfig config = VirtualMachineConfig.from(vmDescriptor.getConfigFd());
         File vmDir = createVmDir(context, name);
         try {
-            VirtualMachine vm = new VirtualMachine(context, name, config);
+            VirtualMachine vm =
+                    new VirtualMachine(context, name, config, VirtualizationService.getInstance());
             config.serialize(vm.mConfigFilePath);
             try {
                 vm.mInstanceFilePath.createNewFile();
@@ -419,7 +437,8 @@ public class VirtualMachine implements AutoCloseable {
         File vmDir = createVmDir(context, name);
 
         try {
-            VirtualMachine vm = new VirtualMachine(context, name, config);
+            VirtualMachine vm =
+                    new VirtualMachine(context, name, config, VirtualizationService.getInstance());
             config.serialize(vm.mConfigFilePath);
             try {
                 vm.mInstanceFilePath.createNewFile();
@@ -435,9 +454,7 @@ public class VirtualMachine implements AutoCloseable {
                 }
             }
 
-            IVirtualizationService service =
-                    IVirtualizationService.Stub.asInterface(
-                            ServiceManager.waitForService(SERVICE_NAME));
+            IVirtualizationService service = vm.mVirtualizationService.connect();
 
             try {
                 service.initializeWritablePartition(
@@ -491,7 +508,8 @@ public class VirtualMachine implements AutoCloseable {
         }
         File configFilePath = new File(thisVmDir, CONFIG_FILE);
         VirtualMachineConfig config = VirtualMachineConfig.from(configFilePath);
-        VirtualMachine vm = new VirtualMachine(context, name, config);
+        VirtualMachine vm =
+                new VirtualMachine(context, name, config, VirtualizationService.getInstance());
 
         if (!vm.mInstanceFilePath.exists()) {
             throw new VirtualMachineException("instance image missing");
@@ -506,8 +524,11 @@ public class VirtualMachine implements AutoCloseable {
     void delete(Context context, String name) throws VirtualMachineException {
         synchronized (mLock) {
             checkStopped();
-            deleteVmDirectory(context, name);
+            // Once we explicitly delete a VM it must remain permanently in the deleted state;
+            // if a new VM is created with the same name (and files) that's unrelated.
+            mWasDeleted = true;
         }
+        deleteVmDirectory(context, name);
     }
 
     static void deleteVmDirectory(Context context, String name) throws VirtualMachineException {
@@ -563,13 +584,15 @@ public class VirtualMachine implements AutoCloseable {
     /**
      * Returns the currently selected config of this virtual machine. There can be multiple virtual
      * machines sharing the same config. Even in that case, the virtual machines are completely
-     * isolated from each other; one cannot share its secret to another virtual machine even if they
-     * share the same config. It is also possible that a virtual machine can switch its config,
-     * which can be done by calling {@link #setConfig(VirtualMachineConfig)}.
+     * isolated from each other; they have different secrets. It is also possible that a virtual
+     * machine can change its config, which can be done by calling {@link #setConfig}.
+     *
+     * <p>NOTE: This method may block and should not be called on the main thread.
      *
      * @hide
      */
     @SystemApi
+    @WorkerThread
     @NonNull
     public VirtualMachineConfig getConfig() {
         synchronized (mLock) {
@@ -580,13 +603,19 @@ public class VirtualMachine implements AutoCloseable {
     /**
      * Returns the current status of this virtual machine.
      *
+     * <p>NOTE: This method may block and should not be called on the main thread.
+     *
      * @hide
      */
     @SystemApi
+    @WorkerThread
     @Status
     public int getStatus() {
         IVirtualMachine virtualMachine;
         synchronized (mLock) {
+            if (mWasDeleted) {
+                return STATUS_DELETED;
+            }
             virtualMachine = mVirtualMachine;
         }
         if (virtualMachine == null) {
@@ -617,7 +646,7 @@ public class VirtualMachine implements AutoCloseable {
     // Throw an appropriate exception if we have a running VM, or the VM has been deleted.
     @GuardedBy("mLock")
     private void checkStopped() throws VirtualMachineException {
-        if (!mVmRootPath.exists()) {
+        if (mWasDeleted || !mVmRootPath.exists()) {
             throw new VirtualMachineException("VM has been deleted");
         }
         if (mVirtualMachine == null) {
@@ -653,7 +682,7 @@ public class VirtualMachine implements AutoCloseable {
                     && stateToStatus(mVirtualMachine.getState()) == STATUS_RUNNING) {
                 return mVirtualMachine;
             } else {
-                if (!mVmRootPath.exists()) {
+                if (mWasDeleted || !mVmRootPath.exists()) {
                     throw new VirtualMachineException("VM has been deleted");
                 } else {
                     throw new VirtualMachineException("VM is not in running state");
@@ -715,14 +744,16 @@ public class VirtualMachine implements AutoCloseable {
     /**
      * Runs this virtual machine. The returning of this method however doesn't mean that the VM has
      * actually started running or the OS has booted there. Such events can be notified by
-     * registering a callback using {@link #setCallback(Executor, VirtualMachineCallback)} before
-     * calling {@code run()}.
+     * registering a callback using {@link #setCallback} before calling {@code run()}.
+     *
+     * <p>NOTE: This method may block and should not be called on the main thread.
      *
      * @throws VirtualMachineException if the virtual machine is not stopped or could not be
      *     started.
      * @hide
      */
     @SystemApi
+    @WorkerThread
     @RequiresPermission(MANAGE_VIRTUAL_MACHINE_PERMISSION)
     public void run() throws VirtualMachineException {
         synchronized (mLock) {
@@ -738,9 +769,7 @@ public class VirtualMachine implements AutoCloseable {
                 throw new VirtualMachineException("failed to create idsig file", e);
             }
 
-            IVirtualizationService service =
-                    IVirtualizationService.Stub.asInterface(
-                            ServiceManager.waitForService(SERVICE_NAME));
+            IVirtualizationService service = mVirtualizationService.connect();
 
             try {
                 createVmPipes();
@@ -863,10 +892,13 @@ public class VirtualMachine implements AutoCloseable {
     /**
      * Returns the stream object representing the console output from the virtual machine.
      *
+     * <p>NOTE: This method may block and should not be called on the main thread.
+     *
      * @throws VirtualMachineException if the stream could not be created.
      * @hide
      */
     @SystemApi
+    @WorkerThread
     @NonNull
     public InputStream getConsoleOutput() throws VirtualMachineException {
         synchronized (mLock) {
@@ -878,10 +910,13 @@ public class VirtualMachine implements AutoCloseable {
     /**
      * Returns the stream object representing the log output from the virtual machine.
      *
+     * <p>NOTE: This method may block and should not be called on the main thread.
+     *
      * @throws VirtualMachineException if the stream could not be created.
      * @hide
      */
     @SystemApi
+    @WorkerThread
     @NonNull
     public InputStream getLogOutput() throws VirtualMachineException {
         synchronized (mLock) {
@@ -893,13 +928,24 @@ public class VirtualMachine implements AutoCloseable {
     /**
      * Stops this virtual machine. Stopping a virtual machine is like pulling the plug on a real
      * computer; the machine halts immediately. Software running on the virtual machine is not
-     * notified of the event. A stopped virtual machine can be re-started by calling {@link #run()}.
+     * notified of the event. Writes to {@linkplain
+     * VirtualMachineConfig.Builder#setEncryptedStorageKib encrypted storage} might not be
+     * persisted, and the instance might be left in an inconsistent state.
+     *
+     * <p>For a graceful shutdown, you could request the payload to call {@code exit()}, e.g. via a
+     * {@linkplain #connectToVsockServer binder request}, and wait for {@link
+     * VirtualMachineCallback#onPayloadFinished} to be called.
+     *
+     * <p>A stopped virtual machine can be re-started by calling {@link #run()}.
+     *
+     * <p>NOTE: This method may block and should not be called on the main thread.
      *
      * @throws VirtualMachineException if the virtual machine is not running or could not be
      *     stopped.
      * @hide
      */
     @SystemApi
+    @WorkerThread
     public void stop() throws VirtualMachineException {
         synchronized (mLock) {
             if (mVirtualMachine == null) {
@@ -919,10 +965,13 @@ public class VirtualMachine implements AutoCloseable {
     /**
      * Stops this virtual machine, if it is running.
      *
+     * <p>NOTE: This method may block and should not be called on the main thread.
+     *
      * @see #stop()
      * @hide
      */
     @SystemApi
+    @WorkerThread
     @Override
     public void close() {
         synchronized (mLock) {
@@ -970,8 +1019,10 @@ public class VirtualMachine implements AutoCloseable {
      * like the number of CPU and size of the RAM, depending on the situation (e.g. the size of the
      * application to run on the virtual machine, etc.)
      *
-     * <p>The new config must be {@link VirtualMachineConfig#isCompatibleWith compatible with} the
-     * existing config.
+     * <p>The new config must be {@linkplain VirtualMachineConfig#isCompatibleWith compatible with}
+     * the existing config.
+     *
+     * <p>NOTE: This method may block and should not be called on the main thread.
      *
      * @return the old config
      * @throws VirtualMachineException if the virtual machine is not stopped, or the new config is
@@ -979,6 +1030,7 @@ public class VirtualMachine implements AutoCloseable {
      * @hide
      */
     @SystemApi
+    @WorkerThread
     @NonNull
     public VirtualMachineConfig setConfig(@NonNull VirtualMachineConfig newConfig)
             throws VirtualMachineException {
@@ -1004,14 +1056,17 @@ public class VirtualMachine implements AutoCloseable {
     /**
      * Connect to a VM's binder service via vsock and return the root IBinder object. Guest VMs are
      * expected to set up vsock servers in their payload. After the host app receives the {@link
-     * VirtualMachineCallback#onPayloadReady(VirtualMachine)}, it can use this method to establish a
-     * connection to the guest VM.
+     * VirtualMachineCallback#onPayloadReady}, it can use this method to establish a connection to
+     * the guest VM.
+     *
+     * <p>NOTE: This method may block and should not be called on the main thread.
      *
      * @throws VirtualMachineException if the virtual machine is not running or the connection
      *     failed.
      * @hide
      */
     @SystemApi
+    @WorkerThread
     @NonNull
     public IBinder connectToVsockServer(
             @IntRange(from = MIN_VSOCK_PORT, to = MAX_VSOCK_PORT) long port)
@@ -1030,10 +1085,15 @@ public class VirtualMachine implements AutoCloseable {
     /**
      * Opens a vsock connection to the VM on the given port.
      *
+     * <p>The caller is responsible for closing the returned {@code ParcelFileDescriptor}.
+     *
+     * <p>NOTE: This method may block and should not be called on the main thread.
+     *
      * @throws VirtualMachineException if connecting fails.
      * @hide
      */
     @SystemApi
+    @WorkerThread
     @NonNull
     public ParcelFileDescriptor connectVsock(
             @IntRange(from = MIN_VSOCK_PORT, to = MAX_VSOCK_PORT) long port)
@@ -1079,12 +1139,15 @@ public class VirtualMachine implements AutoCloseable {
      * VirtualMachineManager#importFromDescriptor} is called. It is recommended that the VM not be
      * started until that operation is complete.
      *
+     * <p>NOTE: This method may block and should not be called on the main thread.
+     *
      * @return a {@link VirtualMachineDescriptor} instance that represents the VM's state.
      * @throws VirtualMachineException if the virtual machine is not stopped, or the state could not
      *     be captured.
      * @hide
      */
     @SystemApi
+    @WorkerThread
     @NonNull
     public VirtualMachineDescriptor toDescriptor() throws VirtualMachineException {
         synchronized (mLock) {
@@ -1160,17 +1223,15 @@ public class VirtualMachine implements AutoCloseable {
     public String toString() {
         VirtualMachineConfig config = getConfig();
         String payloadConfigPath = config.getPayloadConfigPath();
-        String payloadBinaryPath = config.getPayloadBinaryPath();
+        String payloadBinaryName = config.getPayloadBinaryName();
 
         StringBuilder result = new StringBuilder();
         result.append("VirtualMachine(")
                 .append("name:")
                 .append(getName())
                 .append(", ");
-        if (payloadBinaryPath != null) {
-            result.append("payload:")
-                    .append(payloadBinaryPath)
-                    .append(", ");
+        if (payloadBinaryName != null) {
+            result.append("payload:").append(payloadBinaryName).append(", ");
         }
         if (payloadConfigPath != null) {
             result.append("config:")
