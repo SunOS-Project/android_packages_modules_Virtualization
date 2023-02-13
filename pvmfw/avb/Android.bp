@@ -25,19 +25,26 @@ rust_library_rlib {
 }
 
 rust_test {
-    name: "libpvmfw_avb.test",
-    defaults: ["libpvmfw_avb_nostd_defaults"],
+    name: "libpvmfw_avb.integration_test",
+    crate_name: "pvmfw_avb_test",
+    srcs: ["tests/*_test.rs"],
     test_suites: ["general-tests"],
     data: [
         ":avb_testkey_rsa2048_pub_bin",
         ":avb_testkey_rsa4096_pub_bin",
         ":microdroid_kernel_signed",
         ":microdroid_initrd_normal",
+        ":microdroid_initrd_debuggable",
         ":test_image_with_one_hashdesc",
+        ":test_image_with_non_initrd_hashdesc",
+        ":test_image_with_prop_desc",
         ":unsigned_test_image",
     ],
+    prefer_rlib: true,
     rustlibs: [
         "libanyhow",
+        "libavb_bindgen",
+        "libpvmfw_avb_nostd",
     ],
     enabled: false,
     arch: {
@@ -57,6 +64,38 @@ genrule {
     tools: ["avbtool"],
     out: ["unsigned_test.img"],
     cmd: "$(location avbtool) generate_test_image --image_size 16384 --output $(out)",
+}
+
+avb_gen_vbmeta_image {
+    name: "test_non_initrd_hashdesc",
+    src: ":unsigned_test_image",
+    partition_name: "non_initrd11",
+    salt: "2222",
+}
+
+avb_add_hash_footer {
+    name: "test_image_with_non_initrd_hashdesc",
+    src: ":unsigned_test_image",
+    partition_name: "boot",
+    private_key: ":pvmfw_sign_key",
+    salt: "1111",
+    include_descriptors_from_images: [
+        ":test_non_initrd_hashdesc",
+    ],
+}
+
+avb_add_hash_footer {
+    name: "test_image_with_prop_desc",
+    src: ":unsigned_test_image",
+    partition_name: "boot",
+    private_key: ":pvmfw_sign_key",
+    salt: "1111",
+    props: [
+        {
+            name: "mock_prop",
+            value: "3333",
+        },
+    ],
 }
 
 avb_add_hash_footer {

@@ -14,71 +14,31 @@
 
 //! This module handles the pvmfw payload verification.
 
-use crate::error::{slot_verify_result_to_verify_payload_result, AvbSlotVerifyError};
-use avb_bindgen::{avb_slot_verify, AvbHashtreeErrorMode, AvbIOResult, AvbOps, AvbSlotVerifyFlags};
+use crate::error::{
+    slot_verify_result_to_verify_payload_result, to_avb_io_result, AvbIOError, AvbSlotVerifyError,
+};
+use avb_bindgen::{
+    avb_descriptor_foreach, avb_hash_descriptor_validate_and_byteswap, avb_slot_verify,
+    avb_slot_verify_data_free, AvbDescriptor, AvbHashDescriptor, AvbHashtreeErrorMode, AvbIOResult,
+    AvbOps, AvbSlotVerifyData, AvbSlotVerifyFlags, AvbVBMetaData,
+};
 use core::{
     ffi::{c_char, c_void, CStr},
+    mem::{size_of, MaybeUninit},
     ptr::{self, NonNull},
     slice,
 };
 
-static NULL_BYTE: &[u8] = b"\0";
-
-enum AvbIOError {
-    /// AVB_IO_RESULT_ERROR_OOM,
-    #[allow(dead_code)]
-    Oom,
-    /// AVB_IO_RESULT_ERROR_IO,
-    #[allow(dead_code)]
-    Io,
-    /// AVB_IO_RESULT_ERROR_NO_SUCH_PARTITION,
-    NoSuchPartition,
-    /// AVB_IO_RESULT_ERROR_RANGE_OUTSIDE_PARTITION,
-    RangeOutsidePartition,
-    /// AVB_IO_RESULT_ERROR_NO_SUCH_VALUE,
-    NoSuchValue,
-    /// AVB_IO_RESULT_ERROR_INVALID_VALUE_SIZE,
-    InvalidValueSize,
-    /// AVB_IO_RESULT_ERROR_INSUFFICIENT_SPACE,
-    #[allow(dead_code)]
-    InsufficientSpace,
-}
-
-impl From<AvbIOError> for AvbIOResult {
-    fn from(error: AvbIOError) -> Self {
-        match error {
-            AvbIOError::Oom => AvbIOResult::AVB_IO_RESULT_ERROR_OOM,
-            AvbIOError::Io => AvbIOResult::AVB_IO_RESULT_ERROR_IO,
-            AvbIOError::NoSuchPartition => AvbIOResult::AVB_IO_RESULT_ERROR_NO_SUCH_PARTITION,
-            AvbIOError::RangeOutsidePartition => {
-                AvbIOResult::AVB_IO_RESULT_ERROR_RANGE_OUTSIDE_PARTITION
-            }
-            AvbIOError::NoSuchValue => AvbIOResult::AVB_IO_RESULT_ERROR_NO_SUCH_VALUE,
-            AvbIOError::InvalidValueSize => AvbIOResult::AVB_IO_RESULT_ERROR_INVALID_VALUE_SIZE,
-            AvbIOError::InsufficientSpace => AvbIOResult::AVB_IO_RESULT_ERROR_INSUFFICIENT_SPACE,
-        }
-    }
-}
-
-fn to_avb_io_result(result: Result<(), AvbIOError>) -> AvbIOResult {
-    result.map_or_else(|e| e.into(), |_| AvbIOResult::AVB_IO_RESULT_OK)
-}
+const NULL_BYTE: &[u8] = b"\0";
 
 extern "C" fn read_is_device_unlocked(
     _ops: *mut AvbOps,
     out_is_unlocked: *mut bool,
 ) -> AvbIOResult {
-    if let Err(e) = is_not_null(out_is_unlocked) {
-        return e.into();
-    }
-    // SAFETY: It is safe as the raw pointer `out_is_unlocked` is a valid pointer.
-    unsafe {
-        *out_is_unlocked = false;
-    }
-    AvbIOResult::AVB_IO_RESULT_OK
+    to_avb_io_result(write(out_is_unlocked, false))
 }
 
-unsafe extern "C" fn get_preloaded_partition(
+extern "C" fn get_preloaded_partition(
     ops: *mut AvbOps,
     partition: *const c_char,
     num_bytes: usize,
@@ -103,18 +63,8 @@ fn try_get_preloaded_partition(
 ) -> Result<(), AvbIOError> {
     let ops = as_ref(ops)?;
     let partition = ops.as_ref().get_partition(partition)?;
-    let out_pointer = to_nonnull(out_pointer)?;
-    // SAFETY: It is safe as the raw pointer `out_pointer` is a nonnull pointer.
-    unsafe {
-        *out_pointer.as_ptr() = partition.as_ptr() as _;
-    }
-    let out_num_bytes_preloaded = to_nonnull(out_num_bytes_preloaded)?;
-    // SAFETY: The raw pointer `out_num_bytes_preloaded` was created to point to a valid a `usize`
-    // and we checked it is nonnull.
-    unsafe {
-        *out_num_bytes_preloaded.as_ptr() = partition.len().min(num_bytes);
-    }
-    Ok(())
+    write(out_pointer, partition.as_ptr() as *mut u8)?;
+    write(out_num_bytes_preloaded, partition.len().min(num_bytes))
 }
 
 extern "C" fn read_from_partition(
@@ -150,13 +100,7 @@ fn try_read_from_partition(
     // is created to point to the `num_bytes` of bytes in memory.
     let buffer_slice = unsafe { slice::from_raw_parts_mut(buffer.as_ptr() as *mut u8, num_bytes) };
     copy_data_to_dst(partition, offset, buffer_slice)?;
-    let out_num_read = to_nonnull(out_num_read)?;
-    // SAFETY: The raw pointer `out_num_read` was created to point to a valid a `usize`
-    // and we checked it is nonnull.
-    unsafe {
-        *out_num_read.as_ptr() = buffer_slice.len();
-    }
-    Ok(())
+    write(out_num_read, buffer_slice.len())
 }
 
 fn copy_data_to_dst(src: &[u8], offset: i64, dst: &mut [u8]) -> Result<(), AvbIOError> {
@@ -189,13 +133,7 @@ fn try_get_size_of_partition(
     let partition = ops.as_ref().get_partition(partition)?;
     let partition_size =
         u64::try_from(partition.len()).map_err(|_| AvbIOError::InvalidValueSize)?;
-    let out_size_num_bytes = to_nonnull(out_size_num_bytes)?;
-    // SAFETY: The raw pointer `out_size_num_bytes` was created to point to a valid a `u64`
-    // and we checked it is nonnull.
-    unsafe {
-        *out_size_num_bytes.as_ptr() = partition_size;
-    }
-    Ok(())
+    write(out_size_num_bytes, partition_size)
 }
 
 extern "C" fn read_rollback_index(
@@ -260,10 +198,97 @@ fn try_validate_public_key_for_partition(
     // Verifies the public key for the known partitions only.
     ops.as_ref().get_partition(partition)?;
     let trusted_public_key = ops.as_ref().trusted_public_key;
-    let out_is_trusted = to_nonnull(out_is_trusted)?;
-    // SAFETY: It is safe as the raw pointer `out_is_trusted` is a nonnull pointer.
+    write(out_is_trusted, public_key == trusted_public_key)
+}
+
+extern "C" fn search_initrd_hash_descriptor(
+    descriptor: *const AvbDescriptor,
+    user_data: *mut c_void,
+) -> bool {
+    try_search_initrd_hash_descriptor(descriptor, user_data).is_ok()
+}
+
+fn try_search_initrd_hash_descriptor(
+    descriptor: *const AvbDescriptor,
+    user_data: *mut c_void,
+) -> Result<(), AvbIOError> {
+    let hash_desc = AvbHashDescriptorRef::try_from(descriptor)?;
+    if matches!(
+        hash_desc.partition_name()?.try_into(),
+        Ok(PartitionName::InitrdDebug) | Ok(PartitionName::InitrdNormal),
+    ) {
+        write(user_data as *mut bool, true)?;
+    }
+    Ok(())
+}
+
+/// `hash_desc` only contains the metadata like fields length and flags of the descriptor.
+/// The data itself is contained in `ptr`.
+struct AvbHashDescriptorRef {
+    hash_desc: AvbHashDescriptor,
+    ptr: *const AvbDescriptor,
+}
+
+impl TryFrom<*const AvbDescriptor> for AvbHashDescriptorRef {
+    type Error = AvbIOError;
+
+    fn try_from(descriptor: *const AvbDescriptor) -> Result<Self, Self::Error> {
+        is_not_null(descriptor)?;
+        // SAFETY: It is safe as the raw pointer `descriptor` is a nonnull pointer and
+        // we have validated that it is of hash descriptor type.
+        let hash_desc = unsafe {
+            let mut desc = MaybeUninit::uninit();
+            if !avb_hash_descriptor_validate_and_byteswap(
+                descriptor as *const AvbHashDescriptor,
+                desc.as_mut_ptr(),
+            ) {
+                return Err(AvbIOError::Io);
+            }
+            desc.assume_init()
+        };
+        Ok(Self { hash_desc, ptr: descriptor })
+    }
+}
+
+impl AvbHashDescriptorRef {
+    fn check_is_in_range(&self, index: usize) -> Result<(), AvbIOError> {
+        let parent_desc = self.hash_desc.parent_descriptor;
+        let total_len = usize_checked_add(
+            size_of::<AvbDescriptor>(),
+            to_usize(parent_desc.num_bytes_following)?,
+        )?;
+        if index <= total_len {
+            Ok(())
+        } else {
+            Err(AvbIOError::Io)
+        }
+    }
+
+    /// Returns the non null-terminated partition name.
+    fn partition_name(&self) -> Result<&[u8], AvbIOError> {
+        let partition_name_offset = size_of::<AvbHashDescriptor>();
+        let partition_name_len = to_usize(self.hash_desc.partition_name_len)?;
+        self.check_is_in_range(usize_checked_add(partition_name_offset, partition_name_len)?)?;
+        let desc = self.ptr as *const u8;
+        // SAFETY: The descriptor has been validated as nonnull and the partition name is
+        // contained within the image.
+        unsafe { Ok(slice::from_raw_parts(desc.add(partition_name_offset), partition_name_len)) }
+    }
+}
+
+fn to_usize<T: TryInto<usize>>(num: T) -> Result<usize, AvbIOError> {
+    num.try_into().map_err(|_| AvbIOError::InvalidValueSize)
+}
+
+fn usize_checked_add(x: usize, y: usize) -> Result<usize, AvbIOError> {
+    x.checked_add(y).ok_or(AvbIOError::InvalidValueSize)
+}
+
+fn write<T>(ptr: *mut T, value: T) -> Result<(), AvbIOError> {
+    let ptr = to_nonnull(ptr)?;
+    // SAFETY: It is safe as the raw pointer `ptr` is a nonnull pointer.
     unsafe {
-        *out_is_trusted.as_ptr() = public_key == trusted_public_key;
+        *ptr.as_ptr() = value;
     }
     Ok(())
 }
@@ -299,12 +324,31 @@ impl PartitionName {
     const INITRD_DEBUG_PARTITION_NAME: &[u8] = b"initrd_debug\0";
 
     fn as_cstr(&self) -> &CStr {
-        let partition_name = match self {
+        CStr::from_bytes_with_nul(self.as_bytes()).unwrap()
+    }
+
+    fn as_non_null_terminated_bytes(&self) -> &[u8] {
+        let partition_name = self.as_bytes();
+        &partition_name[..partition_name.len() - 1]
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        match self {
             Self::Kernel => Self::KERNEL_PARTITION_NAME,
             Self::InitrdNormal => Self::INITRD_NORMAL_PARTITION_NAME,
             Self::InitrdDebug => Self::INITRD_DEBUG_PARTITION_NAME,
-        };
-        CStr::from_bytes_with_nul(partition_name).unwrap()
+        }
+    }
+}
+
+impl TryFrom<*const c_char> for PartitionName {
+    type Error = AvbIOError;
+
+    fn try_from(partition_name: *const c_char) -> Result<Self, Self::Error> {
+        is_not_null(partition_name)?;
+        // SAFETY: It is safe as the raw pointer `partition_name` is a nonnull pointer.
+        let partition_name = unsafe { CStr::from_ptr(partition_name) };
+        partition_name.try_into()
     }
 }
 
@@ -318,6 +362,59 @@ impl TryFrom<&CStr> for PartitionName {
             Self::INITRD_DEBUG_PARTITION_NAME => Ok(Self::InitrdDebug),
             _ => Err(AvbIOError::NoSuchPartition),
         }
+    }
+}
+
+impl TryFrom<&[u8]> for PartitionName {
+    type Error = AvbIOError;
+
+    fn try_from(non_null_terminated_name: &[u8]) -> Result<Self, Self::Error> {
+        match non_null_terminated_name {
+            x if x == Self::Kernel.as_non_null_terminated_bytes() => Ok(Self::Kernel),
+            x if x == Self::InitrdNormal.as_non_null_terminated_bytes() => Ok(Self::InitrdNormal),
+            x if x == Self::InitrdDebug.as_non_null_terminated_bytes() => Ok(Self::InitrdDebug),
+            _ => Err(AvbIOError::NoSuchPartition),
+        }
+    }
+}
+
+struct AvbSlotVerifyDataWrap(*mut AvbSlotVerifyData);
+
+impl TryFrom<*mut AvbSlotVerifyData> for AvbSlotVerifyDataWrap {
+    type Error = AvbSlotVerifyError;
+
+    fn try_from(data: *mut AvbSlotVerifyData) -> Result<Self, Self::Error> {
+        is_not_null(data).map_err(|_| AvbSlotVerifyError::Io)?;
+        Ok(Self(data))
+    }
+}
+
+impl Drop for AvbSlotVerifyDataWrap {
+    fn drop(&mut self) {
+        // SAFETY: This is safe because `self.0` is checked nonnull when the
+        // instance is created. We can free this pointer when the instance is
+        // no longer needed.
+        unsafe {
+            avb_slot_verify_data_free(self.0);
+        }
+    }
+}
+
+impl AsRef<AvbSlotVerifyData> for AvbSlotVerifyDataWrap {
+    fn as_ref(&self) -> &AvbSlotVerifyData {
+        // This is safe because `self.0` is checked nonnull when the instance is created.
+        as_ref(self.0).unwrap()
+    }
+}
+
+impl AvbSlotVerifyDataWrap {
+    fn vbmeta_images(&self) -> Result<&[AvbVBMetaData], AvbSlotVerifyError> {
+        let data = self.as_ref();
+        is_not_null(data.vbmeta_images).map_err(|_| AvbSlotVerifyError::Io)?;
+        // SAFETY: It is safe as the raw pointer `data.vbmeta_images` is a nonnull pointer.
+        let vbmeta_images =
+            unsafe { slice::from_raw_parts(data.vbmeta_images, data.num_vbmeta_images) };
+        Ok(vbmeta_images)
     }
 }
 
@@ -339,12 +436,7 @@ impl<'a> AsRef<Payload<'a>> for AvbOps {
 }
 
 impl<'a> Payload<'a> {
-    const MAX_NUM_OF_HASH_DESCRIPTORS: usize = 3;
-
     fn get_partition(&self, partition_name: *const c_char) -> Result<&[u8], AvbIOError> {
-        is_not_null(partition_name)?;
-        // SAFETY: It is safe as the raw pointer `partition_name` is a nonnull pointer.
-        let partition_name = unsafe { CStr::from_ptr(partition_name) };
         match partition_name.try_into()? {
             PartitionName::Kernel => Ok(self.kernel),
             PartitionName::InitrdNormal | PartitionName::InitrdDebug => {
@@ -353,16 +445,11 @@ impl<'a> Payload<'a> {
         }
     }
 
-    fn verify_partitions(&mut self, partition_names: &[&CStr]) -> Result<(), AvbSlotVerifyError> {
-        if partition_names.len() > Self::MAX_NUM_OF_HASH_DESCRIPTORS {
-            return Err(AvbSlotVerifyError::InvalidArgument);
-        }
-        let mut requested_partitions = [ptr::null(); Self::MAX_NUM_OF_HASH_DESCRIPTORS + 1];
-        partition_names
-            .iter()
-            .enumerate()
-            .for_each(|(i, name)| requested_partitions[i] = name.as_ptr());
-
+    fn verify_partition(
+        &mut self,
+        partition_name: &CStr,
+    ) -> Result<AvbSlotVerifyDataWrap, AvbSlotVerifyError> {
+        let requested_partitions = [partition_name.as_ptr(), ptr::null()];
         let mut avb_ops = AvbOps {
             user_data: self as *mut _ as *mut c_void,
             ab_ops: ptr::null_mut(),
@@ -381,7 +468,7 @@ impl<'a> Payload<'a> {
             validate_public_key_for_partition: Some(validate_public_key_for_partition),
         };
         let ab_suffix = CStr::from_bytes_with_nul(NULL_BYTE).unwrap();
-        let out_data = ptr::null_mut();
+        let mut out_data = MaybeUninit::uninit();
         // SAFETY: It is safe to call `avb_slot_verify()` as the pointer arguments (`ops`,
         // `requested_partitions` and `ab_suffix`) passed to the method are all valid and
         // initialized. The last argument `out_data` is allowed to be null so that nothing
@@ -393,10 +480,46 @@ impl<'a> Payload<'a> {
                 ab_suffix.as_ptr(),
                 AvbSlotVerifyFlags::AVB_SLOT_VERIFY_FLAGS_NO_VBMETA_PARTITION,
                 AvbHashtreeErrorMode::AVB_HASHTREE_ERROR_MODE_RESTART_AND_INVALIDATE,
-                out_data,
+                out_data.as_mut_ptr(),
             )
         };
-        slot_verify_result_to_verify_payload_result(result)
+        slot_verify_result_to_verify_payload_result(result)?;
+        // SAFETY: This is safe because `out_data` has been properly initialized after
+        // calling `avb_slot_verify` and it returns OK.
+        let out_data = unsafe { out_data.assume_init() };
+        out_data.try_into()
+    }
+}
+
+fn verify_vbmeta_has_no_initrd_descriptor(
+    vbmeta_image: &AvbVBMetaData,
+) -> Result<(), AvbSlotVerifyError> {
+    is_not_null(vbmeta_image.vbmeta_data).map_err(|_| AvbSlotVerifyError::Io)?;
+    let mut has_unexpected_descriptor = false;
+    // SAFETY: It is safe as the raw pointer `vbmeta_image.vbmeta_data` is a nonnull pointer.
+    if !unsafe {
+        avb_descriptor_foreach(
+            vbmeta_image.vbmeta_data,
+            vbmeta_image.vbmeta_size,
+            Some(search_initrd_hash_descriptor),
+            &mut has_unexpected_descriptor as *mut _ as *mut c_void,
+        )
+    } {
+        return Err(AvbSlotVerifyError::InvalidMetadata);
+    }
+    if has_unexpected_descriptor {
+        Err(AvbSlotVerifyError::InvalidMetadata)
+    } else {
+        Ok(())
+    }
+}
+
+fn verify_vbmeta_is_from_kernel_partition(
+    vbmeta_image: &AvbVBMetaData,
+) -> Result<(), AvbSlotVerifyError> {
+    match (vbmeta_image.partition_name as *const c_char).try_into() {
+        Ok(PartitionName::Kernel) => Ok(()),
+        _ => Err(AvbSlotVerifyError::InvalidMetadata),
     }
 }
 
@@ -407,132 +530,18 @@ pub fn verify_payload(
     trusted_public_key: &[u8],
 ) -> Result<(), AvbSlotVerifyError> {
     let mut payload = Payload { kernel, initrd, trusted_public_key };
-    let requested_partitions = [PartitionName::Kernel.as_cstr()];
-    payload.verify_partitions(&requested_partitions)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use anyhow::Result;
-    use avb_bindgen::AvbFooter;
-    use std::{fs, mem::size_of};
-
-    const MICRODROID_KERNEL_IMG_PATH: &str = "microdroid_kernel";
-    const INITRD_NORMAL_IMG_PATH: &str = "microdroid_initrd_normal.img";
-    const TEST_IMG_WITH_ONE_HASHDESC_PATH: &str = "test_image_with_one_hashdesc.img";
-    const UNSIGNED_TEST_IMG_PATH: &str = "unsigned_test.img";
-
-    const PUBLIC_KEY_RSA2048_PATH: &str = "data/testkey_rsa2048_pub.bin";
-    const PUBLIC_KEY_RSA4096_PATH: &str = "data/testkey_rsa4096_pub.bin";
-    const RANDOM_FOOTER_POS: usize = 30;
-
-    /// This test uses the Microdroid payload compiled on the fly to check that
-    /// the latest payload can be verified successfully.
-    #[test]
-    fn latest_valid_payload_passes_verification() -> Result<()> {
-        let kernel = load_latest_signed_kernel()?;
-        let initrd_normal = fs::read(INITRD_NORMAL_IMG_PATH)?;
-        let public_key = fs::read(PUBLIC_KEY_RSA4096_PATH)?;
-
-        assert_eq!(Ok(()), verify_payload(&kernel, Some(&initrd_normal[..]), &public_key));
-        Ok(())
+    let kernel_verify_result = payload.verify_partition(PartitionName::Kernel.as_cstr())?;
+    let vbmeta_images = kernel_verify_result.vbmeta_images()?;
+    if vbmeta_images.len() != 1 {
+        // There can only be one VBMeta.
+        return Err(AvbSlotVerifyError::InvalidMetadata);
     }
-
-    #[test]
-    fn payload_expecting_no_initrd_passes_verification_with_no_initrd() -> Result<()> {
-        let kernel = fs::read(TEST_IMG_WITH_ONE_HASHDESC_PATH)?;
-        let public_key = fs::read(PUBLIC_KEY_RSA4096_PATH)?;
-
-        assert_eq!(Ok(()), verify_payload(&kernel, None, &public_key));
-        Ok(())
+    let vbmeta_image = vbmeta_images[0];
+    verify_vbmeta_is_from_kernel_partition(&vbmeta_image)?;
+    if payload.initrd.is_none() {
+        verify_vbmeta_has_no_initrd_descriptor(&vbmeta_image)?;
     }
-
-    // TODO(b/256148034): Test that kernel with two hashdesc and no initrd fails verification.
-    // e.g. payload_expecting_initrd_fails_verification_with_no_initrd
-
-    #[test]
-    fn payload_with_empty_public_key_fails_verification() -> Result<()> {
-        assert_payload_verification_fails(
-            &load_latest_signed_kernel()?,
-            &load_latest_initrd_normal()?,
-            /*trusted_public_key=*/ &[0u8; 0],
-            AvbSlotVerifyError::PublicKeyRejected,
-        )
-    }
-
-    #[test]
-    fn payload_with_an_invalid_public_key_fails_verification() -> Result<()> {
-        assert_payload_verification_fails(
-            &load_latest_signed_kernel()?,
-            &load_latest_initrd_normal()?,
-            /*trusted_public_key=*/ &[0u8; 512],
-            AvbSlotVerifyError::PublicKeyRejected,
-        )
-    }
-
-    #[test]
-    fn payload_with_a_different_valid_public_key_fails_verification() -> Result<()> {
-        assert_payload_verification_fails(
-            &load_latest_signed_kernel()?,
-            &load_latest_initrd_normal()?,
-            &fs::read(PUBLIC_KEY_RSA2048_PATH)?,
-            AvbSlotVerifyError::PublicKeyRejected,
-        )
-    }
-
-    #[test]
-    fn unsigned_kernel_fails_verification() -> Result<()> {
-        assert_payload_verification_fails(
-            &fs::read(UNSIGNED_TEST_IMG_PATH)?,
-            &load_latest_initrd_normal()?,
-            &fs::read(PUBLIC_KEY_RSA4096_PATH)?,
-            AvbSlotVerifyError::Io,
-        )
-    }
-
-    #[test]
-    fn tampered_kernel_fails_verification() -> Result<()> {
-        let mut kernel = load_latest_signed_kernel()?;
-        kernel[1] = !kernel[1]; // Flip the bits
-
-        assert_payload_verification_fails(
-            &kernel,
-            &load_latest_initrd_normal()?,
-            &fs::read(PUBLIC_KEY_RSA4096_PATH)?,
-            AvbSlotVerifyError::Verification,
-        )
-    }
-
-    #[test]
-    fn tampered_kernel_footer_fails_verification() -> Result<()> {
-        let mut kernel = load_latest_signed_kernel()?;
-        let avb_footer_index = kernel.len() - size_of::<AvbFooter>() + RANDOM_FOOTER_POS;
-        kernel[avb_footer_index] = !kernel[avb_footer_index];
-
-        assert_payload_verification_fails(
-            &kernel,
-            &load_latest_initrd_normal()?,
-            &fs::read(PUBLIC_KEY_RSA4096_PATH)?,
-            AvbSlotVerifyError::InvalidMetadata,
-        )
-    }
-
-    fn assert_payload_verification_fails(
-        kernel: &[u8],
-        initrd: &[u8],
-        trusted_public_key: &[u8],
-        expected_error: AvbSlotVerifyError,
-    ) -> Result<()> {
-        assert_eq!(Err(expected_error), verify_payload(kernel, Some(initrd), trusted_public_key));
-        Ok(())
-    }
-
-    fn load_latest_signed_kernel() -> Result<Vec<u8>> {
-        Ok(fs::read(MICRODROID_KERNEL_IMG_PATH)?)
-    }
-
-    fn load_latest_initrd_normal() -> Result<Vec<u8>> {
-        Ok(fs::read(INITRD_NORMAL_IMG_PATH)?)
-    }
+    // TODO(b/256148034): Check the vbmeta doesn't have hash descriptors other than
+    // boot, initrd_normal, initrd_debug.
+    Ok(())
 }
