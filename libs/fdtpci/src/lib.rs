@@ -23,7 +23,7 @@ use core::{
 };
 use libfdt::{AddressRange, Fdt, FdtError, FdtNode};
 use log::debug;
-use virtio_drivers::pci::bus::{Cam, PciRoot};
+use virtio_drivers::transport::pci::bus::{Cam, PciRoot};
 
 /// PCI MMIO configuration region size.
 const PCI_CFG_SIZE: usize = 0x100_0000;
@@ -91,7 +91,7 @@ impl Display for PciError {
 }
 
 /// Information about the PCI bus parsed from the device tree.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct PciInfo {
     /// The MMIO range used by the memory-mapped PCI CAM.
     pub cam_range: Range<usize>,

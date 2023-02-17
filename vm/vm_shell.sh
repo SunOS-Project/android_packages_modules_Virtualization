@@ -66,12 +66,16 @@ function handle_connect_cmd() {
     fi
 
     if [ ! -n "${selected_cid}" ]; then
-        PS3="Select CID of VM to adb-shell into: "
-        select cid in ${available_cids}
-        do
-            selected_cid=${cid}
-            break
-        done
+        if [ ${#selected_cid[@]} -eq 1 ]; then
+            selected_cid=${available_cids[0]}
+        else
+            PS3="Select CID of VM to adb-shell into: "
+            select cid in ${available_cids}
+            do
+                selected_cid=${cid}
+                break
+            done
+        fi
     fi
 
     if [[ ! " ${available_cids[*]} " =~ " ${selected_cid} " ]]; then
@@ -92,7 +96,8 @@ function handle_start_microdroid_cmd() {
         shift
     done
     if [[ "${auto_connect}" == true ]]; then
-        adb shell /apex/com.android.virt/bin/vm run-microdroid -d "${passthrough_args}"
+        adb shell /apex/com.android.virt/bin/vm run-microdroid "${passthrough_args}" &
+        trap "kill $!" EXIT
         sleep 2
         handle_connect_cmd
     else

@@ -16,7 +16,7 @@
 
 use android_system_virtualizationservice::{
     aidl::android::system::virtualizationservice::{
-        DiskImage::DiskImage, VirtualMachineConfig::VirtualMachineConfig,
+        CpuTopology::CpuTopology, DiskImage::DiskImage, VirtualMachineConfig::VirtualMachineConfig,
         VirtualMachineRawConfig::VirtualMachineRawConfig,
     },
     binder::{ParcelFileDescriptor, ProcessState},
@@ -50,7 +50,9 @@ fn test_run_example_vm() -> Result<(), Error> {
     // We need to start the thread pool for Binder to work properly, especially link_to_death.
     ProcessState::start_thread_pool();
 
-    let service = vmclient::connect().context("Failed to find VirtualizationService")?;
+    let virtmgr =
+        vmclient::VirtualizationService::new().context("Failed to spawn VirtualizationService")?;
+    let service = virtmgr.connect().context("Failed to connect to VirtualizationService")?;
 
     // Start example VM.
     let bootloader = ParcelFileDescriptor::new(
@@ -82,7 +84,7 @@ fn test_run_example_vm() -> Result<(), Error> {
         disks: vec![disk_image],
         protectedVm: false,
         memoryMib: 300,
-        numCpus: 1,
+        cpuTopology: CpuTopology::ONE_CPU,
         platformVersion: "~1.0".to_string(),
         taskProfiles: vec![],
     });

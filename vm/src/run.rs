@@ -16,6 +16,7 @@
 
 use crate::create_partition::command_create_partition;
 use android_system_virtualizationservice::aidl::android::system::virtualizationservice::{
+    CpuTopology::CpuTopology,
     IVirtualizationService::IVirtualizationService,
     PartitionType::PartitionType,
     VirtualMachineAppConfig::{DebugLevel::DebugLevel, Payload::Payload, VirtualMachineAppConfig},
@@ -25,6 +26,7 @@ use android_system_virtualizationservice::aidl::android::system::virtualizations
 };
 use anyhow::{anyhow, bail, Context, Error};
 use binder::ParcelFileDescriptor;
+use glob::glob;
 use microdroid_payload_config::VmPayloadConfig;
 use rand::{distributions::Alphanumeric, Rng};
 use std::fs;
@@ -32,7 +34,6 @@ use std::fs::File;
 use std::io;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use vmclient::{ErrorCode, VmInstance};
 use vmconfig::{open_parcel_file, VmConfig};
 use zip::ZipArchive;
@@ -48,14 +49,13 @@ pub fn command_run_app(
     storage: Option<&Path>,
     storage_size: Option<u64>,
     config_path: Option<String>,
-    payload_path: Option<String>,
-    daemonize: bool,
+    payload_binary_name: Option<String>,
     console_path: Option<&Path>,
     log_path: Option<&Path>,
     debug_level: DebugLevel,
     protected: bool,
     mem: Option<u32>,
-    cpus: Option<u32>,
+    cpu_topology: CpuTopology,
     task_profiles: Vec<String>,
     extra_idsigs: &[PathBuf],
 ) -> Result<(), Error> {
@@ -117,14 +117,16 @@ pub fn command_run_app(
     let extra_idsig_fds = extra_idsig_files?.into_iter().map(ParcelFileDescriptor::new).collect();
 
     let payload = if let Some(config_path) = config_path {
-        if payload_path.is_some() {
-            bail!("Only one of --config-path or --payload-path can be defined")
+        if payload_binary_name.is_some() {
+            bail!("Only one of --config-path or --payload-binary-name can be defined")
         }
         Payload::ConfigPath(config_path)
-    } else if let Some(payload_path) = payload_path {
-        Payload::PayloadConfig(VirtualMachinePayloadConfig { payloadPath: payload_path })
+    } else if let Some(payload_binary_name) = payload_binary_name {
+        Payload::PayloadConfig(VirtualMachinePayloadConfig {
+            payloadBinaryName: payload_binary_name,
+        })
     } else {
-        bail!("Either --config-path or --payload-path must be defined")
+        bail!("Either --config-path or --payload-binary-name must be defined")
     };
 
     let payload_config_str = format!("{:?}!{:?}", apk, payload);
@@ -140,24 +142,22 @@ pub fn command_run_app(
         debugLevel: debug_level,
         protectedVm: protected,
         memoryMib: mem.unwrap_or(0) as i32, // 0 means use the VM default
-        numCpus: cpus.unwrap_or(1) as i32,
+        cpuTopology: cpu_topology,
         taskProfiles: task_profiles,
     });
-    run(service, &config, &payload_config_str, daemonize, console_path, log_path)
+    run(service, &config, &payload_config_str, console_path, log_path)
 }
 
-const EMPTY_PAYLOAD_APK: &str = "com.android.microdroid.empty_payload";
-
 fn find_empty_payload_apk_path() -> Result<PathBuf, Error> {
-    let output = Command::new("/system/bin/pm")
-        .arg("path")
-        .arg(EMPTY_PAYLOAD_APK)
-        .output()
-        .context("failed to execute pm path")?;
-    let output_str = String::from_utf8(output.stdout).context("failed to parse output")?;
-    match output_str.strip_prefix("package:") {
-        None => Err(anyhow!("Unexpected output {}", output_str)),
-        Some(apk_path) => Ok(PathBuf::from(apk_path.trim())),
+    const GLOB_PATTERN: &str = "/apex/com.android.virt/app/**/EmptyPayloadApp.apk";
+    let mut entries: Vec<PathBuf> =
+        glob(GLOB_PATTERN).context("failed to glob")?.filter_map(|e| e.ok()).collect();
+    if entries.len() > 1 {
+        return Err(anyhow!("Found more than one apk matching {}", GLOB_PATTERN));
+    }
+    match entries.pop() {
+        Some(path) => Ok(path),
+        None => Err(anyhow!("No apks match {}", GLOB_PATTERN)),
     }
 }
 
@@ -178,18 +178,16 @@ pub fn command_run_microdroid(
     work_dir: Option<PathBuf>,
     storage: Option<&Path>,
     storage_size: Option<u64>,
-    daemonize: bool,
     console_path: Option<&Path>,
     log_path: Option<&Path>,
     debug_level: DebugLevel,
     protected: bool,
     mem: Option<u32>,
-    cpus: Option<u32>,
+    cpu_topology: CpuTopology,
     task_profiles: Vec<String>,
 ) -> Result<(), Error> {
-    let apk = find_empty_payload_apk_path()
-        .context(anyhow!("failed to find path for {} apk", EMPTY_PAYLOAD_APK))?;
-    println!("found path for {} apk: {}", EMPTY_PAYLOAD_APK, apk.display());
+    let apk = find_empty_payload_apk_path()?;
+    println!("found path {}", apk.display());
 
     let work_dir = work_dir.unwrap_or(create_work_dir()?);
     let idsig = work_dir.join("apk.idsig");
@@ -197,7 +195,7 @@ pub fn command_run_microdroid(
     let instance_img = work_dir.join("instance.img");
     println!("instance.img path: {}", instance_img.display());
 
-    let payload_path = "MicrodroidEmptyPayloadJniLib.so";
+    let payload_binary_name = "MicrodroidEmptyPayloadJniLib.so";
     let extra_sig = [];
     command_run_app(
         name,
@@ -208,14 +206,13 @@ pub fn command_run_microdroid(
         storage,
         storage_size,
         /* config_path= */ None,
-        Some(payload_path.to_owned()),
-        daemonize,
+        Some(payload_binary_name.to_owned()),
         console_path,
         log_path,
         debug_level,
         protected,
         mem,
-        cpus,
+        cpu_topology,
         task_profiles,
         &extra_sig,
     )
@@ -227,11 +224,10 @@ pub fn command_run(
     name: Option<String>,
     service: &dyn IVirtualizationService,
     config_path: &Path,
-    daemonize: bool,
     console_path: Option<&Path>,
     log_path: Option<&Path>,
     mem: Option<u32>,
-    cpus: Option<u32>,
+    cpu_topology: CpuTopology,
     task_profiles: Vec<String>,
 ) -> Result<(), Error> {
     let config_file = File::open(config_path).context("Failed to open config file")?;
@@ -240,20 +236,17 @@ pub fn command_run(
     if let Some(mem) = mem {
         config.memoryMib = mem as i32;
     }
-    if let Some(cpus) = cpus {
-        config.numCpus = cpus as i32;
-    }
     if let Some(name) = name {
         config.name = name;
     } else {
         config.name = String::from("VmRun");
     }
+    config.cpuTopology = cpu_topology;
     config.taskProfiles = task_profiles;
     run(
         service,
         &VirtualMachineConfig::RawConfig(config),
         &format!("{:?}", config_path),
-        daemonize,
         console_path,
         log_path,
     )
@@ -275,7 +268,6 @@ fn run(
     service: &dyn IVirtualizationService,
     config: &VirtualMachineConfig,
     payload_config: &str,
-    daemonize: bool,
     console_path: Option<&Path>,
     log_path: Option<&Path>,
 ) -> Result<(), Error> {
@@ -284,8 +276,6 @@ fn run(
             File::create(console_path)
                 .with_context(|| format!("Failed to open console file {:?}", console_path))?,
         )
-    } else if daemonize {
-        None
     } else {
         Some(duplicate_stdout()?)
     };
@@ -294,8 +284,6 @@ fn run(
             File::create(log_path)
                 .with_context(|| format!("Failed to open log file {:?}", log_path))?,
         )
-    } else if daemonize {
-        None
     } else {
         Some(duplicate_stdout()?)
     };
@@ -312,17 +300,10 @@ fn run(
         state_to_str(vm.state()?)
     );
 
-    if daemonize {
-        // Pass the VM reference back to VirtualizationService and have it hold it in the
-        // background.
-        service.debugHoldVmRef(&vm.vm).context("Failed to pass VM to VirtualizationService")?;
-    } else {
-        // Wait until the VM or VirtualizationService dies. If we just returned immediately then the
-        // IVirtualMachine Binder object would be dropped and the VM would be killed.
-        let death_reason = vm.wait_for_death();
-        println!("VM ended: {:?}", death_reason);
-    }
-
+    // Wait until the VM or VirtualizationService dies. If we just returned immediately then the
+    // IVirtualMachine Binder object would be dropped and the VM would be killed.
+    let death_reason = vm.wait_for_death();
+    println!("VM ended: {:?}", death_reason);
     Ok(())
 }
 

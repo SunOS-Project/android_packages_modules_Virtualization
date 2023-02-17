@@ -16,6 +16,13 @@
 
 #![cfg_attr(not(test), no_std)]
 
+mod descriptor;
+mod error;
+mod ops;
+mod partition;
+mod utils;
 mod verify;
 
-pub use verify::{verify_payload, AvbImageVerifyError};
+pub use descriptor::Digest;
+pub use error::AvbSlotVerifyError;
+pub use verify::{verify_payload, DebugLevel, VerifiedBootData};

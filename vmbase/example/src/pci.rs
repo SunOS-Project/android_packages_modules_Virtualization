@@ -15,13 +15,17 @@
 //! Functions to scan the PCI bus for VirtIO device.
 
 use aarch64_paging::paging::MemoryRegion;
-use alloc::alloc::{alloc, dealloc, Layout};
-use core::mem::size_of;
+use alloc::alloc::{alloc, dealloc, handle_alloc_error, Layout};
+use core::{mem::size_of, ptr::NonNull};
 use fdtpci::PciInfo;
 use log::{debug, info};
 use virtio_drivers::{
-    pci::{bus::PciRoot, virtio_device_type, PciTransport},
-    DeviceType, Hal, PhysAddr, Transport, VirtAddr, VirtIOBlk, PAGE_SIZE,
+    device::blk::VirtIOBlk,
+    transport::{
+        pci::{bus::PciRoot, virtio_device_type, PciTransport},
+        DeviceType, Transport,
+    },
+    BufferDirection, Hal, PhysAddr, PAGE_SIZE,
 };
 
 /// The standard sector size of a VirtIO block device, in bytes.
@@ -83,31 +87,44 @@ pub fn get_bar_region(pci_info: &PciInfo) -> MemoryRegion {
 struct HalImpl;
 
 impl Hal for HalImpl {
-    fn dma_alloc(pages: usize) -> PhysAddr {
+    fn dma_alloc(pages: usize, _direction: BufferDirection) -> (PhysAddr, NonNull<u8>) {
         debug!("dma_alloc: pages={}", pages);
         let layout = Layout::from_size_align(pages * PAGE_SIZE, PAGE_SIZE).unwrap();
         // Safe because the layout has a non-zero size.
-        let vaddr = unsafe { alloc(layout) } as VirtAddr;
-        Self::virt_to_phys(vaddr)
+        let vaddr = unsafe { alloc(layout) };
+        let vaddr =
+            if let Some(vaddr) = NonNull::new(vaddr) { vaddr } else { handle_alloc_error(layout) };
+        let paddr = virt_to_phys(vaddr);
+        (paddr, vaddr)
     }
 
-    fn dma_dealloc(paddr: PhysAddr, pages: usize) -> i32 {
+    fn dma_dealloc(paddr: PhysAddr, vaddr: NonNull<u8>, pages: usize) -> i32 {
         debug!("dma_dealloc: paddr={:#x}, pages={}", paddr, pages);
-        let vaddr = Self::phys_to_virt(paddr);
         let layout = Layout::from_size_align(pages * PAGE_SIZE, PAGE_SIZE).unwrap();
         // Safe because the memory was allocated by `dma_alloc` above using the same allocator, and
         // the layout is the same as was used then.
         unsafe {
-            dealloc(vaddr as *mut u8, layout);
+            dealloc(vaddr.as_ptr(), layout);
         }
         0
     }
 
-    fn phys_to_virt(paddr: PhysAddr) -> VirtAddr {
-        paddr
+    fn mmio_phys_to_virt(paddr: PhysAddr, _size: usize) -> NonNull<u8> {
+        NonNull::new(paddr as _).unwrap()
     }
 
-    fn virt_to_phys(vaddr: VirtAddr) -> PhysAddr {
-        vaddr
+    fn share(buffer: NonNull<[u8]>, _direction: BufferDirection) -> PhysAddr {
+        let vaddr = buffer.cast();
+        // Nothing to do, as the host already has access to all memory.
+        virt_to_phys(vaddr)
     }
+
+    fn unshare(_paddr: PhysAddr, _buffer: NonNull<[u8]>, _direction: BufferDirection) {
+        // Nothing to do, as the host already has access to all memory and we didn't copy the buffer
+        // anywhere else.
+    }
+}
+
+fn virt_to_phys(vaddr: NonNull<u8>) -> PhysAddr {
+    vaddr.as_ptr() as _
 }

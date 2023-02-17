@@ -16,7 +16,6 @@
 //! to a bare-metal environment.
 
 #![no_std]
-#![feature(let_else)] // Stabilized in 1.65.0
 
 mod iterators;
 
@@ -389,6 +388,23 @@ impl<'a> FdtNodeMut<'a> {
         fdt_err_expect_zero(ret)
     }
 
+    /// Create or change a property name-value pair to the given node.
+    pub fn setprop(&mut self, name: &CStr, value: &[u8]) -> Result<()> {
+        // SAFETY - New value size is constrained to the DT totalsize
+        //          (validated by underlying libfdt).
+        let ret = unsafe {
+            libfdt_bindgen::fdt_setprop(
+                self.fdt.as_mut_ptr(),
+                self.offset,
+                name.as_ptr(),
+                value.as_ptr().cast::<c_void>(),
+                value.len().try_into().map_err(|_| FdtError::BadValue)?,
+            )
+        };
+
+        fdt_err_expect_zero(ret)
+    }
+
     /// Get reference to the containing device tree.
     pub fn fdt(&mut self) -> &mut Fdt {
         self.fdt
@@ -508,6 +524,19 @@ impl Fdt {
         fdt_err_expect_zero(ret)
     }
 
+    /// Applies a DT overlay on the base DT.
+    ///
+    /// # Safety
+    ///
+    /// On failure, the library corrupts the DT and overlay so both must be discarded.
+    pub unsafe fn apply_overlay<'a>(&'a mut self, overlay: &'a mut Fdt) -> Result<&'a mut Self> {
+        fdt_err_expect_zero(libfdt_bindgen::fdt_overlay_apply(
+            self.as_mut_ptr(),
+            overlay.as_mut_ptr(),
+        ))?;
+        Ok(self)
+    }
+
     /// Return an iterator of memory banks specified the "/memory" node.
     ///
     /// NOTE: This does not support individual "/memory@XXXX" banks.
@@ -557,6 +586,11 @@ impl Fdt {
         Ok(self.path_offset(path)?.map(|offset| FdtNodeMut { fdt: self, offset }))
     }
 
+    /// Return the device tree as a slice (may be smaller than the containing buffer).
+    pub fn as_slice(&self) -> &[u8] {
+        &self.buffer[..self.totalsize()]
+    }
+
     fn path_offset(&self, path: &CStr) -> Result<Option<c_int>> {
         let len = path.to_bytes().len().try_into().map_err(|_| FdtError::BadPath)?;
         // SAFETY - Accesses are constrained to the DT totalsize (validated by ctor) and the
@@ -590,5 +624,14 @@ impl Fdt {
 
     fn capacity(&self) -> usize {
         self.buffer.len()
+    }
+
+    fn header(&self) -> &libfdt_bindgen::fdt_header {
+        // SAFETY - A valid FDT (verified by constructor) must contain a valid fdt_header.
+        unsafe { &*(&self as *const _ as *const libfdt_bindgen::fdt_header) }
+    }
+
+    fn totalsize(&self) -> usize {
+        u32::from_be(self.header().totalsize) as usize
     }
 }

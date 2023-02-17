@@ -40,6 +40,7 @@ import static android.system.virtualmachine.VirtualMachineCallback.STOP_REASON_R
 import static android.system.virtualmachine.VirtualMachineCallback.STOP_REASON_SHUTDOWN;
 import static android.system.virtualmachine.VirtualMachineCallback.STOP_REASON_START_FAILED;
 import static android.system.virtualmachine.VirtualMachineCallback.STOP_REASON_UNKNOWN;
+import static android.system.virtualmachine.VirtualMachineCallback.STOP_REASON_VIRTUALIZATION_SERVICE_DIED;
 
 import static java.util.Objects.requireNonNull;
 
@@ -60,7 +61,6 @@ import android.os.Binder;
 import android.os.IBinder;
 import android.os.ParcelFileDescriptor;
 import android.os.RemoteException;
-import android.os.ServiceManager;
 import android.os.ServiceSpecificException;
 import android.system.virtualizationcommon.DeathReason;
 import android.system.virtualizationcommon.ErrorCode;
@@ -163,7 +163,7 @@ public class VirtualMachine implements AutoCloseable {
     })
     public @interface Status {}
 
-     /** The virtual machine has just been created, or {@link #stop()} was called on it. */
+    /** The virtual machine has just been created, or {@link #stop} was called on it. */
     public static final int STATUS_STOPPED = 0;
 
     /** The virtual machine is running. */
@@ -192,9 +192,6 @@ public class VirtualMachine implements AutoCloseable {
 
     /** Name of the idsig files for extra APKs. */
     private static final String EXTRA_IDSIG_FILE_PREFIX = "extra_idsig_";
-
-    /** Name of the virtualization service. */
-    private static final String SERVICE_NAME = "android.system.virtualizationservice";
 
     /** Size of the instance image. 10 MB. */
     private static final long INSTANCE_FILE_SIZE = 10 * 1024 * 1024;
@@ -279,6 +276,9 @@ public class VirtualMachine implements AutoCloseable {
         }
     }
 
+    /** Running instance of virtmgr that hosts VirtualizationService for this VM. */
+    @NonNull private final VirtualizationService mVirtualizationService;
+
     @NonNull private final MemoryManagementCallbacks mMemoryManagementCallbacks;
 
     @NonNull private final Context mContext;
@@ -294,6 +294,7 @@ public class VirtualMachine implements AutoCloseable {
     /** Lock protecting callbacks. */
     private final Object mCallbackLock = new Object();
 
+    private final boolean mVmOutputCaptured;
 
     /** The configuration that is currently associated with this VM. */
     @GuardedBy("mLock")
@@ -349,11 +350,15 @@ public class VirtualMachine implements AutoCloseable {
     }
 
     private VirtualMachine(
-            @NonNull Context context, @NonNull String name, @NonNull VirtualMachineConfig config)
+            @NonNull Context context,
+            @NonNull String name,
+            @NonNull VirtualMachineConfig config,
+            @NonNull VirtualizationService service)
             throws VirtualMachineException {
         mPackageName = context.getPackageName();
         mName = requireNonNull(name, "Name must not be null");
         mConfig = requireNonNull(config, "Config must not be null");
+        mVirtualizationService = service;
 
         File thisVmDir = getVmDir(context, mName);
         mVmRootPath = thisVmDir;
@@ -367,10 +372,12 @@ public class VirtualMachine implements AutoCloseable {
                 (config.isEncryptedStorageEnabled())
                         ? new File(thisVmDir, ENCRYPTED_STORE_FILE)
                         : null;
+
+        mVmOutputCaptured = config.isVmOutputCaptured();
     }
 
     /**
-     * Builds a virtual machine from an {@link VirtualMachineDescriptor} object and associates it
+     * Creates a virtual machine from an {@link VirtualMachineDescriptor} object and associates it
      * with the given name.
      *
      * <p>The new virtual machine will be in the same state as the descriptor indicates.
@@ -386,26 +393,29 @@ public class VirtualMachine implements AutoCloseable {
             @NonNull String name,
             @NonNull VirtualMachineDescriptor vmDescriptor)
             throws VirtualMachineException {
-        VirtualMachineConfig config = VirtualMachineConfig.from(vmDescriptor.getConfigFd());
         File vmDir = createVmDir(context, name);
         try {
-            VirtualMachine vm = new VirtualMachine(context, name, config);
-            config.serialize(vm.mConfigFilePath);
-            try {
-                vm.mInstanceFilePath.createNewFile();
-            } catch (IOException e) {
-                throw new VirtualMachineException("failed to create instance image", e);
-            }
-            vm.importInstanceFrom(vmDescriptor.getInstanceImgFd());
-
-            if (vmDescriptor.getEncryptedStoreFd() != null) {
+            VirtualMachine vm;
+            try (vmDescriptor) {
+                VirtualMachineConfig config = VirtualMachineConfig.from(vmDescriptor.getConfigFd());
+                vm = new VirtualMachine(context, name, config, VirtualizationService.getInstance());
+                config.serialize(vm.mConfigFilePath);
                 try {
-                    vm.mEncryptedStoreFilePath.createNewFile();
+                    vm.mInstanceFilePath.createNewFile();
                 } catch (IOException e) {
-                    throw new VirtualMachineException(
-                            "failed to create encrypted storage image", e);
+                    throw new VirtualMachineException("failed to create instance image", e);
                 }
-                vm.importEncryptedStoreFrom(vmDescriptor.getEncryptedStoreFd());
+                vm.importInstanceFrom(vmDescriptor.getInstanceImgFd());
+
+                if (vmDescriptor.getEncryptedStoreFd() != null) {
+                    try {
+                        vm.mEncryptedStoreFilePath.createNewFile();
+                    } catch (IOException e) {
+                        throw new VirtualMachineException(
+                                "failed to create encrypted storage image", e);
+                    }
+                    vm.importEncryptedStoreFrom(vmDescriptor.getEncryptedStoreFd());
+                }
             }
             return vm;
         } catch (VirtualMachineException | RuntimeException e) {
@@ -432,7 +442,8 @@ public class VirtualMachine implements AutoCloseable {
         File vmDir = createVmDir(context, name);
 
         try {
-            VirtualMachine vm = new VirtualMachine(context, name, config);
+            VirtualMachine vm =
+                    new VirtualMachine(context, name, config, VirtualizationService.getInstance());
             config.serialize(vm.mConfigFilePath);
             try {
                 vm.mInstanceFilePath.createNewFile();
@@ -448,9 +459,7 @@ public class VirtualMachine implements AutoCloseable {
                 }
             }
 
-            IVirtualizationService service =
-                    IVirtualizationService.Stub.asInterface(
-                            ServiceManager.waitForService(SERVICE_NAME));
+            IVirtualizationService service = vm.mVirtualizationService.connect();
 
             try {
                 service.initializeWritablePartition(
@@ -469,7 +478,7 @@ public class VirtualMachine implements AutoCloseable {
                 try {
                     service.initializeWritablePartition(
                             ParcelFileDescriptor.open(vm.mEncryptedStoreFilePath, MODE_READ_WRITE),
-                            config.getEncryptedStorageKib() * 1024L,
+                            config.getEncryptedStorageBytes(),
                             PartitionType.ENCRYPTEDSTORE);
                 } catch (FileNotFoundException e) {
                     throw new VirtualMachineException("encrypted storage image missing", e);
@@ -504,7 +513,8 @@ public class VirtualMachine implements AutoCloseable {
         }
         File configFilePath = new File(thisVmDir, CONFIG_FILE);
         VirtualMachineConfig config = VirtualMachineConfig.from(configFilePath);
-        VirtualMachine vm = new VirtualMachine(context, name, config);
+        VirtualMachine vm =
+                new VirtualMachine(context, name, config, VirtualizationService.getInstance());
 
         if (!vm.mInstanceFilePath.exists()) {
             throw new VirtualMachineException("instance image missing");
@@ -580,8 +590,7 @@ public class VirtualMachine implements AutoCloseable {
      * Returns the currently selected config of this virtual machine. There can be multiple virtual
      * machines sharing the same config. Even in that case, the virtual machines are completely
      * isolated from each other; they have different secrets. It is also possible that a virtual
-     * machine can change its config, which can be done by calling {@link
-     * #setConfig(VirtualMachineConfig)}.
+     * machine can change its config, which can be done by calling {@link #setConfig}.
      *
      * <p>NOTE: This method may block and should not be called on the main thread.
      *
@@ -614,15 +623,26 @@ public class VirtualMachine implements AutoCloseable {
             }
             virtualMachine = mVirtualMachine;
         }
+
+        int status;
         if (virtualMachine == null) {
-            return mVmRootPath.exists() ? STATUS_STOPPED : STATUS_DELETED;
+            status = STATUS_STOPPED;
         } else {
             try {
-                return stateToStatus(virtualMachine.getState());
+                status = stateToStatus(virtualMachine.getState());
             } catch (RemoteException e) {
                 throw e.rethrowAsRuntimeException();
             }
         }
+        if (status == STATUS_STOPPED && !mVmRootPath.exists()) {
+            // A VM can quite happily keep running if its backing files have been deleted.
+            // But once it stops, it's gone forever.
+            synchronized (mLock) {
+                dropVm();
+            }
+            return STATUS_DELETED;
+        }
+        return status;
     }
 
     private int stateToStatus(@VirtualMachineState int state) {
@@ -740,8 +760,7 @@ public class VirtualMachine implements AutoCloseable {
     /**
      * Runs this virtual machine. The returning of this method however doesn't mean that the VM has
      * actually started running or the OS has booted there. Such events can be notified by
-     * registering a callback using {@link #setCallback(Executor, VirtualMachineCallback)} before
-     * calling {@code run()}.
+     * registering a callback using {@link #setCallback} before calling {@code run()}.
      *
      * <p>NOTE: This method may block and should not be called on the main thread.
      *
@@ -763,110 +782,66 @@ public class VirtualMachine implements AutoCloseable {
                 }
             } catch (IOException e) {
                 // If the file already exists, exception is not thrown.
-                throw new VirtualMachineException("failed to create idsig file", e);
+                throw new VirtualMachineException("Failed to create APK signature file", e);
             }
 
-            IVirtualizationService service =
-                    IVirtualizationService.Stub.asInterface(
-                            ServiceManager.waitForService(SERVICE_NAME));
+            IVirtualizationService service = mVirtualizationService.connect();
 
             try {
-                createVmPipes();
+                if (mVmOutputCaptured) {
+                    createVmPipes();
+                }
 
-                VirtualMachineAppConfig appConfig = getConfig().toVsConfig();
+                VirtualMachineAppConfig appConfig =
+                        getConfig().toVsConfig(mContext.getPackageManager());
                 appConfig.name = mName;
 
-                // Fill the idsig file by hashing the apk
-                service.createOrUpdateIdsigFile(
-                        appConfig.apk, ParcelFileDescriptor.open(mIdsigFilePath, MODE_READ_WRITE));
-
-                for (ExtraApkSpec extraApk : mExtraApks) {
-                    service.createOrUpdateIdsigFile(
-                            ParcelFileDescriptor.open(extraApk.apk, MODE_READ_ONLY),
-                            ParcelFileDescriptor.open(extraApk.idsig, MODE_READ_WRITE));
+                try {
+                    createIdSigs(service, appConfig);
+                } catch (FileNotFoundException e) {
+                    throw new VirtualMachineException("Failed to generate APK signature", e);
                 }
-
-                // Re-open idsig file in read-only mode
-                appConfig.idsig = ParcelFileDescriptor.open(mIdsigFilePath, MODE_READ_ONLY);
-                appConfig.instanceImage =
-                        ParcelFileDescriptor.open(mInstanceFilePath, MODE_READ_WRITE);
-                if (mEncryptedStoreFilePath != null) {
-                    appConfig.encryptedStorageImage =
-                            ParcelFileDescriptor.open(mEncryptedStoreFilePath, MODE_READ_WRITE);
-                }
-                List<ParcelFileDescriptor> extraIdsigs = new ArrayList<>();
-                for (ExtraApkSpec extraApk : mExtraApks) {
-                    extraIdsigs.add(ParcelFileDescriptor.open(extraApk.idsig, MODE_READ_ONLY));
-                }
-                appConfig.extraIdsigs = extraIdsigs;
 
                 android.system.virtualizationservice.VirtualMachineConfig vmConfigParcel =
                         android.system.virtualizationservice.VirtualMachineConfig.appConfig(
                                 appConfig);
 
-                // The VM should only be observed to die once
-                AtomicBoolean onDiedCalled = new AtomicBoolean(false);
-
-                IBinder.DeathRecipient deathRecipient = () -> {
-                    if (onDiedCalled.compareAndSet(false, true)) {
-                        executeCallback((cb) -> cb.onStopped(VirtualMachine.this,
-                                VirtualMachineCallback.STOP_REASON_VIRTUALIZATION_SERVICE_DIED));
-                    }
-                };
-
                 mVirtualMachine = service.createVm(vmConfigParcel, mConsoleWriter, mLogWriter);
-                mVirtualMachine.registerCallback(
-                        new IVirtualMachineCallback.Stub() {
-                            @Override
-                            public void onPayloadStarted(int cid) {
-                                executeCallback((cb) -> cb.onPayloadStarted(VirtualMachine.this));
-                            }
-
-                            @Override
-                            public void onPayloadReady(int cid) {
-                                executeCallback((cb) -> cb.onPayloadReady(VirtualMachine.this));
-                            }
-
-                            @Override
-                            public void onPayloadFinished(int cid, int exitCode) {
-                                executeCallback(
-                                        (cb) ->
-                                                cb.onPayloadFinished(
-                                                        VirtualMachine.this, exitCode));
-                            }
-
-                            @Override
-                            public void onError(int cid, int errorCode, String message) {
-                                int translatedError = getTranslatedError(errorCode);
-                                executeCallback(
-                                        (cb) ->
-                                                cb.onError(
-                                                        VirtualMachine.this,
-                                                        translatedError,
-                                                        message));
-                            }
-
-                            @Override
-                            public void onDied(int cid, int reason) {
-                                service.asBinder().unlinkToDeath(deathRecipient, 0);
-                                int translatedReason = getTranslatedReason(reason);
-                                if (onDiedCalled.compareAndSet(false, true)) {
-                                    executeCallback(
-                                            (cb) ->
-                                                    cb.onStopped(
-                                                            VirtualMachine.this, translatedReason));
-                                }
-                            }
-                        });
+                mVirtualMachine.registerCallback(new CallbackTranslator(service));
                 mContext.registerComponentCallbacks(mMemoryManagementCallbacks);
-                service.asBinder().linkToDeath(deathRecipient, 0);
                 mVirtualMachine.start();
-            } catch (IOException | IllegalStateException | ServiceSpecificException e) {
+            } catch (IllegalStateException | ServiceSpecificException e) {
                 throw new VirtualMachineException(e);
             } catch (RemoteException e) {
                 throw e.rethrowAsRuntimeException();
             }
         }
+    }
+
+    private void createIdSigs(IVirtualizationService service, VirtualMachineAppConfig appConfig)
+            throws RemoteException, FileNotFoundException {
+        // Fill the idsig file by hashing the apk
+        service.createOrUpdateIdsigFile(
+                appConfig.apk, ParcelFileDescriptor.open(mIdsigFilePath, MODE_READ_WRITE));
+
+        for (ExtraApkSpec extraApk : mExtraApks) {
+            service.createOrUpdateIdsigFile(
+                    ParcelFileDescriptor.open(extraApk.apk, MODE_READ_ONLY),
+                    ParcelFileDescriptor.open(extraApk.idsig, MODE_READ_WRITE));
+        }
+
+        // Re-open idsig files in read-only mode
+        appConfig.idsig = ParcelFileDescriptor.open(mIdsigFilePath, MODE_READ_ONLY);
+        appConfig.instanceImage = ParcelFileDescriptor.open(mInstanceFilePath, MODE_READ_WRITE);
+        if (mEncryptedStoreFilePath != null) {
+            appConfig.encryptedStorageImage =
+                    ParcelFileDescriptor.open(mEncryptedStoreFilePath, MODE_READ_WRITE);
+        }
+        List<ParcelFileDescriptor> extraIdsigs = new ArrayList<>();
+        for (ExtraApkSpec extraApk : mExtraApks) {
+            extraIdsigs.add(ParcelFileDescriptor.open(extraApk.idsig, MODE_READ_ONLY));
+        }
+        appConfig.extraIdsigs = extraIdsigs;
     }
 
     @GuardedBy("mLock")
@@ -889,17 +864,26 @@ public class VirtualMachine implements AutoCloseable {
     }
 
     /**
-     * Returns the stream object representing the console output from the virtual machine.
+     * Returns the stream object representing the console output from the virtual machine. The
+     * console output is only available if the {@link VirtualMachineConfig} specifies that it should
+     * be {@linkplain VirtualMachineConfig#isVmOutputCaptured captured}.
+     *
+     * <p>If you turn on output capture, you must consume data from {@code getConsoleOutput} -
+     * because otherwise the code in the VM may get blocked when the pipe buffer fills up.
      *
      * <p>NOTE: This method may block and should not be called on the main thread.
      *
-     * @throws VirtualMachineException if the stream could not be created.
+     * @throws VirtualMachineException if the stream could not be created, or capturing is turned
+     *     off.
      * @hide
      */
     @SystemApi
     @WorkerThread
     @NonNull
     public InputStream getConsoleOutput() throws VirtualMachineException {
+        if (!mVmOutputCaptured) {
+            throw new VirtualMachineException("Capturing vm outputs is turned off");
+        }
         synchronized (mLock) {
             createVmPipes();
             return new FileInputStream(mConsoleReader.getFileDescriptor());
@@ -907,17 +891,26 @@ public class VirtualMachine implements AutoCloseable {
     }
 
     /**
-     * Returns the stream object representing the log output from the virtual machine.
+     * Returns the stream object representing the log output from the virtual machine. The log
+     * output is only available if the VirtualMachineConfig specifies that it should be {@linkplain
+     * VirtualMachineConfig#isVmOutputCaptured captured}.
+     *
+     * <p>If you turn on output capture, you must consume data from {@code getLogOutput} - because
+     * otherwise the code in the VM may get blocked when the pipe buffer fills up.
      *
      * <p>NOTE: This method may block and should not be called on the main thread.
      *
-     * @throws VirtualMachineException if the stream could not be created.
+     * @throws VirtualMachineException if the stream could not be created, or capturing is turned
+     *     off.
      * @hide
      */
     @SystemApi
     @WorkerThread
     @NonNull
     public InputStream getLogOutput() throws VirtualMachineException {
+        if (!mVmOutputCaptured) {
+            throw new VirtualMachineException("Capturing vm outputs is turned off");
+        }
         synchronized (mLock) {
             createVmPipes();
             return new FileInputStream(mLogReader.getFileDescriptor());
@@ -927,7 +920,15 @@ public class VirtualMachine implements AutoCloseable {
     /**
      * Stops this virtual machine. Stopping a virtual machine is like pulling the plug on a real
      * computer; the machine halts immediately. Software running on the virtual machine is not
-     * notified of the event. A stopped virtual machine can be re-started by calling {@link #run()}.
+     * notified of the event. Writes to {@linkplain
+     * VirtualMachineConfig.Builder#setEncryptedStorageBytes encrypted storage} might not be
+     * persisted, and the instance might be left in an inconsistent state.
+     *
+     * <p>For a graceful shutdown, you could request the payload to call {@code exit()}, e.g. via a
+     * {@linkplain #connectToVsockServer binder request}, and wait for {@link
+     * VirtualMachineCallback#onPayloadFinished} to be called.
+     *
+     * <p>A stopped virtual machine can be re-started by calling {@link #run()}.
      *
      * <p>NOTE: This method may block and should not be called on the main thread.
      *
@@ -1010,8 +1011,8 @@ public class VirtualMachine implements AutoCloseable {
      * like the number of CPU and size of the RAM, depending on the situation (e.g. the size of the
      * application to run on the virtual machine, etc.)
      *
-     * <p>The new config must be {@link VirtualMachineConfig#isCompatibleWith compatible with} the
-     * existing config.
+     * <p>The new config must be {@linkplain VirtualMachineConfig#isCompatibleWith compatible with}
+     * the existing config.
      *
      * <p>NOTE: This method may block and should not be called on the main thread.
      *
@@ -1047,8 +1048,8 @@ public class VirtualMachine implements AutoCloseable {
     /**
      * Connect to a VM's binder service via vsock and return the root IBinder object. Guest VMs are
      * expected to set up vsock servers in their payload. After the host app receives the {@link
-     * VirtualMachineCallback#onPayloadReady(VirtualMachine)}, it can use this method to establish a
-     * connection to the guest VM.
+     * VirtualMachineCallback#onPayloadReady}, it can use this method to establish a connection to
+     * the guest VM.
      *
      * <p>NOTE: This method may block and should not be called on the main thread.
      *
@@ -1075,6 +1076,8 @@ public class VirtualMachine implements AutoCloseable {
 
     /**
      * Opens a vsock connection to the VM on the given port.
+     *
+     * <p>The caller is responsible for closing the returned {@code ParcelFileDescriptor}.
      *
      * <p>NOTE: This method may block and should not be called on the main thread.
      *
@@ -1154,75 +1157,19 @@ public class VirtualMachine implements AutoCloseable {
         }
     }
 
-    @VirtualMachineCallback.ErrorCode
-    private int getTranslatedError(int reason) {
-        switch (reason) {
-            case ErrorCode.PAYLOAD_VERIFICATION_FAILED:
-                return ERROR_PAYLOAD_VERIFICATION_FAILED;
-            case ErrorCode.PAYLOAD_CHANGED:
-                return ERROR_PAYLOAD_CHANGED;
-            case ErrorCode.PAYLOAD_CONFIG_INVALID:
-                return ERROR_PAYLOAD_INVALID_CONFIG;
-            default:
-                return ERROR_UNKNOWN;
-        }
-    }
-
-    @VirtualMachineCallback.StopReason
-    private int getTranslatedReason(int reason) {
-        switch (reason) {
-            case DeathReason.INFRASTRUCTURE_ERROR:
-                return STOP_REASON_INFRASTRUCTURE_ERROR;
-            case DeathReason.KILLED:
-                return STOP_REASON_KILLED;
-            case DeathReason.SHUTDOWN:
-                return STOP_REASON_SHUTDOWN;
-            case DeathReason.START_FAILED:
-                return STOP_REASON_START_FAILED;
-            case DeathReason.REBOOT:
-                return STOP_REASON_REBOOT;
-            case DeathReason.CRASH:
-                return STOP_REASON_CRASH;
-            case DeathReason.PVM_FIRMWARE_PUBLIC_KEY_MISMATCH:
-                return STOP_REASON_PVM_FIRMWARE_PUBLIC_KEY_MISMATCH;
-            case DeathReason.PVM_FIRMWARE_INSTANCE_IMAGE_CHANGED:
-                return STOP_REASON_PVM_FIRMWARE_INSTANCE_IMAGE_CHANGED;
-            case DeathReason.BOOTLOADER_PUBLIC_KEY_MISMATCH:
-                return STOP_REASON_BOOTLOADER_PUBLIC_KEY_MISMATCH;
-            case DeathReason.BOOTLOADER_INSTANCE_IMAGE_CHANGED:
-                return STOP_REASON_BOOTLOADER_INSTANCE_IMAGE_CHANGED;
-            case DeathReason.MICRODROID_FAILED_TO_CONNECT_TO_VIRTUALIZATION_SERVICE:
-                return STOP_REASON_MICRODROID_FAILED_TO_CONNECT_TO_VIRTUALIZATION_SERVICE;
-            case DeathReason.MICRODROID_PAYLOAD_HAS_CHANGED:
-                return STOP_REASON_MICRODROID_PAYLOAD_HAS_CHANGED;
-            case DeathReason.MICRODROID_PAYLOAD_VERIFICATION_FAILED:
-                return STOP_REASON_MICRODROID_PAYLOAD_VERIFICATION_FAILED;
-            case DeathReason.MICRODROID_INVALID_PAYLOAD_CONFIG:
-                return STOP_REASON_MICRODROID_INVALID_PAYLOAD_CONFIG;
-            case DeathReason.MICRODROID_UNKNOWN_RUNTIME_ERROR:
-                return STOP_REASON_MICRODROID_UNKNOWN_RUNTIME_ERROR;
-            case DeathReason.HANGUP:
-                return STOP_REASON_HANGUP;
-            default:
-                return STOP_REASON_UNKNOWN;
-        }
-    }
-
     @Override
     public String toString() {
         VirtualMachineConfig config = getConfig();
         String payloadConfigPath = config.getPayloadConfigPath();
-        String payloadBinaryPath = config.getPayloadBinaryPath();
+        String payloadBinaryName = config.getPayloadBinaryName();
 
         StringBuilder result = new StringBuilder();
         result.append("VirtualMachine(")
                 .append("name:")
                 .append(getName())
                 .append(", ");
-        if (payloadBinaryPath != null) {
-            result.append("payload:")
-                    .append(payloadBinaryPath)
-                    .append(", ");
+        if (payloadBinaryName != null) {
+            result.append("payload:").append(payloadBinaryName).append(", ");
         }
         if (payloadConfigPath != null) {
             result.append("config:")
@@ -1282,8 +1229,7 @@ public class VirtualMachine implements AutoCloseable {
         if (configPath == null) {
             return Collections.emptyList();
         }
-        try {
-            ZipFile zipFile = new ZipFile(context.getPackageCodePath());
+        try (ZipFile zipFile = new ZipFile(context.getPackageCodePath())) {
             InputStream inputStream =
                     zipFile.getInputStream(zipFile.getEntry(configPath));
             List<String> apkList =
@@ -1321,6 +1267,109 @@ public class VirtualMachine implements AutoCloseable {
             storeOutput.transferFrom(storeInput, /*position=*/ 0, storeInput.size());
         } catch (IOException e) {
             throw new VirtualMachineException("failed to transfer encryptedstore image", e);
+        }
+    }
+
+    /** Map the raw AIDL (& binder) callbacks to what the client expects. */
+    private class CallbackTranslator extends IVirtualMachineCallback.Stub {
+        private final IVirtualizationService mService;
+        private final DeathRecipient mDeathRecipient;
+
+        // The VM should only be observed to die once
+        private final AtomicBoolean mOnDiedCalled = new AtomicBoolean(false);
+
+        public CallbackTranslator(IVirtualizationService service) throws RemoteException {
+            this.mService = service;
+            this.mDeathRecipient = () -> reportStopped(STOP_REASON_VIRTUALIZATION_SERVICE_DIED);
+            service.asBinder().linkToDeath(mDeathRecipient, 0);
+        }
+
+        @Override
+        public void onPayloadStarted(int cid) {
+            executeCallback((cb) -> cb.onPayloadStarted(VirtualMachine.this));
+        }
+
+        @Override
+        public void onPayloadReady(int cid) {
+            executeCallback((cb) -> cb.onPayloadReady(VirtualMachine.this));
+        }
+
+        @Override
+        public void onPayloadFinished(int cid, int exitCode) {
+            executeCallback((cb) -> cb.onPayloadFinished(VirtualMachine.this, exitCode));
+        }
+
+        @Override
+        public void onError(int cid, int errorCode, String message) {
+            int translatedError = getTranslatedError(errorCode);
+            executeCallback((cb) -> cb.onError(VirtualMachine.this, translatedError, message));
+        }
+
+        @Override
+        public void onDied(int cid, int reason) {
+            int translatedReason = getTranslatedReason(reason);
+            reportStopped(translatedReason);
+            mService.asBinder().unlinkToDeath(mDeathRecipient, 0);
+        }
+
+        private void reportStopped(@VirtualMachineCallback.StopReason int reason) {
+            if (mOnDiedCalled.compareAndSet(false, true)) {
+                executeCallback((cb) -> cb.onStopped(VirtualMachine.this, reason));
+            }
+        }
+
+        @VirtualMachineCallback.ErrorCode
+        private int getTranslatedError(int reason) {
+            switch (reason) {
+                case ErrorCode.PAYLOAD_VERIFICATION_FAILED:
+                    return ERROR_PAYLOAD_VERIFICATION_FAILED;
+                case ErrorCode.PAYLOAD_CHANGED:
+                    return ERROR_PAYLOAD_CHANGED;
+                case ErrorCode.PAYLOAD_CONFIG_INVALID:
+                    return ERROR_PAYLOAD_INVALID_CONFIG;
+                default:
+                    return ERROR_UNKNOWN;
+            }
+        }
+
+        @VirtualMachineCallback.StopReason
+        private int getTranslatedReason(int reason) {
+            switch (reason) {
+                case DeathReason.INFRASTRUCTURE_ERROR:
+                    return STOP_REASON_INFRASTRUCTURE_ERROR;
+                case DeathReason.KILLED:
+                    return STOP_REASON_KILLED;
+                case DeathReason.SHUTDOWN:
+                    return STOP_REASON_SHUTDOWN;
+                case DeathReason.START_FAILED:
+                    return STOP_REASON_START_FAILED;
+                case DeathReason.REBOOT:
+                    return STOP_REASON_REBOOT;
+                case DeathReason.CRASH:
+                    return STOP_REASON_CRASH;
+                case DeathReason.PVM_FIRMWARE_PUBLIC_KEY_MISMATCH:
+                    return STOP_REASON_PVM_FIRMWARE_PUBLIC_KEY_MISMATCH;
+                case DeathReason.PVM_FIRMWARE_INSTANCE_IMAGE_CHANGED:
+                    return STOP_REASON_PVM_FIRMWARE_INSTANCE_IMAGE_CHANGED;
+                case DeathReason.BOOTLOADER_PUBLIC_KEY_MISMATCH:
+                    return STOP_REASON_BOOTLOADER_PUBLIC_KEY_MISMATCH;
+                case DeathReason.BOOTLOADER_INSTANCE_IMAGE_CHANGED:
+                    return STOP_REASON_BOOTLOADER_INSTANCE_IMAGE_CHANGED;
+                case DeathReason.MICRODROID_FAILED_TO_CONNECT_TO_VIRTUALIZATION_SERVICE:
+                    return STOP_REASON_MICRODROID_FAILED_TO_CONNECT_TO_VIRTUALIZATION_SERVICE;
+                case DeathReason.MICRODROID_PAYLOAD_HAS_CHANGED:
+                    return STOP_REASON_MICRODROID_PAYLOAD_HAS_CHANGED;
+                case DeathReason.MICRODROID_PAYLOAD_VERIFICATION_FAILED:
+                    return STOP_REASON_MICRODROID_PAYLOAD_VERIFICATION_FAILED;
+                case DeathReason.MICRODROID_INVALID_PAYLOAD_CONFIG:
+                    return STOP_REASON_MICRODROID_INVALID_PAYLOAD_CONFIG;
+                case DeathReason.MICRODROID_UNKNOWN_RUNTIME_ERROR:
+                    return STOP_REASON_MICRODROID_UNKNOWN_RUNTIME_ERROR;
+                case DeathReason.HANGUP:
+                    return STOP_REASON_HANGUP;
+                default:
+                    return STOP_REASON_UNKNOWN;
+            }
         }
     }
 }
