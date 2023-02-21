@@ -1,4 +1,4 @@
-// Copyright 2022, The Android Open Source Project
+// Copyright 2023, The Android Open Source Project
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,6 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Image verification.
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
 
-pub use pvmfw_embedded_key::PUBLIC_KEY;
+rust_fuzz {
+    name: "avb_kernel_without_footer_verify_fuzzer",
+    srcs: ["without_footer_verify_fuzzer.rs"],
+    rustlibs: [
+        "libpvmfw_avb_nostd",
+    ],
+    fuzz_config: {
+        cc: [
+            "android-kvm@google.com",
+        ],
+        fuzz_on_haiku_device: true,
+        fuzz_on_haiku_host: true,
+    },
+}
+
+// TODO(b/260574387): Add avb_kernel_with_footer_verify_fuzzer

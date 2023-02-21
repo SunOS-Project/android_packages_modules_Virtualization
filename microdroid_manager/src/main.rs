@@ -77,6 +77,7 @@ const DEBUG_MICRODROID_NO_VERIFIED_BOOT: &str =
     "/sys/firmware/devicetree/base/virtualization/guest/debug-microdroid,no-verified-boot";
 
 const APEX_CONFIG_DONE_PROP: &str = "apex_config.done";
+const TOMBSTONE_TRANSMIT_DONE_PROP: &str = "tombstone_transmit.init_done";
 const DEBUGGABLE_PROP: &str = "ro.boot.microdroid.debuggable";
 
 // SYNC WITH virtualizationservice/src/crosvm.rs
@@ -425,7 +426,8 @@ fn try_run_payload(service: &Strong<dyn IVirtualMachineService>) -> Result<i32> 
 
     // Start tombstone_transmit if enabled
     if config.export_tombstones {
-        control_service("start", "tombstone_transmit")?;
+        system_properties::write("tombstone_transmit.start", "1")
+            .context("set tombstone_transmit.start")?;
     } else {
         control_service("stop", "tombstoned")?;
     }
@@ -446,6 +448,12 @@ fn try_run_payload(service: &Strong<dyn IVirtualMachineService>) -> Result<i32> 
     wait_for_property_true("dev.bootcomplete").context("failed waiting for dev.bootcomplete")?;
     system_properties::write("microdroid_manager.init_done", "1")
         .context("set microdroid_manager.init_done")?;
+
+    // Wait for tombstone_transmit to init
+    if config.export_tombstones {
+        wait_for_tombstone_transmit_done()?;
+    }
+
     info!("boot completed, time to run payload");
     exec_task(task, service).context("Failed to run payload")
 }
@@ -721,6 +729,11 @@ fn setup_config_sysprops(config: &VmPayloadConfig) -> Result<()> {
 // Waits until linker config is generated
 fn wait_for_apex_config_done() -> Result<()> {
     wait_for_property_true(APEX_CONFIG_DONE_PROP).context("Failed waiting for apex config done")
+}
+
+fn wait_for_tombstone_transmit_done() -> Result<()> {
+    wait_for_property_true(TOMBSTONE_TRANSMIT_DONE_PROP)
+        .context("Failed waiting for tombstone transmit done")
 }
 
 fn wait_for_property_true(property_name: &str) -> Result<()> {

@@ -17,11 +17,9 @@
 #![no_main]
 #![no_std]
 #![feature(default_alloc_error_handler)]
-#![feature(ptr_const_cast)] // Stabilized in 1.65.0
 
 extern crate alloc;
 
-mod avb;
 mod config;
 mod dice;
 mod entry;
@@ -39,20 +37,20 @@ mod virtio;
 use alloc::boxed::Box;
 
 use crate::{
-    avb::PUBLIC_KEY,
     dice::derive_next_bcc,
     entry::RebootReason,
     fdt::add_dice_node,
     helpers::flush,
     helpers::GUEST_PAGE_SIZE,
     memory::MemoryTracker,
-    virtio::pci::{find_virtio_devices, map_mmio},
+    virtio::pci::{self, find_virtio_devices},
 };
 use ::dice::bcc;
 use fdtpci::{PciError, PciInfo};
 use libfdt::Fdt;
 use log::{debug, error, info, trace};
 use pvmfw_avb::verify_payload;
+use pvmfw_embedded_key::PUBLIC_KEY;
 
 const NEXT_BCC_SIZE: usize = GUEST_PAGE_SIZE;
 
@@ -77,10 +75,7 @@ fn main(
     // Set up PCI bus for VirtIO devices.
     let pci_info = PciInfo::from_fdt(fdt).map_err(handle_pci_error)?;
     debug!("PCI: {:#x?}", pci_info);
-    map_mmio(&pci_info, memory)?;
-    // Safety: This is the only place where we call make_pci_root, and this main function is only
-    // called once.
-    let mut pci_root = unsafe { pci_info.make_pci_root() };
+    let mut pci_root = pci::initialise(pci_info, memory)?;
     find_virtio_devices(&mut pci_root).map_err(handle_pci_error)?;
 
     verify_payload(signed_kernel, ramdisk, PUBLIC_KEY).map_err(|e| {

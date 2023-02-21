@@ -78,9 +78,9 @@ lazy_static! {
     /// triggered.
     static ref BOOT_HANGUP_TIMEOUT: Duration = if nested_virt::is_nested_virtualization().unwrap() {
         // Nested virtualization is slow, so we need a longer timeout.
-        Duration::from_secs(100)
+        Duration::from_secs(300)
     } else {
-        Duration::from_secs(10)
+        Duration::from_secs(30)
     };
 }
 
@@ -376,7 +376,7 @@ impl VmInstance {
             &self.name,
             death_reason,
             exit_signal,
-            &*vm_metric,
+            &vm_metric,
         );
 
         // Delete temporary files. The folder itself is removed by VirtualizationServiceInternal.
@@ -575,7 +575,7 @@ fn get_guest_time(pid: u32) -> Result<i64> {
 
     let guest_time_ticks = data_list[42].parse::<i64>()?;
     // SAFETY : It just returns an integer about CPU tick information.
-    let ticks_per_sec = unsafe { sysconf(_SC_CLK_TCK) } as i64;
+    let ticks_per_sec = unsafe { sysconf(_SC_CLK_TCK) };
     Ok(guest_time_ticks * MILLIS_PER_SEC / ticks_per_sec)
 }
 
@@ -678,7 +678,7 @@ fn run_vm(
         // Configure the logger for the crosvm process to silence logs from the disk crate which
         // don't provide much information to us (but do spamming us).
         .arg("--log-level")
-        .arg("info,disk=off")
+        .arg("info,disk=warn")
         .arg("run")
         .arg("--disable-sandbox")
         .arg("--cid")
