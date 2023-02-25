@@ -16,12 +16,13 @@
 
 //! Utility functions used by API tests.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use avb_bindgen::{
     avb_footer_validate_and_byteswap, avb_vbmeta_image_header_to_host_byte_order, AvbFooter,
     AvbVBMetaImageHeader,
 };
-use pvmfw_avb::{verify_payload, AvbSlotVerifyError, DebugLevel};
+use openssl::sha;
+use pvmfw_avb::{verify_payload, AvbSlotVerifyError, DebugLevel, Digest, VerifiedBootData};
 use std::{
     fs,
     mem::{size_of, transmute, MaybeUninit},
@@ -34,22 +35,22 @@ const PUBLIC_KEY_RSA4096_PATH: &str = "data/testkey_rsa4096_pub.bin";
 
 pub const PUBLIC_KEY_RSA2048_PATH: &str = "data/testkey_rsa2048_pub.bin";
 
-pub fn assert_payload_verification_with_initrd_eq(
+pub fn assert_payload_verification_with_initrd_fails(
     kernel: &[u8],
     initrd: &[u8],
     trusted_public_key: &[u8],
-    expected_result: Result<DebugLevel, AvbSlotVerifyError>,
+    expected_error: AvbSlotVerifyError,
 ) -> Result<()> {
-    assert_payload_verification_eq(kernel, Some(initrd), trusted_public_key, expected_result)
+    assert_payload_verification_fails(kernel, Some(initrd), trusted_public_key, expected_error)
 }
 
-pub fn assert_payload_verification_eq(
+pub fn assert_payload_verification_fails(
     kernel: &[u8],
     initrd: Option<&[u8]>,
     trusted_public_key: &[u8],
-    expected_result: Result<DebugLevel, AvbSlotVerifyError>,
+    expected_error: AvbSlotVerifyError,
 ) -> Result<()> {
-    assert_eq!(expected_result, verify_payload(kernel, initrd, trusted_public_key));
+    assert_eq!(expected_error, verify_payload(kernel, initrd, trusted_public_key).unwrap_err());
     Ok(())
 }
 
@@ -94,4 +95,35 @@ pub fn extract_vbmeta_header(kernel: &[u8], footer: &AvbFooter) -> Result<AvbVBM
         header.assume_init()
     };
     Ok(vbmeta_header)
+}
+
+pub fn assert_latest_payload_verification_passes(
+    initrd: &[u8],
+    initrd_salt: &[u8],
+    expected_debug_level: DebugLevel,
+) -> Result<()> {
+    let public_key = load_trusted_public_key()?;
+    let kernel = load_latest_signed_kernel()?;
+    let verified_boot_data = verify_payload(&kernel, Some(initrd), &public_key)
+        .map_err(|e| anyhow!("Verification failed. Error: {}", e))?;
+
+    let footer = extract_avb_footer(&kernel)?;
+    let kernel_digest =
+        hash(&[&hash(&[b"bootloader"]), &kernel[..usize::try_from(footer.original_image_size)?]]);
+    let initrd_digest = Some(hash(&[&hash(&[initrd_salt]), initrd]));
+    let expected_boot_data = VerifiedBootData {
+        debug_level: expected_debug_level,
+        kernel_digest,
+        initrd_digest,
+        public_key: &public_key,
+    };
+    assert_eq!(expected_boot_data, verified_boot_data);
+
+    Ok(())
+}
+
+pub fn hash(inputs: &[&[u8]]) -> Digest {
+    let mut digester = sha::Sha256::new();
+    inputs.iter().for_each(|input| digester.update(input));
+    digester.finish()
 }

@@ -16,22 +16,15 @@
 
 //! Wrapper around dice/android/bcc.h.
 
-use core::ffi::CStr;
 use core::mem;
 use core::ptr;
 
-use open_dice_bcc_bindgen::BccConfigValues;
-use open_dice_bcc_bindgen::BccFormatConfigDescriptor;
 use open_dice_bcc_bindgen::BccHandoverMainFlow;
 use open_dice_bcc_bindgen::BccHandoverParse;
-use open_dice_bcc_bindgen::DiceInputValues;
-use open_dice_bcc_bindgen::BCC_INPUT_COMPONENT_NAME;
-use open_dice_bcc_bindgen::BCC_INPUT_COMPONENT_VERSION;
-use open_dice_bcc_bindgen::BCC_INPUT_RESETTABLE;
 
-use crate::check_call;
+use crate::check_result;
 use crate::Cdi;
-use crate::Error;
+use crate::DiceError;
 use crate::InputValues;
 use crate::Result;
 
@@ -57,7 +50,7 @@ impl<'a> Handover<'a> {
 
         // SAFETY - The buffer is only read and never stored and the returned pointers should all
         // point within the address range of the buffer or be NULL.
-        check_call(unsafe {
+        check_result(unsafe {
             BccHandoverParse(
                 buffer.as_ptr(),
                 buffer.len(),
@@ -69,20 +62,20 @@ impl<'a> Handover<'a> {
         })?;
 
         let cdi_attest = {
-            let i = index_from_ptr(buffer, cdi_attest).ok_or(Error::PlatformError)?;
-            let s = buffer.get(i..(i + mem::size_of::<Cdi>())).ok_or(Error::PlatformError)?;
-            s.try_into().map_err(|_| Error::PlatformError)?
+            let i = index_from_ptr(buffer, cdi_attest).ok_or(DiceError::PlatformError)?;
+            let s = buffer.get(i..(i + mem::size_of::<Cdi>())).ok_or(DiceError::PlatformError)?;
+            s.try_into().map_err(|_| DiceError::PlatformError)?
         };
         let cdi_seal = {
-            let i = index_from_ptr(buffer, cdi_seal).ok_or(Error::PlatformError)?;
-            let s = buffer.get(i..(i + mem::size_of::<Cdi>())).ok_or(Error::PlatformError)?;
-            s.try_into().map_err(|_| Error::PlatformError)?
+            let i = index_from_ptr(buffer, cdi_seal).ok_or(DiceError::PlatformError)?;
+            let s = buffer.get(i..(i + mem::size_of::<Cdi>())).ok_or(DiceError::PlatformError)?;
+            s.try_into().map_err(|_| DiceError::PlatformError)?
         };
         let bcc = if bcc.is_null() {
             None
         } else {
-            let i = index_from_ptr(buffer, bcc).ok_or(Error::PlatformError)?;
-            Some(buffer.get(i..(i + bcc_size)).ok_or(Error::PlatformError)?)
+            let i = index_from_ptr(buffer, bcc).ok_or(DiceError::PlatformError)?;
+            Some(buffer.get(i..(i + bcc_size)).ok_or(DiceError::PlatformError)?)
         };
 
         Ok(Self { buffer, cdi_attest, cdi_seal, bcc })
@@ -94,12 +87,12 @@ impl<'a> Handover<'a> {
         let mut size: usize = 0;
         // SAFETY - The function only reads `self.buffer`, writes to `buffer` within its bounds,
         // reads `input_values` as a constant input and doesn't store any pointer.
-        check_call(unsafe {
+        check_result(unsafe {
             BccHandoverMainFlow(
                 context,
                 self.buffer.as_ptr(),
                 self.buffer.len(),
-                input_values as *const _ as *const DiceInputValues,
+                input_values.as_ptr(),
                 buffer.len(),
                 buffer.as_mut_ptr(),
                 &mut size as *mut usize,
@@ -108,57 +101,6 @@ impl<'a> Handover<'a> {
 
         Ok(size)
     }
-}
-
-/// Formats a configuration descriptor following the BCC's specification.
-///
-/// ```
-/// BccConfigDescriptor = {
-///   ? -70002 : tstr,     ; Component name
-///   ? -70003 : int,      ; Component version
-///   ? -70004 : null,     ; Resettable
-/// }
-/// ```
-pub fn format_config_descriptor(
-    buffer: &mut [u8],
-    name: Option<&CStr>,
-    version: Option<u64>,
-    resettable: bool,
-) -> Result<usize> {
-    let mut inputs = 0;
-
-    if name.is_some() {
-        inputs |= BCC_INPUT_COMPONENT_NAME;
-    }
-
-    if version.is_some() {
-        inputs |= BCC_INPUT_COMPONENT_VERSION;
-    }
-
-    if resettable {
-        inputs |= BCC_INPUT_RESETTABLE;
-    }
-
-    let values = BccConfigValues {
-        inputs,
-        component_name: name.map_or(ptr::null(), |p| p.as_ptr()),
-        component_version: version.unwrap_or(0),
-    };
-
-    let mut buffer_size = 0;
-
-    // SAFETY - The function writes to the buffer, within the given bounds, and only reads the
-    // input values. It writes its result to buffer_size.
-    check_call(unsafe {
-        BccFormatConfigDescriptor(
-            &values as *const _,
-            buffer.len(),
-            buffer.as_mut_ptr(),
-            &mut buffer_size as *mut _,
-        )
-    })?;
-
-    Ok(buffer_size)
 }
 
 fn index_from_ptr(slice: &[u8], pointer: *const u8) -> Option<usize> {
