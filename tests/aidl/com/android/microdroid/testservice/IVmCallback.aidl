@@ -1,5 +1,5 @@
 /*
- * Copyright 2022 The Android Open Source Project
+ * Copyright 2023 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,14 +13,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+package com.android.microdroid.testservice;
 
-//! Bare metal wrapper around libopen_dice.
-
-#![no_std]
-
-pub use diced_open_dice::{
-    bcc_format_config_descriptor, check_result, Cdi, Config, DiceError, DiceMode, Hash,
-    InputValues, Result, CDI_SIZE, HASH_SIZE, HIDDEN_SIZE,
-};
-
-pub mod bcc;
+/**
+ * An interface exposed by the VM for callbacks from the app.
+ *
+ * {@hide}
+ */
+interface IVmCallback {
+    /** Requests the VM to asynchronously call the app's onEchoRequestReceived() callback. */
+    void echoMessage(String message);
+}

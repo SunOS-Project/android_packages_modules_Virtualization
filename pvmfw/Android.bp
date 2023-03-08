@@ -13,8 +13,8 @@ rust_ffi_static {
     ],
     rustlibs: [
         "libaarch64_paging",
+        "libbssl_ffi_nostd",
         "libbuddy_system_allocator",
-        "libdice_nostd", // TODO(b/267575445): Remove this library once the migration is done.
         "libdiced_open_dice_nostd",
         "libfdtpci",
         "liblibfdt",
@@ -22,7 +22,9 @@ rust_ffi_static {
         "libonce_cell_nostd",
         "libpvmfw_avb_nostd",
         "libpvmfw_embedded_key",
+        "libstatic_assertions",
         "libtinyvec_nostd",
+        "libuuid_nostd",
         "libvirtio_drivers",
         "libvmbase",
         "libzeroize_nostd",

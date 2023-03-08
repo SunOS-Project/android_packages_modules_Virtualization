@@ -377,7 +377,7 @@ public class VirtualMachine implements AutoCloseable {
     }
 
     /**
-     * Builds a virtual machine from an {@link VirtualMachineDescriptor} object and associates it
+     * Creates a virtual machine from an {@link VirtualMachineDescriptor} object and associates it
      * with the given name.
      *
      * <p>The new virtual machine will be in the same state as the descriptor indicates.
@@ -416,8 +416,6 @@ public class VirtualMachine implements AutoCloseable {
                     }
                     vm.importEncryptedStoreFrom(vmDescriptor.getEncryptedStoreFd());
                 }
-            } catch (IOException e) {
-                throw new VirtualMachineException(e);
             }
             return vm;
         } catch (VirtualMachineException | RuntimeException e) {
@@ -1035,11 +1033,13 @@ public class VirtualMachine implements AutoCloseable {
             }
             checkStopped();
 
-            // Delete any existing file before recreating; that ensures any VirtualMachineDescriptor
-            // that refers to the old file does not see the new config.
-            mConfigFilePath.delete();
-            newConfig.serialize(mConfigFilePath);
-            mConfig = newConfig;
+            if (oldConfig != newConfig) {
+                // Delete any existing file before recreating; that ensures any
+                // VirtualMachineDescriptor that refers to the old file does not see the new config.
+                mConfigFilePath.delete();
+                newConfig.serialize(mConfigFilePath);
+                mConfig = newConfig;
+            }
             return oldConfig;
         }
     }
