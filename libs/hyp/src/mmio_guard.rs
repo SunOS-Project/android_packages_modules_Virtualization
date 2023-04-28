@@ -14,17 +14,17 @@
 
 //! Safe MMIO_GUARD support.
 
-use crate::helpers;
-use crate::hypervisor::{mmio_guard_enroll, mmio_guard_info, mmio_guard_map, mmio_guard_unmap};
-use crate::smccc;
+use crate::hypervisor::get_hypervisor;
+use crate::util::{page_address, SIZE_4KB};
 use core::{fmt, result};
 
+/// MMIO guard error.
 #[derive(Debug, Clone)]
 pub enum Error {
     /// Failed the necessary MMIO_GUARD_ENROLL call.
     EnrollFailed(smccc::Error),
     /// Failed to obtain the MMIO_GUARD granule size.
-    InfoFailed(smccc::Error),
+    GranuleQueryFailed(smccc::Error),
     /// Failed to MMIO_GUARD_MAP a page.
     MapFailed(smccc::Error),
     /// Failed to MMIO_GUARD_UNMAP a page.
@@ -33,13 +33,11 @@ pub enum Error {
     UnsupportedGranule(usize),
 }
 
-type Result<T> = result::Result<T, Error>;
-
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::EnrollFailed(e) => write!(f, "Failed to enroll into MMIO_GUARD: {e}"),
-            Self::InfoFailed(e) => write!(f, "Failed to get the MMIO_GUARD granule: {e}"),
+            Self::GranuleQueryFailed(e) => write!(f, "Failed to get the MMIO_GUARD granule: {e}"),
             Self::MapFailed(e) => write!(f, "Failed to MMIO_GUARD map: {e}"),
             Self::UnmapFailed(e) => write!(f, "Failed to MMIO_GUARD unmap: {e}"),
             Self::UnsupportedGranule(g) => write!(f, "Unsupported MMIO_GUARD granule: {g}"),
@@ -47,19 +45,26 @@ impl fmt::Display for Error {
     }
 }
 
+/// Result type with mmio_guard::Error.
+pub type Result<T> = result::Result<T, Error>;
+
+/// Initializes the hypervisor by enrolling a MMIO guard and checking the memory granule size.
 pub fn init() -> Result<()> {
-    mmio_guard_enroll().map_err(Error::EnrollFailed)?;
-    let mmio_granule = mmio_guard_info().map_err(Error::InfoFailed)? as usize;
-    if mmio_granule != helpers::SIZE_4KB {
+    let hyp = get_hypervisor();
+    hyp.mmio_guard_enroll().map_err(Error::EnrollFailed)?;
+    let mmio_granule = hyp.mmio_guard_granule().map_err(Error::GranuleQueryFailed)?;
+    if mmio_granule != SIZE_4KB {
         return Err(Error::UnsupportedGranule(mmio_granule));
     }
     Ok(())
 }
 
+/// Maps a memory address to the hypervisor MMIO guard.
 pub fn map(addr: usize) -> Result<()> {
-    mmio_guard_map(helpers::page_4kb_of(addr) as u64).map_err(Error::MapFailed)
+    get_hypervisor().mmio_guard_map(page_address(addr)).map_err(Error::MapFailed)
 }
 
+/// Unmaps a memory address from the hypervisor MMIO guard.
 pub fn unmap(addr: usize) -> Result<()> {
-    mmio_guard_unmap(helpers::page_4kb_of(addr) as u64).map_err(Error::UnmapFailed)
+    get_hypervisor().mmio_guard_unmap(page_address(addr)).map_err(Error::UnmapFailed)
 }

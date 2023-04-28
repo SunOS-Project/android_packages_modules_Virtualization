@@ -17,18 +17,41 @@ rust_ffi_static {
         "libbuddy_system_allocator",
         "libdiced_open_dice_nostd",
         "libfdtpci",
+        "libhyp",
         "liblibfdt",
         "liblog_rust_nostd",
         "libonce_cell_nostd",
         "libpvmfw_avb_nostd",
         "libpvmfw_embedded_key",
         "libpvmfw_fdt_template",
+        "libsmccc",
         "libstatic_assertions",
         "libtinyvec_nostd",
         "libuuid_nostd",
         "libvirtio_drivers",
         "libvmbase",
         "libzeroize_nostd",
+    ],
+}
+
+// Generates an empty file.
+genrule {
+    name: "empty_file",
+    out: ["empty_file"],
+    cmd: "touch $(out)",
+}
+
+rust_test {
+    name: "libpvmfw.bootargs.test",
+    host_supported: true,
+    // For now, only bootargs.rs is written to be conditionally compiled with std.
+    srcs: ["src/bootargs.rs"],
+    test_suites: ["general-tests"],
+    test_options: {
+        unit_test: true,
+    },
+    rustlibs: [
+        "libzeroize",
     ],
 }
 
@@ -81,7 +104,7 @@ prebuilt_etc {
             src: ":pvmfw_bin",
         },
     },
-    src: "empty_file",
+    src: ":empty_file",
     installable: false,
 }
 
