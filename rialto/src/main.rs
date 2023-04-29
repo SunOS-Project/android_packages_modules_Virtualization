@@ -34,6 +34,7 @@ use log::{debug, error, info};
 use vmbase::{layout, main, power::reboot};
 
 const SZ_1K: usize = 1024;
+const SZ_4K: usize = 4 * SZ_1K;
 const SZ_64K: usize = 64 * SZ_1K;
 const SZ_1M: usize = 1024 * SZ_1K;
 const SZ_1G: usize = 1024 * SZ_1M;
@@ -73,7 +74,6 @@ fn init_heap() {
     unsafe {
         HEAP_ALLOCATOR.lock().init(&mut HEAP as *mut u8 as usize, HEAP.len());
     }
-    info!("Initialized heap.");
 }
 
 fn init_kernel_pgt(pgt: &mut IdMap) -> Result<()> {
@@ -81,18 +81,21 @@ fn init_kernel_pgt(pgt: &mut IdMap) -> Result<()> {
     let reg_dev = MemoryRegion::new(0, SZ_1G);
     let reg_text = into_memreg(&layout::text_range());
     let reg_rodata = into_memreg(&layout::rodata_range());
-    let reg_data = into_memreg(&layout::writable_region());
+    let reg_scratch = into_memreg(&layout::scratch_range());
+    let reg_stack = into_memreg(&layout::stack_range(40 * SZ_4K));
 
     debug!("Preparing kernel page table.");
     debug!("  dev:    {}-{}", reg_dev.start(), reg_dev.end());
     debug!("  text:   {}-{}", reg_text.start(), reg_text.end());
     debug!("  rodata: {}-{}", reg_rodata.start(), reg_rodata.end());
-    debug!("  data:   {}-{}", reg_data.start(), reg_data.end());
+    debug!("  scratch:{}-{}", reg_scratch.start(), reg_scratch.end());
+    debug!("  stack:  {}-{}", reg_stack.start(), reg_stack.end());
 
     pgt.map_range(&reg_dev, PROT_DEV)?;
     pgt.map_range(&reg_text, PROT_RX)?;
     pgt.map_range(&reg_rodata, PROT_RO)?;
-    pgt.map_range(&reg_data, PROT_RW)?;
+    pgt.map_range(&reg_scratch, PROT_RW)?;
+    pgt.map_range(&reg_stack, PROT_RW)?;
 
     pgt.activate();
     info!("Activated kernel page table.");
@@ -112,7 +115,6 @@ fn try_init_logger() -> Result<()> {
 
 fn try_main() -> Result<()> {
     info!("Welcome to Rialto!");
-    init_heap();
 
     let mut pgt = IdMap::new(PT_ASID, PT_ROOT_LEVEL);
     init_kernel_pgt(&mut pgt)?;
@@ -121,6 +123,7 @@ fn try_main() -> Result<()> {
 
 /// Entry point for Rialto.
 pub fn main(_a0: u64, _a1: u64, _a2: u64, _a3: u64) {
+    init_heap();
     if try_init_logger().is_err() {
         // Don't log anything if the logger initialization fails.
         reboot();
