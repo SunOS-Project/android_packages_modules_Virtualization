@@ -31,6 +31,7 @@ macro_rules! read_sysreg {
     ($sysreg:literal) => {{
         let mut r: usize;
         // Safe because it reads a system register and does not affect Rust.
+        #[allow(unused_unsafe)] // In case the macro is used within an unsafe block.
         unsafe {
             core::arch::asm!(
                 concat!("mrs {}, ", $sysreg),
@@ -182,6 +183,6 @@ impl<T: PartialOrd> RangeExt for Range<T> {
 #[macro_export]
 macro_rules! cstr {
     ($str:literal) => {{
-        CStr::from_bytes_with_nul(concat!($str, "\0").as_bytes()).unwrap()
+        core::ffi::CStr::from_bytes_with_nul(concat!($str, "\0").as_bytes()).unwrap()
     }};
 }
