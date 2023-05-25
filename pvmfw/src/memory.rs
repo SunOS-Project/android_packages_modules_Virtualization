@@ -16,8 +16,9 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use crate::helpers::{self, page_4kb_of, RangeExt, PVMFW_PAGE_SIZE, SIZE_4MB};
+use crate::helpers::{self, dbm_available, page_4kb_of, RangeExt, PVMFW_PAGE_SIZE, SIZE_4MB};
 use crate::mmu;
+use crate::{dsb, isb, read_sysreg, tlbi, write_sysreg};
 use aarch64_paging::paging::{Attributes, Descriptor, MemoryRegion as VaRange};
 use alloc::alloc::alloc_zeroed;
 use alloc::alloc::dealloc;
@@ -29,13 +30,14 @@ use core::alloc::Layout;
 use core::cmp::max;
 use core::cmp::min;
 use core::fmt;
+use core::iter::once;
 use core::num::NonZeroUsize;
 use core::ops::Range;
 use core::ptr::NonNull;
 use core::result;
 use hyp::get_hypervisor;
-use log::error;
 use log::trace;
+use log::{debug, error};
 use once_cell::race::OnceBox;
 use spin::mutex::SpinMutex;
 use tinyvec::ArrayVec;
@@ -50,7 +52,7 @@ pub type MemoryRange = Range<usize>;
 pub static MEMORY: SpinMutex<Option<MemoryTracker>> = SpinMutex::new(None);
 unsafe impl Send for MemoryTracker {}
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 enum MemoryType {
     #[default]
     ReadOnly,
@@ -121,6 +123,10 @@ pub enum MemoryTrackerError {
     SharedPoolSetFailure,
     /// Invalid page table entry.
     InvalidPte,
+    /// Failed to flush memory region.
+    FlushRegionFailed,
+    /// Failed to set PTE dirty state.
+    SetPteDirtyFailed,
 }
 
 impl fmt::Display for MemoryTrackerError {
@@ -138,6 +144,8 @@ impl fmt::Display for MemoryTrackerError {
             Self::SharedMemorySetFailure => write!(f, "Failed to set SHARED_MEMORY"),
             Self::SharedPoolSetFailure => write!(f, "Failed to set SHARED_POOL"),
             Self::InvalidPte => write!(f, "Page table entry is not valid"),
+            Self::FlushRegionFailed => write!(f, "Failed to flush memory region"),
+            Self::SetPteDirtyFailed => write!(f, "Failed to set PTE dirty state"),
         }
     }
 }
@@ -211,9 +219,22 @@ impl MemoryTracker {
     const CAPACITY: usize = 5;
     const MMIO_CAPACITY: usize = 5;
     const PVMFW_RANGE: MemoryRange = (BASE_ADDR - SIZE_4MB)..BASE_ADDR;
+    // TCR_EL1.{HA,HD} bits controlling hardware management of access and dirty state
+    const TCR_EL1_HA_HD_BITS: usize = 3 << 39;
 
     /// Create a new instance from an active page table, covering the maximum RAM size.
-    pub fn new(page_table: mmu::PageTable) -> Self {
+    pub fn new(mut page_table: mmu::PageTable) -> Self {
+        // Activate dirty state management first, otherwise we may get permission faults immediately
+        // after activating the new page table. This has no effect before the new page table is
+        // activated because none of the entries in the initial idmap have the DBM flag.
+        Self::set_dbm_enabled(true);
+
+        debug!("Activating dynamic page table...");
+        // SAFETY - page_table duplicates the static mappings for everything that the Rust code is
+        // aware of so activating it shouldn't have any visible effect.
+        unsafe { page_table.activate() };
+        debug!("... Success!");
+
         Self {
             total: BASE_ADDR..MAX_ADDR,
             page_table,
@@ -386,20 +407,54 @@ impl MemoryTracker {
         // Maps a single device page, breaking up block mappings if necessary.
         self.page_table.map_device(&page_range).map_err(|_| MemoryTrackerError::FailedToMap)
     }
+
+    /// Flush all memory regions marked as writable-dirty.
+    fn flush_dirty_pages(&mut self) -> Result<()> {
+        // Collect memory ranges for which dirty state is tracked.
+        let writable_regions =
+            self.regions.iter().filter(|r| r.mem_type == MemoryType::ReadWrite).map(|r| &r.range);
+        let payload_range = mmu::PageTable::appended_payload_range();
+        // Execute a barrier instruction to ensure all hardware updates to the page table have been
+        // observed before reading PTE flags to determine dirty state.
+        dsb!("ish");
+        // Now flush writable-dirty pages in those regions.
+        for range in writable_regions.chain(once(&payload_range)) {
+            self.page_table
+                .modify_range(range, &flush_dirty_range)
+                .map_err(|_| MemoryTrackerError::FlushRegionFailed)?;
+        }
+        Ok(())
+    }
+
+    /// Handles permission fault for read-only blocks by setting writable-dirty state.
+    /// In general, this should be called from the exception handler when hardware dirty
+    /// state management is disabled or unavailable.
+    pub fn handle_permission_fault(&mut self, addr: usize) -> Result<()> {
+        self.page_table
+            .modify_range(&(addr..addr + 1), &mark_dirty_block)
+            .map_err(|_| MemoryTrackerError::SetPteDirtyFailed)
+    }
+
+    fn set_dbm_enabled(enabled: bool) {
+        if dbm_available() {
+            let mut tcr = read_sysreg!("tcr_el1");
+            if enabled {
+                tcr |= Self::TCR_EL1_HA_HD_BITS
+            } else {
+                tcr &= !Self::TCR_EL1_HA_HD_BITS
+            };
+            // Safe because it writes to a system register and does not affect Rust.
+            unsafe { write_sysreg!("tcr_el1", tcr) }
+            isb!();
+        }
+    }
 }
 
 impl Drop for MemoryTracker {
     fn drop(&mut self) {
-        for region in &self.regions {
-            match region.mem_type {
-                MemoryType::ReadWrite => {
-                    // TODO(b/269738062): Use PT's dirty bit to only flush pages that were touched.
-                    helpers::flush_region(region.range.start, region.range.len())
-                }
-                MemoryType::ReadOnly => {}
-            }
-        }
-        self.unshare_all_memory()
+        Self::set_dbm_enabled(false);
+        self.flush_dirty_pages().unwrap();
+        self.unshare_all_memory();
     }
 }
 
@@ -494,11 +549,14 @@ fn mmio_guard_unmap_page(
     level: usize,
 ) -> result::Result<(), ()> {
     let flags = desc.flags().expect("Unsupported PTE flags set");
+    if !is_leaf_pte(&flags, level) {
+        return Ok(());
+    }
     // This function will be called on an address range that corresponds to a device. Only if a
     // page has been accessed (written to or read from), will it contain the VALID flag and be MMIO
     // guard mapped. Therefore, we can skip unmapping invalid pages, they were never MMIO guard
     // mapped anyway.
-    if is_leaf_pte(&flags, level) && flags.contains(Attributes::VALID) {
+    if flags.contains(Attributes::VALID) {
         assert!(
             flags.contains(mmu::MMIO_LAZY_MAP_FLAG),
             "Attempting MMIO guard unmap for non-device pages"
@@ -518,4 +576,49 @@ fn mmio_guard_unmap_page(
         })?;
     }
     Ok(())
+}
+
+/// Flushes a memory range the descriptor refers to, if the descriptor is in writable-dirty state.
+fn flush_dirty_range(
+    va_range: &VaRange,
+    desc: &mut Descriptor,
+    level: usize,
+) -> result::Result<(), ()> {
+    // Only flush ranges corresponding to dirty leaf PTEs.
+    let flags = desc.flags().ok_or(())?;
+    if !is_leaf_pte(&flags, level) {
+        return Ok(());
+    }
+    if !flags.contains(Attributes::READ_ONLY) {
+        helpers::flush_region(va_range.start().0, va_range.len());
+    }
+    Ok(())
+}
+
+/// Clears read-only flag on a PTE, making it writable-dirty. Used when dirty state is managed
+/// in software to handle permission faults on read-only descriptors.
+fn mark_dirty_block(
+    va_range: &VaRange,
+    desc: &mut Descriptor,
+    level: usize,
+) -> result::Result<(), ()> {
+    let flags = desc.flags().ok_or(())?;
+    if !is_leaf_pte(&flags, level) {
+        return Ok(());
+    }
+    if flags.contains(Attributes::DBM) {
+        assert!(flags.contains(Attributes::READ_ONLY), "unexpected PTE writable state");
+        desc.modify_flags(Attributes::empty(), Attributes::READ_ONLY);
+        // Updating the read-only bit of a PTE requires TLB invalidation.
+        // A TLB maintenance instruction is only guaranteed to be complete after a DSB instruction.
+        // An ISB instruction is required to ensure the effects of completed TLB maintenance
+        // instructions are visible to instructions fetched afterwards.
+        // See ARM ARM E2.3.10, and G5.9.
+        tlbi!("vale1", mmu::PageTable::ASID, va_range.start().0);
+        dsb!("ish");
+        isb!();
+        Ok(())
+    } else {
+        Err(())
+    }
 }
