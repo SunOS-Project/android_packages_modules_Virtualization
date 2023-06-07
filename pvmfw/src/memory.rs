@@ -16,7 +16,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use crate::helpers::{self, RangeExt, PVMFW_PAGE_SIZE};
+use crate::helpers::{RangeExt, PVMFW_PAGE_SIZE};
 use aarch64_paging::idmap::IdMap;
 use aarch64_paging::paging::{Attributes, Descriptor, MemoryRegion as VaRange};
 use aarch64_paging::MapError;
@@ -24,8 +24,6 @@ use alloc::alloc::handle_alloc_error;
 use alloc::boxed::Box;
 use buddy_system_allocator::LockedFrameAllocator;
 use core::alloc::Layout;
-use core::cmp::max;
-use core::cmp::min;
 use core::fmt;
 use core::iter::once;
 use core::num::NonZeroUsize;
@@ -39,17 +37,16 @@ use once_cell::race::OnceBox;
 use spin::mutex::SpinMutex;
 use tinyvec::ArrayVec;
 use vmbase::{
-    dsb, isb, layout,
+    dsb, isb,
+    layout::{self, crosvm::MEM_START},
     memory::{
-        page_4kb_of, set_dbm_enabled, MemorySharer, PageTable, MMIO_LAZY_MAP_FLAG, SIZE_2MB,
-        SIZE_4KB, SIZE_4MB,
+        flush_dirty_range, is_leaf_pte, page_4kb_of, set_dbm_enabled, MemorySharer, PageTable,
+        MMIO_LAZY_MAP_FLAG, SIZE_2MB, SIZE_4KB, SIZE_4MB,
     },
     tlbi,
     util::align_up,
 };
 
-/// Base of the system's contiguous "main" memory.
-pub const BASE_ADDR: usize = 0x8000_0000;
 /// First address that can't be translated by a level 1 TTBR0_EL1.
 pub const MAX_ADDR: usize = 1 << 40;
 
@@ -72,29 +69,6 @@ enum MemoryType {
 struct MemoryRegion {
     range: MemoryRange,
     mem_type: MemoryType,
-}
-
-impl MemoryRegion {
-    /// True if the instance overlaps with the passed range.
-    pub fn overlaps(&self, range: &MemoryRange) -> bool {
-        overlaps(&self.range, range)
-    }
-
-    /// True if the instance is fully contained within the passed range.
-    pub fn is_within(&self, range: &MemoryRange) -> bool {
-        self.as_ref().is_within(range)
-    }
-}
-
-impl AsRef<MemoryRange> for MemoryRegion {
-    fn as_ref(&self) -> &MemoryRange {
-        &self.range
-    }
-}
-
-/// Returns true if one range overlaps with the other at all.
-fn overlaps<T: Copy + Ord>(a: &Range<T>, b: &Range<T>) -> bool {
-    max(a.start, b.start) < min(a.end, b.end)
 }
 
 /// Tracks non-overlapping slices of main memory.
@@ -173,7 +147,7 @@ static SHARED_MEMORY: SpinMutex<Option<MemorySharer>> = SpinMutex::new(None);
 impl MemoryTracker {
     const CAPACITY: usize = 5;
     const MMIO_CAPACITY: usize = 5;
-    const PVMFW_RANGE: MemoryRange = (BASE_ADDR - SIZE_4MB)..BASE_ADDR;
+    const PVMFW_RANGE: MemoryRange = (MEM_START - SIZE_4MB)..MEM_START;
 
     /// Create a new instance from an active page table, covering the maximum RAM size.
     pub fn new(mut page_table: PageTable) -> Self {
@@ -189,7 +163,7 @@ impl MemoryTracker {
         debug!("... Success!");
 
         Self {
-            total: BASE_ADDR..MAX_ADDR,
+            total: MEM_START..MAX_ADDR,
             page_table,
             regions: ArrayVec::new(),
             mmio_regions: ArrayVec::new(),
@@ -206,7 +180,7 @@ impl MemoryTracker {
         if self.total.end < range.end {
             return Err(MemoryTrackerError::SizeTooLarge);
         }
-        if !self.regions.iter().all(|r| r.is_within(range)) {
+        if !self.regions.iter().all(|r| r.range.is_within(range)) {
             return Err(MemoryTrackerError::SizeTooSmall);
         }
 
@@ -250,10 +224,10 @@ impl MemoryTracker {
     /// appropriately.
     pub fn map_mmio_range(&mut self, range: MemoryRange) -> Result<()> {
         // MMIO space is below the main memory region.
-        if range.end > self.total.start || overlaps(&Self::PVMFW_RANGE, &range) {
+        if range.end > self.total.start || range.overlaps(&Self::PVMFW_RANGE) {
             return Err(MemoryTrackerError::OutOfRange);
         }
-        if self.mmio_regions.iter().any(|r| overlaps(r, &range)) {
+        if self.mmio_regions.iter().any(|r| range.overlaps(r)) {
             return Err(MemoryTrackerError::Overlaps);
         }
         if self.mmio_regions.len() == self.mmio_regions.capacity() {
@@ -276,10 +250,10 @@ impl MemoryTracker {
     /// with any other previously allocated regions, and that the regions ArrayVec has capacity to
     /// add it.
     fn check(&self, region: &MemoryRegion) -> Result<()> {
-        if !region.is_within(&self.total) {
+        if !region.range.is_within(&self.total) {
             return Err(MemoryTrackerError::OutOfRange);
         }
-        if self.regions.iter().any(|r| r.overlaps(&region.range)) {
+        if self.regions.iter().any(|r| region.range.overlaps(&r.range)) {
             return Err(MemoryTrackerError::Overlaps);
         }
         if self.regions.len() == self.regions.capacity() {
@@ -293,7 +267,7 @@ impl MemoryTracker {
             return Err(MemoryTrackerError::Full);
         }
 
-        Ok(self.regions.last().unwrap().as_ref().clone())
+        Ok(self.regions.last().unwrap().range.clone())
     }
 
     /// Unmaps all tracked MMIO regions from the MMIO guard.
@@ -439,17 +413,6 @@ pub unsafe fn dealloc_shared(vaddr: NonNull<u8>, layout: Layout) -> hyp::Result<
     Ok(())
 }
 
-/// Checks whether a PTE at given level is a page or block descriptor.
-#[inline]
-fn is_leaf_pte(flags: &Attributes, level: usize) -> bool {
-    const LEAF_PTE_LEVEL: usize = 3;
-    if flags.contains(Attributes::TABLE_OR_PAGE) {
-        level == LEAF_PTE_LEVEL
-    } else {
-        level < LEAF_PTE_LEVEL
-    }
-}
-
 /// Checks whether block flags indicate it should be MMIO guard mapped.
 fn verify_lazy_mapped_block(
     _range: &VaRange,
@@ -499,23 +462,6 @@ fn mmio_guard_unmap_page(
         get_hypervisor().mmio_guard_unmap(page_base).map_err(|e| {
             error!("Error MMIO guard unmapping: {e}");
         })?;
-    }
-    Ok(())
-}
-
-/// Flushes a memory range the descriptor refers to, if the descriptor is in writable-dirty state.
-fn flush_dirty_range(
-    va_range: &VaRange,
-    desc: &mut Descriptor,
-    level: usize,
-) -> result::Result<(), ()> {
-    // Only flush ranges corresponding to dirty leaf PTEs.
-    let flags = desc.flags().ok_or(())?;
-    if !is_leaf_pte(&flags, level) {
-        return Ok(());
-    }
-    if !flags.contains(Attributes::READ_ONLY) {
-        helpers::flush_region(va_range.start().0, va_range.len());
     }
     Ok(())
 }

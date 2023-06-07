@@ -14,70 +14,28 @@
 
 //! Miscellaneous helper functions.
 
-use core::arch::asm;
 use core::ops::Range;
-use vmbase::memory::SIZE_4KB;
-use vmbase::read_sysreg;
-use vmbase::util::unchecked_align_down;
-use zeroize::Zeroize;
+use vmbase::memory::{PAGE_SIZE, SIZE_4KB};
 
 pub const GUEST_PAGE_SIZE: usize = SIZE_4KB;
-pub const PVMFW_PAGE_SIZE: usize = SIZE_4KB;
-
-#[inline]
-/// Read the number of words in the smallest cache line of all the data caches and unified caches.
-pub fn min_dcache_line_size() -> usize {
-    const DMINLINE_SHIFT: usize = 16;
-    const DMINLINE_MASK: usize = 0xf;
-    let ctr_el0 = read_sysreg!("ctr_el0");
-
-    // DminLine: log2 of the number of words in the smallest cache line of all the data caches.
-    let dminline = (ctr_el0 >> DMINLINE_SHIFT) & DMINLINE_MASK;
-
-    1 << dminline
-}
-
-/// Flush `size` bytes of data cache by virtual address.
-#[inline]
-pub fn flush_region(start: usize, size: usize) {
-    let line_size = min_dcache_line_size();
-    let end = start + size;
-    let start = unchecked_align_down(start, line_size);
-
-    for line in (start..end).step_by(line_size) {
-        // SAFETY - Clearing cache lines shouldn't have Rust-visible side effects.
-        unsafe {
-            asm!(
-                "dc cvau, {x}",
-                x = in(reg) line,
-                options(nomem, nostack, preserves_flags),
-            )
-        }
-    }
-}
-
-#[inline]
-/// Flushes the slice to the point of unification.
-pub fn flush(reg: &[u8]) {
-    flush_region(reg.as_ptr() as usize, reg.len())
-}
-
-#[inline]
-/// Overwrites the slice with zeroes, to the point of unification.
-pub fn flushed_zeroize(reg: &mut [u8]) {
-    reg.zeroize();
-    flush(reg)
-}
+pub const PVMFW_PAGE_SIZE: usize = PAGE_SIZE;
 
 /// Trait to check containment of one range within another.
 pub(crate) trait RangeExt {
     /// Returns true if `self` is contained within the `other` range.
     fn is_within(&self, other: &Self) -> bool;
+
+    /// Returns true if `self` overlaps with the `other` range.
+    fn overlaps(&self, other: &Self) -> bool;
 }
 
 impl<T: PartialOrd> RangeExt for Range<T> {
     fn is_within(&self, other: &Self) -> bool {
         self.start >= other.start && self.end <= other.end
+    }
+
+    fn overlaps(&self, other: &Self) -> bool {
+        self.start < other.end && other.start < self.end
     }
 }
 

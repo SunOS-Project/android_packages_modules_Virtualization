@@ -12,17 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Memory management.
+//! Memory layout for crosvm for aarch64 architecture.
+//!
+//! https://crosvm.dev/book/appendix/memory_layout.html#common-layout
 
-mod dbm;
-mod page_table;
-mod shared;
-mod util;
-
-pub use dbm::{flush_dirty_range, set_dbm_enabled};
-pub use page_table::{is_leaf_pte, PageTable, MMIO_LAZY_MAP_FLAG};
-pub use shared::MemorySharer;
-pub use util::{
-    flush, flushed_zeroize, min_dcache_line_size, page_4kb_of, phys_to_virt, virt_to_phys,
-    PAGE_SIZE, SIZE_2MB, SIZE_4KB, SIZE_4MB,
-};
+/// The start of the system's contiguous "main" memory.
+pub const MEM_START: usize = 0x8000_0000;
