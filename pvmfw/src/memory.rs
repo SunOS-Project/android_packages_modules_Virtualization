@@ -16,8 +16,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use crate::helpers::{RangeExt, PVMFW_PAGE_SIZE};
-use aarch64_paging::idmap::IdMap;
+use crate::helpers::PVMFW_PAGE_SIZE;
 use aarch64_paging::paging::{Attributes, Descriptor, MemoryRegion as VaRange};
 use aarch64_paging::MapError;
 use alloc::alloc::handle_alloc_error;
@@ -37,21 +36,17 @@ use once_cell::race::OnceBox;
 use spin::mutex::SpinMutex;
 use tinyvec::ArrayVec;
 use vmbase::{
-    dsb, isb,
-    layout::{self, crosvm::MEM_START},
+    dsb, isb, layout,
     memory::{
         flush_dirty_range, is_leaf_pte, page_4kb_of, set_dbm_enabled, MemorySharer, PageTable,
-        MMIO_LAZY_MAP_FLAG, SIZE_2MB, SIZE_4KB, SIZE_4MB,
+        MMIO_LAZY_MAP_FLAG, PT_ASID, SIZE_2MB, SIZE_4KB,
     },
     tlbi,
-    util::align_up,
+    util::{align_up, RangeExt as _},
 };
 
 /// First address that can't be translated by a level 1 TTBR0_EL1.
 pub const MAX_ADDR: usize = 1 << 40;
-
-const PT_ROOT_LEVEL: usize = 1;
-const PT_ASID: usize = 1;
 
 pub type MemoryRange = Range<usize>;
 
@@ -77,6 +72,8 @@ pub struct MemoryTracker {
     page_table: PageTable,
     regions: ArrayVec<[MemoryRegion; MemoryTracker::CAPACITY]>,
     mmio_regions: ArrayVec<[MemoryRange; MemoryTracker::MMIO_CAPACITY]>,
+    mmio_range: MemoryRange,
+    payload_range: MemoryRange,
 }
 
 /// Errors for MemoryTracker operations.
@@ -147,10 +144,19 @@ static SHARED_MEMORY: SpinMutex<Option<MemorySharer>> = SpinMutex::new(None);
 impl MemoryTracker {
     const CAPACITY: usize = 5;
     const MMIO_CAPACITY: usize = 5;
-    const PVMFW_RANGE: MemoryRange = (MEM_START - SIZE_4MB)..MEM_START;
 
     /// Create a new instance from an active page table, covering the maximum RAM size.
-    pub fn new(mut page_table: PageTable) -> Self {
+    pub fn new(
+        mut page_table: PageTable,
+        total: MemoryRange,
+        mmio_range: MemoryRange,
+        payload_range: MemoryRange,
+    ) -> Self {
+        assert!(
+            !total.overlaps(&mmio_range),
+            "MMIO space should not overlap with the main memory region."
+        );
+
         // Activate dirty state management first, otherwise we may get permission faults immediately
         // after activating the new page table. This has no effect before the new page table is
         // activated because none of the entries in the initial idmap have the DBM flag.
@@ -163,10 +169,12 @@ impl MemoryTracker {
         debug!("... Success!");
 
         Self {
-            total: MEM_START..MAX_ADDR,
+            total,
             page_table,
             regions: ArrayVec::new(),
             mmio_regions: ArrayVec::new(),
+            mmio_range,
+            payload_range,
         }
     }
 
@@ -223,8 +231,7 @@ impl MemoryTracker {
     /// Checks that the given range of addresses is within the MMIO region, and then maps it
     /// appropriately.
     pub fn map_mmio_range(&mut self, range: MemoryRange) -> Result<()> {
-        // MMIO space is below the main memory region.
-        if range.end > self.total.start || range.overlaps(&Self::PVMFW_RANGE) {
+        if !range.is_within(&self.mmio_range) {
             return Err(MemoryTrackerError::OutOfRange);
         }
         if self.mmio_regions.iter().any(|r| range.overlaps(r)) {
@@ -342,12 +349,11 @@ impl MemoryTracker {
         // Collect memory ranges for which dirty state is tracked.
         let writable_regions =
             self.regions.iter().filter(|r| r.mem_type == MemoryType::ReadWrite).map(|r| &r.range);
-        let payload_range = appended_payload_range();
         // Execute a barrier instruction to ensure all hardware updates to the page table have been
         // observed before reading PTE flags to determine dirty state.
         dsb!("ish");
         // Now flush writable-dirty pages in those regions.
-        for range in writable_regions.chain(once(&payload_range)) {
+        for range in writable_regions.chain(once(&self.payload_range)) {
             self.page_table
                 .modify_range(range, &flush_dirty_range)
                 .map_err(|_| MemoryTrackerError::FlushRegionFailed)?;
@@ -495,7 +501,7 @@ fn mark_dirty_block(
 }
 
 /// Returns memory range reserved for the appended payload.
-pub fn appended_payload_range() -> Range<usize> {
+pub fn appended_payload_range() -> MemoryRange {
     let start = align_up(layout::binary_end(), SIZE_4KB).unwrap();
     // pvmfw is contained in a 2MiB region so the payload can't be larger than the 2MiB alignment.
     let end = align_up(start, SIZE_2MB).unwrap();
@@ -503,14 +509,14 @@ pub fn appended_payload_range() -> Range<usize> {
 }
 
 /// Region allocated for the stack.
-pub fn stack_range() -> Range<usize> {
+pub fn stack_range() -> MemoryRange {
     const STACK_PAGES: usize = 8;
 
     layout::stack_range(STACK_PAGES * PVMFW_PAGE_SIZE)
 }
 
 pub fn init_page_table() -> result::Result<PageTable, MapError> {
-    let mut page_table: PageTable = IdMap::new(PT_ASID, PT_ROOT_LEVEL).into();
+    let mut page_table = PageTable::default();
 
     // Stack and scratch ranges are explicitly zeroed and flushed before jumping to payload,
     // so dirty state management can be omitted.
