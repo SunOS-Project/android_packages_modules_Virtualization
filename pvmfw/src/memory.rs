@@ -17,13 +17,11 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use crate::helpers::PVMFW_PAGE_SIZE;
-use aarch64_paging::paging::{Attributes, Descriptor, MemoryRegion as VaRange};
 use aarch64_paging::MapError;
 use alloc::alloc::handle_alloc_error;
 use alloc::boxed::Box;
 use buddy_system_allocator::LockedFrameAllocator;
 use core::alloc::Layout;
-use core::fmt;
 use core::iter::once;
 use core::num::NonZeroUsize;
 use core::ops::Range;
@@ -36,19 +34,18 @@ use once_cell::race::OnceBox;
 use spin::mutex::SpinMutex;
 use tinyvec::ArrayVec;
 use vmbase::{
-    dsb, isb, layout,
+    dsb, layout,
     memory::{
-        flush_dirty_range, is_leaf_pte, page_4kb_of, set_dbm_enabled, MemorySharer, PageTable,
-        MMIO_LAZY_MAP_FLAG, PT_ASID, SIZE_2MB, SIZE_4KB,
+        flush_dirty_range, mark_dirty_block, mmio_guard_unmap_page, page_4kb_of, set_dbm_enabled,
+        verify_lazy_mapped_block, MemorySharer, MemoryTrackerError, PageTable, SIZE_2MB, SIZE_4KB,
     },
-    tlbi,
     util::{align_up, RangeExt as _},
 };
 
 /// First address that can't be translated by a level 1 TTBR0_EL1.
 pub const MAX_ADDR: usize = 1 << 40;
 
-pub type MemoryRange = Range<usize>;
+type MemoryRange = Range<usize>;
 
 pub static MEMORY: SpinMutex<Option<MemoryTracker>> = SpinMutex::new(None);
 unsafe impl Send for MemoryTracker {}
@@ -74,66 +71,6 @@ pub struct MemoryTracker {
     mmio_regions: ArrayVec<[MemoryRange; MemoryTracker::MMIO_CAPACITY]>,
     mmio_range: MemoryRange,
     payload_range: MemoryRange,
-}
-
-/// Errors for MemoryTracker operations.
-#[derive(Debug, Clone)]
-pub enum MemoryTrackerError {
-    /// Tried to modify the memory base address.
-    DifferentBaseAddress,
-    /// Tried to shrink to a larger memory size.
-    SizeTooLarge,
-    /// Tracked regions would not fit in memory size.
-    SizeTooSmall,
-    /// Reached limit number of tracked regions.
-    Full,
-    /// Region is out of the tracked memory address space.
-    OutOfRange,
-    /// New region overlaps with tracked regions.
-    Overlaps,
-    /// Region couldn't be mapped.
-    FailedToMap,
-    /// Region couldn't be unmapped.
-    FailedToUnmap,
-    /// Error from the interaction with the hypervisor.
-    Hypervisor(hyp::Error),
-    /// Failure to set `SHARED_MEMORY`.
-    SharedMemorySetFailure,
-    /// Failure to set `SHARED_POOL`.
-    SharedPoolSetFailure,
-    /// Invalid page table entry.
-    InvalidPte,
-    /// Failed to flush memory region.
-    FlushRegionFailed,
-    /// Failed to set PTE dirty state.
-    SetPteDirtyFailed,
-}
-
-impl fmt::Display for MemoryTrackerError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::DifferentBaseAddress => write!(f, "Received different base address"),
-            Self::SizeTooLarge => write!(f, "Tried to shrink to a larger memory size"),
-            Self::SizeTooSmall => write!(f, "Tracked regions would not fit in memory size"),
-            Self::Full => write!(f, "Reached limit number of tracked regions"),
-            Self::OutOfRange => write!(f, "Region is out of the tracked memory address space"),
-            Self::Overlaps => write!(f, "New region overlaps with tracked regions"),
-            Self::FailedToMap => write!(f, "Failed to map the new region"),
-            Self::FailedToUnmap => write!(f, "Failed to unmap the new region"),
-            Self::Hypervisor(e) => e.fmt(f),
-            Self::SharedMemorySetFailure => write!(f, "Failed to set SHARED_MEMORY"),
-            Self::SharedPoolSetFailure => write!(f, "Failed to set SHARED_POOL"),
-            Self::InvalidPte => write!(f, "Page table entry is not valid"),
-            Self::FlushRegionFailed => write!(f, "Failed to flush memory region"),
-            Self::SetPteDirtyFailed => write!(f, "Failed to set PTE dirty state"),
-        }
-    }
-}
-
-impl From<hyp::Error> for MemoryTrackerError {
-    fn from(e: hyp::Error) -> Self {
-        Self::Hypervisor(e)
-    }
 }
 
 type Result<T> = result::Result<T, MemoryTrackerError>;
@@ -417,87 +354,6 @@ pub unsafe fn dealloc_shared(vaddr: NonNull<u8>, layout: Layout) -> hyp::Result<
 
     trace!("Deallocated shared buffer at {vaddr:?} with {layout:?}");
     Ok(())
-}
-
-/// Checks whether block flags indicate it should be MMIO guard mapped.
-fn verify_lazy_mapped_block(
-    _range: &VaRange,
-    desc: &mut Descriptor,
-    level: usize,
-) -> result::Result<(), ()> {
-    let flags = desc.flags().expect("Unsupported PTE flags set");
-    if !is_leaf_pte(&flags, level) {
-        return Ok(()); // Skip table PTEs as they aren't tagged with MMIO_LAZY_MAP_FLAG.
-    }
-    if flags.contains(MMIO_LAZY_MAP_FLAG) && !flags.contains(Attributes::VALID) {
-        Ok(())
-    } else {
-        Err(())
-    }
-}
-
-/// MMIO guard unmaps page
-fn mmio_guard_unmap_page(
-    va_range: &VaRange,
-    desc: &mut Descriptor,
-    level: usize,
-) -> result::Result<(), ()> {
-    let flags = desc.flags().expect("Unsupported PTE flags set");
-    if !is_leaf_pte(&flags, level) {
-        return Ok(());
-    }
-    // This function will be called on an address range that corresponds to a device. Only if a
-    // page has been accessed (written to or read from), will it contain the VALID flag and be MMIO
-    // guard mapped. Therefore, we can skip unmapping invalid pages, they were never MMIO guard
-    // mapped anyway.
-    if flags.contains(Attributes::VALID) {
-        assert!(
-            flags.contains(MMIO_LAZY_MAP_FLAG),
-            "Attempting MMIO guard unmap for non-device pages"
-        );
-        assert_eq!(
-            va_range.len(),
-            PVMFW_PAGE_SIZE,
-            "Failed to break down block mapping before MMIO guard mapping"
-        );
-        let page_base = va_range.start().0;
-        assert_eq!(page_base % PVMFW_PAGE_SIZE, 0);
-        // Since mmio_guard_map takes IPAs, if pvmfw moves non-ID address mapping, page_base
-        // should be converted to IPA. However, since 0x0 is a valid MMIO address, we don't use
-        // virt_to_phys here, and just pass page_base instead.
-        get_hypervisor().mmio_guard_unmap(page_base).map_err(|e| {
-            error!("Error MMIO guard unmapping: {e}");
-        })?;
-    }
-    Ok(())
-}
-
-/// Clears read-only flag on a PTE, making it writable-dirty. Used when dirty state is managed
-/// in software to handle permission faults on read-only descriptors.
-fn mark_dirty_block(
-    va_range: &VaRange,
-    desc: &mut Descriptor,
-    level: usize,
-) -> result::Result<(), ()> {
-    let flags = desc.flags().ok_or(())?;
-    if !is_leaf_pte(&flags, level) {
-        return Ok(());
-    }
-    if flags.contains(Attributes::DBM) {
-        assert!(flags.contains(Attributes::READ_ONLY), "unexpected PTE writable state");
-        desc.modify_flags(Attributes::empty(), Attributes::READ_ONLY);
-        // Updating the read-only bit of a PTE requires TLB invalidation.
-        // A TLB maintenance instruction is only guaranteed to be complete after a DSB instruction.
-        // An ISB instruction is required to ensure the effects of completed TLB maintenance
-        // instructions are visible to instructions fetched afterwards.
-        // See ARM ARM E2.3.10, and G5.9.
-        tlbi!("vale1", PT_ASID, va_range.start().0);
-        dsb!("ish");
-        isb!();
-        Ok(())
-    } else {
-        Err(())
-    }
 }
 
 /// Returns memory range reserved for the appended payload.

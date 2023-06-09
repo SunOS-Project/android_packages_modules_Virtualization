@@ -14,13 +14,14 @@
 
 //! Page table management.
 
+use crate::read_sysreg;
 use aarch64_paging::idmap::IdMap;
 use aarch64_paging::paging::{Attributes, MemoryRegion, PteUpdater};
 use aarch64_paging::MapError;
 use core::{ops::Range, result};
 
 /// Software bit used to indicate a device that should be lazily mapped.
-pub const MMIO_LAZY_MAP_FLAG: Attributes = Attributes::SWFLAG_0;
+pub(super) const MMIO_LAZY_MAP_FLAG: Attributes = Attributes::SWFLAG_0;
 
 // We assume that:
 // - MAIR_EL1.Attr0 = "Device-nGnRE memory" (0b0000_0100)
@@ -34,12 +35,6 @@ const CODE: Attributes = MEMORY.union(Attributes::READ_ONLY);
 const DATA: Attributes = MEMORY.union(Attributes::EXECUTE_NEVER);
 const RODATA: Attributes = DATA.union(Attributes::READ_ONLY);
 const DATA_DBM: Attributes = RODATA.union(Attributes::DBM);
-
-/// Root level is given by the value of TCR_EL1.TG0 and TCR_EL1.T0SZ, set in
-/// entry.S. For 4KB granule and 39-bit VA, the root level is 1.
-const PT_ROOT_LEVEL: usize = 1;
-/// Page table ASID.
-pub const PT_ASID: usize = 1;
 
 type Result<T> = result::Result<T, MapError>;
 
@@ -56,11 +51,30 @@ impl From<IdMap> for PageTable {
 
 impl Default for PageTable {
     fn default() -> Self {
-        IdMap::new(PT_ASID, PT_ROOT_LEVEL).into()
+        const TCR_EL1_TG0_MASK: usize = 0x3;
+        const TCR_EL1_TG0_SHIFT: u32 = 14;
+        const TCR_EL1_TG0_SIZE_4KB: usize = 0b00;
+
+        const TCR_EL1_T0SZ_MASK: usize = 0x3f;
+        const TCR_EL1_T0SZ_SHIFT: u32 = 0;
+        const TCR_EL1_T0SZ_39_VA_BITS: usize = 64 - 39;
+
+        // Ensure that entry.S wasn't changed without updating the assumptions about TCR_EL1 here.
+        let tcr_el1 = read_sysreg!("tcr_el1");
+        assert_eq!((tcr_el1 >> TCR_EL1_TG0_SHIFT) & TCR_EL1_TG0_MASK, TCR_EL1_TG0_SIZE_4KB);
+        assert_eq!((tcr_el1 >> TCR_EL1_T0SZ_SHIFT) & TCR_EL1_T0SZ_MASK, TCR_EL1_T0SZ_39_VA_BITS);
+
+        IdMap::new(Self::ASID, Self::ROOT_LEVEL).into()
     }
 }
 
 impl PageTable {
+    /// ASID used for the underlying page table.
+    pub const ASID: usize = 1;
+
+    /// Level of the underlying page table's root page.
+    const ROOT_LEVEL: usize = 1;
+
     /// Activates the page table.
     ///
     /// # Safety
@@ -123,7 +137,7 @@ impl PageTable {
 
 /// Checks whether a PTE at given level is a page or block descriptor.
 #[inline]
-pub fn is_leaf_pte(flags: &Attributes, level: usize) -> bool {
+pub(super) fn is_leaf_pte(flags: &Attributes, level: usize) -> bool {
     const LEAF_PTE_LEVEL: usize = 3;
     if flags.contains(Attributes::TABLE_OR_PAGE) {
         level == LEAF_PTE_LEVEL
