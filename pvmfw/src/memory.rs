@@ -16,8 +16,9 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use crate::helpers::{self, page_4kb_of, RangeExt, SIZE_4KB, SIZE_4MB};
+use crate::helpers::{self, page_4kb_of, RangeExt, PVMFW_PAGE_SIZE, SIZE_4MB};
 use crate::mmu;
+use aarch64_paging::paging::{Attributes, Descriptor, MemoryRegion as VaRange};
 use alloc::alloc::alloc_zeroed;
 use alloc::alloc::dealloc;
 use alloc::alloc::handle_alloc_error;
@@ -28,16 +29,18 @@ use core::alloc::Layout;
 use core::cmp::max;
 use core::cmp::min;
 use core::fmt;
+use core::iter::once;
 use core::num::NonZeroUsize;
 use core::ops::Range;
 use core::ptr::NonNull;
 use core::result;
 use hyp::get_hypervisor;
-use log::error;
 use log::trace;
+use log::{debug, error};
 use once_cell::race::OnceBox;
 use spin::mutex::SpinMutex;
 use tinyvec::ArrayVec;
+use vmbase::{dsb, isb, memory::set_dbm_enabled, tlbi};
 
 /// Base of the system's contiguous "main" memory.
 pub const BASE_ADDR: usize = 0x8000_0000;
@@ -49,7 +52,7 @@ pub type MemoryRange = Range<usize>;
 pub static MEMORY: SpinMutex<Option<MemoryTracker>> = SpinMutex::new(None);
 unsafe impl Send for MemoryTracker {}
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 enum MemoryType {
     #[default]
     ReadOnly,
@@ -110,12 +113,20 @@ pub enum MemoryTrackerError {
     Overlaps,
     /// Region couldn't be mapped.
     FailedToMap,
+    /// Region couldn't be unmapped.
+    FailedToUnmap,
     /// Error from the interaction with the hypervisor.
     Hypervisor(hyp::Error),
     /// Failure to set `SHARED_MEMORY`.
     SharedMemorySetFailure,
     /// Failure to set `SHARED_POOL`.
     SharedPoolSetFailure,
+    /// Invalid page table entry.
+    InvalidPte,
+    /// Failed to flush memory region.
+    FlushRegionFailed,
+    /// Failed to set PTE dirty state.
+    SetPteDirtyFailed,
 }
 
 impl fmt::Display for MemoryTrackerError {
@@ -128,9 +139,13 @@ impl fmt::Display for MemoryTrackerError {
             Self::OutOfRange => write!(f, "Region is out of the tracked memory address space"),
             Self::Overlaps => write!(f, "New region overlaps with tracked regions"),
             Self::FailedToMap => write!(f, "Failed to map the new region"),
+            Self::FailedToUnmap => write!(f, "Failed to unmap the new region"),
             Self::Hypervisor(e) => e.fmt(f),
             Self::SharedMemorySetFailure => write!(f, "Failed to set SHARED_MEMORY"),
             Self::SharedPoolSetFailure => write!(f, "Failed to set SHARED_POOL"),
+            Self::InvalidPte => write!(f, "Page table entry is not valid"),
+            Self::FlushRegionFailed => write!(f, "Failed to flush memory region"),
+            Self::SetPteDirtyFailed => write!(f, "Failed to set PTE dirty state"),
         }
     }
 }
@@ -206,7 +221,18 @@ impl MemoryTracker {
     const PVMFW_RANGE: MemoryRange = (BASE_ADDR - SIZE_4MB)..BASE_ADDR;
 
     /// Create a new instance from an active page table, covering the maximum RAM size.
-    pub fn new(page_table: mmu::PageTable) -> Self {
+    pub fn new(mut page_table: mmu::PageTable) -> Self {
+        // Activate dirty state management first, otherwise we may get permission faults immediately
+        // after activating the new page table. This has no effect before the new page table is
+        // activated because none of the entries in the initial idmap have the DBM flag.
+        set_dbm_enabled(true);
+
+        debug!("Activating dynamic page table...");
+        // SAFETY - page_table duplicates the static mappings for everything that the Rust code is
+        // aware of so activating it shouldn't have any visible effect.
+        unsafe { page_table.activate() };
+        debug!("... Success!");
+
         Self {
             total: BASE_ADDR..MAX_ADDR,
             page_table,
@@ -279,14 +305,10 @@ impl MemoryTracker {
             return Err(MemoryTrackerError::Full);
         }
 
-        self.page_table.map_device(&range).map_err(|e| {
+        self.page_table.map_device_lazy(&range).map_err(|e| {
             error!("Error during MMIO device mapping: {e}");
             MemoryTrackerError::FailedToMap
         })?;
-
-        for page_base in page_iterator(&range) {
-            get_hypervisor().mmio_guard_map(page_base)?;
-        }
 
         if self.mmio_regions.try_push(range).is_some() {
             return Err(MemoryTrackerError::Full);
@@ -322,13 +344,12 @@ impl MemoryTracker {
     /// Unmaps all tracked MMIO regions from the MMIO guard.
     ///
     /// Note that they are not unmapped from the page table.
-    pub fn mmio_unmap_all(&self) -> Result<()> {
-        for region in &self.mmio_regions {
-            for page_base in page_iterator(region) {
-                get_hypervisor().mmio_guard_unmap(page_base)?;
-            }
+    pub fn mmio_unmap_all(&mut self) -> Result<()> {
+        for range in &self.mmio_regions {
+            self.page_table
+                .modify_range(range, &mmio_guard_unmap_page)
+                .map_err(|_| MemoryTrackerError::FailedToUnmap)?;
         }
-
         Ok(())
     }
 
@@ -372,27 +393,57 @@ impl MemoryTracker {
     pub fn unshare_all_memory(&mut self) {
         drop(SHARED_MEMORY.lock().take());
     }
+
+    /// Handles translation fault for blocks flagged for lazy MMIO mapping by enabling the page
+    /// table entry and MMIO guard mapping the block. Breaks apart a block entry if required.
+    pub fn handle_mmio_fault(&mut self, addr: usize) -> Result<()> {
+        let page_range = page_4kb_of(addr)..page_4kb_of(addr) + PVMFW_PAGE_SIZE;
+        self.page_table
+            .modify_range(&page_range, &verify_lazy_mapped_block)
+            .map_err(|_| MemoryTrackerError::InvalidPte)?;
+        get_hypervisor().mmio_guard_map(page_range.start)?;
+        // Maps a single device page, breaking up block mappings if necessary.
+        self.page_table.map_device(&page_range).map_err(|_| MemoryTrackerError::FailedToMap)
+    }
+
+    /// Flush all memory regions marked as writable-dirty.
+    fn flush_dirty_pages(&mut self) -> Result<()> {
+        // Collect memory ranges for which dirty state is tracked.
+        let writable_regions =
+            self.regions.iter().filter(|r| r.mem_type == MemoryType::ReadWrite).map(|r| &r.range);
+        let payload_range = mmu::PageTable::appended_payload_range();
+        // Execute a barrier instruction to ensure all hardware updates to the page table have been
+        // observed before reading PTE flags to determine dirty state.
+        dsb!("ish");
+        // Now flush writable-dirty pages in those regions.
+        for range in writable_regions.chain(once(&payload_range)) {
+            self.page_table
+                .modify_range(range, &flush_dirty_range)
+                .map_err(|_| MemoryTrackerError::FlushRegionFailed)?;
+        }
+        Ok(())
+    }
+
+    /// Handles permission fault for read-only blocks by setting writable-dirty state.
+    /// In general, this should be called from the exception handler when hardware dirty
+    /// state management is disabled or unavailable.
+    pub fn handle_permission_fault(&mut self, addr: usize) -> Result<()> {
+        self.page_table
+            .modify_range(&(addr..addr + 1), &mark_dirty_block)
+            .map_err(|_| MemoryTrackerError::SetPteDirtyFailed)
+    }
 }
 
 impl Drop for MemoryTracker {
     fn drop(&mut self) {
-        for region in &self.regions {
-            match region.mem_type {
-                MemoryType::ReadWrite => {
-                    // TODO(b/269738062): Use PT's dirty bit to only flush pages that were touched.
-                    helpers::flush_region(region.range.start, region.range.len())
-                }
-                MemoryType::ReadOnly => {}
-            }
-        }
-        self.unshare_all_memory()
+        set_dbm_enabled(false);
+        self.flush_dirty_pages().unwrap();
+        self.unshare_all_memory();
     }
 }
 
-/// Allocates a memory range of at least the given size that is shared with
-/// host. Returns a pointer to the buffer.
-///
-/// It will be aligned to the memory sharing granule size supported by the hypervisor.
+/// Allocates a memory range of at least the given size and alignment that is shared with the host.
+/// Returns a pointer to the buffer.
 pub fn alloc_shared(layout: Layout) -> hyp::Result<NonNull<u8>> {
     assert_ne!(layout.size(), 0);
     let Some(buffer) = try_shared_alloc(layout) else {
@@ -418,22 +469,17 @@ fn try_shared_alloc(layout: Layout) -> Option<NonNull<u8>> {
 
 /// Unshares and deallocates a memory range which was previously allocated by `alloc_shared`.
 ///
-/// The size passed in must be the size passed to the original `alloc_shared` call.
+/// The layout passed in must be the same layout passed to the original `alloc_shared` call.
 ///
 /// # Safety
 ///
-/// The memory must have been allocated by `alloc_shared` with the same size, and not yet
+/// The memory must have been allocated by `alloc_shared` with the same layout, and not yet
 /// deallocated.
 pub unsafe fn dealloc_shared(vaddr: NonNull<u8>, layout: Layout) -> hyp::Result<()> {
     SHARED_POOL.get().unwrap().lock().dealloc_aligned(vaddr.as_ptr() as usize, layout);
 
     trace!("Deallocated shared buffer at {vaddr:?} with {layout:?}");
     Ok(())
-}
-
-/// Returns an iterator which yields the base address of each 4 KiB page within the given range.
-fn page_iterator(range: &MemoryRange) -> impl Iterator<Item = usize> {
-    (page_4kb_of(range.start)..range.end).step_by(SIZE_4KB)
 }
 
 /// Returns the intermediate physical address corresponding to the given virtual address.
@@ -450,4 +496,113 @@ pub fn virt_to_phys(vaddr: NonNull<u8>) -> usize {
 /// Panics if `paddr` is 0.
 pub fn phys_to_virt(paddr: usize) -> NonNull<u8> {
     NonNull::new(paddr as _).unwrap()
+}
+
+/// Checks whether a PTE at given level is a page or block descriptor.
+#[inline]
+fn is_leaf_pte(flags: &Attributes, level: usize) -> bool {
+    const LEAF_PTE_LEVEL: usize = 3;
+    if flags.contains(Attributes::TABLE_OR_PAGE) {
+        level == LEAF_PTE_LEVEL
+    } else {
+        level < LEAF_PTE_LEVEL
+    }
+}
+
+/// Checks whether block flags indicate it should be MMIO guard mapped.
+fn verify_lazy_mapped_block(
+    _range: &VaRange,
+    desc: &mut Descriptor,
+    level: usize,
+) -> result::Result<(), ()> {
+    let flags = desc.flags().expect("Unsupported PTE flags set");
+    if !is_leaf_pte(&flags, level) {
+        return Ok(()); // Skip table PTEs as they aren't tagged with MMIO_LAZY_MAP_FLAG.
+    }
+    if flags.contains(mmu::MMIO_LAZY_MAP_FLAG) && !flags.contains(Attributes::VALID) {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+/// MMIO guard unmaps page
+fn mmio_guard_unmap_page(
+    va_range: &VaRange,
+    desc: &mut Descriptor,
+    level: usize,
+) -> result::Result<(), ()> {
+    let flags = desc.flags().expect("Unsupported PTE flags set");
+    if !is_leaf_pte(&flags, level) {
+        return Ok(());
+    }
+    // This function will be called on an address range that corresponds to a device. Only if a
+    // page has been accessed (written to or read from), will it contain the VALID flag and be MMIO
+    // guard mapped. Therefore, we can skip unmapping invalid pages, they were never MMIO guard
+    // mapped anyway.
+    if flags.contains(Attributes::VALID) {
+        assert!(
+            flags.contains(mmu::MMIO_LAZY_MAP_FLAG),
+            "Attempting MMIO guard unmap for non-device pages"
+        );
+        assert_eq!(
+            va_range.len(),
+            PVMFW_PAGE_SIZE,
+            "Failed to break down block mapping before MMIO guard mapping"
+        );
+        let page_base = va_range.start().0;
+        assert_eq!(page_base % PVMFW_PAGE_SIZE, 0);
+        // Since mmio_guard_map takes IPAs, if pvmfw moves non-ID address mapping, page_base
+        // should be converted to IPA. However, since 0x0 is a valid MMIO address, we don't use
+        // virt_to_phys here, and just pass page_base instead.
+        get_hypervisor().mmio_guard_unmap(page_base).map_err(|e| {
+            error!("Error MMIO guard unmapping: {e}");
+        })?;
+    }
+    Ok(())
+}
+
+/// Flushes a memory range the descriptor refers to, if the descriptor is in writable-dirty state.
+fn flush_dirty_range(
+    va_range: &VaRange,
+    desc: &mut Descriptor,
+    level: usize,
+) -> result::Result<(), ()> {
+    // Only flush ranges corresponding to dirty leaf PTEs.
+    let flags = desc.flags().ok_or(())?;
+    if !is_leaf_pte(&flags, level) {
+        return Ok(());
+    }
+    if !flags.contains(Attributes::READ_ONLY) {
+        helpers::flush_region(va_range.start().0, va_range.len());
+    }
+    Ok(())
+}
+
+/// Clears read-only flag on a PTE, making it writable-dirty. Used when dirty state is managed
+/// in software to handle permission faults on read-only descriptors.
+fn mark_dirty_block(
+    va_range: &VaRange,
+    desc: &mut Descriptor,
+    level: usize,
+) -> result::Result<(), ()> {
+    let flags = desc.flags().ok_or(())?;
+    if !is_leaf_pte(&flags, level) {
+        return Ok(());
+    }
+    if flags.contains(Attributes::DBM) {
+        assert!(flags.contains(Attributes::READ_ONLY), "unexpected PTE writable state");
+        desc.modify_flags(Attributes::empty(), Attributes::READ_ONLY);
+        // Updating the read-only bit of a PTE requires TLB invalidation.
+        // A TLB maintenance instruction is only guaranteed to be complete after a DSB instruction.
+        // An ISB instruction is required to ensure the effects of completed TLB maintenance
+        // instructions are visible to instructions fetched afterwards.
+        // See ARM ARM E2.3.10, and G5.9.
+        tlbi!("vale1", mmu::PageTable::ASID, va_range.start().0);
+        dsb!("ish");
+        isb!();
+        Ok(())
+    } else {
+        Err(())
+    }
 }

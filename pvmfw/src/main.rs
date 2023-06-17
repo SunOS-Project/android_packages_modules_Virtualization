@@ -44,15 +44,16 @@ use crate::fdt::modify_for_next_stage;
 use crate::helpers::flush;
 use crate::helpers::GUEST_PAGE_SIZE;
 use crate::instance::get_or_generate_instance_salt;
-use crate::memory::MemoryTracker;
+use crate::memory::MEMORY;
 use crate::virtio::pci;
 use alloc::boxed::Box;
 use core::ops::Range;
-use diced_open_dice::{bcc_handover_main_flow, bcc_handover_parse, DiceArtifacts};
+use diced_open_dice::{bcc_handover_parse, DiceArtifacts};
 use fdtpci::{PciError, PciInfo};
 use libfdt::Fdt;
 use log::{debug, error, info, trace, warn};
 use pvmfw_avb::verify_payload;
+use pvmfw_avb::Capability;
 use pvmfw_avb::DebugLevel;
 use pvmfw_embedded_key::PUBLIC_KEY;
 
@@ -64,7 +65,6 @@ fn main(
     ramdisk: Option<&[u8]>,
     current_bcc_handover: &[u8],
     mut debug_policy: Option<&mut [u8]>,
-    memory: &mut MemoryTracker,
 ) -> Result<Range<usize>, RebootReason> {
     info!("pVM firmware");
     debug!("FDT: {:?}", fdt.as_ptr());
@@ -99,12 +99,16 @@ fn main(
     // Set up PCI bus for VirtIO devices.
     let pci_info = PciInfo::from_fdt(fdt).map_err(handle_pci_error)?;
     debug!("PCI: {:#x?}", pci_info);
-    let mut pci_root = pci::initialise(pci_info, memory)?;
+    let mut pci_root = pci::initialise(pci_info, MEMORY.lock().as_mut().unwrap())?;
 
     let verified_boot_data = verify_payload(signed_kernel, ramdisk, PUBLIC_KEY).map_err(|e| {
         error!("Failed to verify the payload: {e}");
         RebootReason::PayloadVerificationError
     })?;
+
+    if verified_boot_data.capabilities.contains(&Capability::RemoteAttest) {
+        info!("Service VM capable of remote attestation detected");
+    }
 
     let next_bcc = heap::aligned_boxed_slice(NEXT_BCC_SIZE, GUEST_PAGE_SIZE).ok_or_else(|| {
         error!("Failed to allocate the next-stage BCC");
@@ -124,13 +128,6 @@ fn main(
         })?;
     trace!("Got salt from instance.img: {salt:x?}");
 
-    let mut config_descriptor_buffer = [0; 128];
-    let dice_inputs =
-        dice_inputs.into_input_values(&salt, &mut config_descriptor_buffer).map_err(|e| {
-            error!("Failed to generate DICE inputs: {e:?}");
-            RebootReason::InternalError
-        })?;
-
     // It is possible that the DICE chain we were given is rooted in the UDS. We do not want to give
     // such a chain to the payload, or even the associated CDIs. So remove the entire chain we
     // were given and taint the CDIs. Note that the resulting CDIs are still deterministically
@@ -141,11 +138,12 @@ fn main(
         RebootReason::InternalError
     })?;
 
-    let _ = bcc_handover_main_flow(truncated_bcc_handover.as_slice(), &dice_inputs, next_bcc)
-        .map_err(|e| {
+    dice_inputs.write_next_bcc(truncated_bcc_handover.as_slice(), &salt, next_bcc).map_err(
+        |e| {
             error!("Failed to derive next-stage DICE secrets: {e:?}");
             RebootReason::SecretDerivationError
-        })?;
+        },
+    )?;
     flush(next_bcc);
 
     let strict_boot = true;

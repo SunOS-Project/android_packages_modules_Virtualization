@@ -28,7 +28,8 @@ use aarch64_paging::{
     paging::{Attributes, MemoryRegion},
 };
 use buddy_system_allocator::LockedHeap;
-use core::ops::Range;
+use core::{ops::Range, slice};
+use fdtpci::PciInfo;
 use hyp::get_hypervisor;
 use log::{debug, error, info};
 use vmbase::{layout, main, power::reboot};
@@ -44,21 +45,21 @@ const SZ_1G: usize = 1024 * SZ_1M;
 const PT_ROOT_LEVEL: usize = 1;
 const PT_ASID: usize = 1;
 
-const PROT_DEV: Attributes = Attributes::from_bits_truncate(
-    Attributes::DEVICE_NGNRE.bits() | Attributes::EXECUTE_NEVER.bits(),
-);
-const PROT_RX: Attributes = Attributes::from_bits_truncate(
-    Attributes::NORMAL.bits() | Attributes::NON_GLOBAL.bits() | Attributes::READ_ONLY.bits(),
-);
-const PROT_RO: Attributes = Attributes::from_bits_truncate(
-    Attributes::NORMAL.bits()
-        | Attributes::NON_GLOBAL.bits()
-        | Attributes::READ_ONLY.bits()
-        | Attributes::EXECUTE_NEVER.bits(),
-);
-const PROT_RW: Attributes = Attributes::from_bits_truncate(
-    Attributes::NORMAL.bits() | Attributes::NON_GLOBAL.bits() | Attributes::EXECUTE_NEVER.bits(),
-);
+const PROT_DEV: Attributes =
+    Attributes::DEVICE_NGNRE.union(Attributes::EXECUTE_NEVER).union(Attributes::VALID);
+const PROT_RX: Attributes = Attributes::NORMAL
+    .union(Attributes::NON_GLOBAL)
+    .union(Attributes::READ_ONLY)
+    .union(Attributes::VALID);
+const PROT_RO: Attributes = Attributes::NORMAL
+    .union(Attributes::NON_GLOBAL)
+    .union(Attributes::READ_ONLY)
+    .union(Attributes::EXECUTE_NEVER)
+    .union(Attributes::VALID);
+const PROT_RW: Attributes = Attributes::NORMAL
+    .union(Attributes::NON_GLOBAL)
+    .union(Attributes::EXECUTE_NEVER)
+    .union(Attributes::VALID);
 
 #[global_allocator]
 static HEAP_ALLOCATOR: LockedHeap<32> = LockedHeap::<32>::new();
@@ -113,8 +114,17 @@ fn try_init_logger() -> Result<()> {
     vmbase::logger::init(log::LevelFilter::Debug).map_err(|_| Error::LoggerInit)
 }
 
-fn try_main() -> Result<()> {
+/// # Safety
+///
+/// Behavior is undefined if any of the following conditions are violated:
+/// * The `fdt_addr` must be a valid pointer and points to a valid `Fdt`.
+unsafe fn try_main(fdt_addr: usize) -> Result<()> {
     info!("Welcome to Rialto!");
+    // SAFETY: The caller ensures that `fdt_addr` is valid.
+    let fdt = unsafe { slice::from_raw_parts(fdt_addr as *mut u8, SZ_1M) };
+    let fdt = libfdt::Fdt::from_slice(fdt)?;
+    let pci_info = PciInfo::from_fdt(fdt)?;
+    debug!("PCI: {:#x?}", pci_info);
 
     let mut pgt = IdMap::new(PT_ASID, PT_ROOT_LEVEL);
     init_kernel_pgt(&mut pgt)?;
@@ -122,13 +132,15 @@ fn try_main() -> Result<()> {
 }
 
 /// Entry point for Rialto.
-pub fn main(_a0: u64, _a1: u64, _a2: u64, _a3: u64) {
+pub fn main(fdt_addr: u64, _a1: u64, _a2: u64, _a3: u64) {
     init_heap();
     if try_init_logger().is_err() {
         // Don't log anything if the logger initialization fails.
         reboot();
     }
-    match try_main() {
+    // SAFETY: `fdt_addr` is supposed to be a valid pointer and points to
+    // a valid `Fdt`.
+    match unsafe { try_main(fdt_addr as usize) } {
         Ok(()) => info!("Rialto ends successfully."),
         Err(e) => {
             error!("Rialto failed with {e}");

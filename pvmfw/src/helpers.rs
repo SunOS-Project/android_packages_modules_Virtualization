@@ -16,6 +16,7 @@
 
 use core::arch::asm;
 use core::ops::Range;
+use vmbase::read_sysreg;
 use zeroize::Zeroize;
 
 pub const SIZE_4KB: usize = 4 << 10;
@@ -24,40 +25,6 @@ pub const SIZE_4MB: usize = 4 << 20;
 
 pub const GUEST_PAGE_SIZE: usize = SIZE_4KB;
 pub const PVMFW_PAGE_SIZE: usize = SIZE_4KB;
-
-/// Read a value from a system register.
-#[macro_export]
-macro_rules! read_sysreg {
-    ($sysreg:literal) => {{
-        let mut r: usize;
-        // Safe because it reads a system register and does not affect Rust.
-        unsafe {
-            core::arch::asm!(
-                concat!("mrs {}, ", $sysreg),
-                out(reg) r,
-                options(nomem, nostack, preserves_flags),
-            )
-        }
-        r
-    }};
-}
-
-/// Write a value to a system register.
-///
-/// # Safety
-///
-/// Callers must ensure that side effects of updating the system register are properly handled.
-#[macro_export]
-macro_rules! write_sysreg {
-    ($sysreg:literal, $val:expr) => {{
-        let value: usize = $val;
-        core::arch::asm!(
-            concat!("msr ", $sysreg, ", {}"),
-            in(reg) value,
-            options(nomem, nostack, preserves_flags),
-        )
-    }};
-}
 
 /// Computes the largest multiple of the provided alignment smaller or equal to the address.
 ///
@@ -182,6 +149,6 @@ impl<T: PartialOrd> RangeExt for Range<T> {
 #[macro_export]
 macro_rules! cstr {
     ($str:literal) => {{
-        CStr::from_bytes_with_nul(concat!($str, "\0").as_bytes()).unwrap()
+        core::ffi::CStr::from_bytes_with_nul(concat!($str, "\0").as_bytes()).unwrap()
     }};
 }

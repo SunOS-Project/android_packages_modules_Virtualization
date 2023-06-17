@@ -24,7 +24,7 @@ use crate::memory::{MemoryTracker, MEMORY};
 use crate::mmu;
 use crate::rand;
 use core::arch::asm;
-use core::mem::size_of;
+use core::mem::{drop, size_of};
 use core::num::NonZeroUsize;
 use core::ops::Range;
 use core::slice;
@@ -35,6 +35,7 @@ use log::info;
 use log::warn;
 use log::LevelFilter;
 use vmbase::{console, layout, logger, main, power::reboot};
+use zeroize::Zeroize;
 
 #[derive(Debug, Clone)]
 pub enum RebootReason {
@@ -64,6 +65,9 @@ pub fn start(fdt_address: u64, payload_start: u64, payload_size: u64, _arg3: u64
     // - can't access non-pvmfw memory (only statically-mapped memory)
     // - can't access MMIO (therefore, no logging)
 
+    // SAFETY - This function should and will only be called once, here.
+    unsafe { heap::init() };
+
     match main_wrapper(fdt_address as usize, payload_start as usize, payload_size as usize) {
         Ok((entry, bcc)) => jump_to_payload(fdt_address, entry.try_into().unwrap(), bcc),
         Err(_) => reboot(), // TODO(b/220071963) propagate the reason back to the host.
@@ -79,18 +83,13 @@ struct MemorySlices<'a> {
 }
 
 impl<'a> MemorySlices<'a> {
-    fn new(
-        fdt: usize,
-        kernel: usize,
-        kernel_size: usize,
-        memory: &mut MemoryTracker,
-    ) -> Result<Self, RebootReason> {
+    fn new(fdt: usize, kernel: usize, kernel_size: usize) -> Result<Self, RebootReason> {
         // SAFETY - SIZE_2MB is non-zero.
         const FDT_SIZE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(helpers::SIZE_2MB) };
         // TODO - Only map the FDT as read-only, until we modify it right before jump_to_payload()
         // e.g. by generating a DTBO for a template DT in main() and, on return, re-map DT as RW,
         // overwrite with the template DT and apply the DTBO.
-        let range = memory.alloc_mut(fdt, FDT_SIZE).map_err(|e| {
+        let range = MEMORY.lock().as_mut().unwrap().alloc_mut(fdt, FDT_SIZE).map_err(|e| {
             error!("Failed to allocate the FDT range: {e}");
             RebootReason::InternalError
         })?;
@@ -107,13 +106,13 @@ impl<'a> MemorySlices<'a> {
 
         let memory_range = info.memory_range;
         debug!("Resizing MemoryTracker to range {memory_range:#x?}");
-        memory.shrink(&memory_range).map_err(|_| {
-            error!("Failed to use memory range value from DT: {memory_range:#x?}");
+        MEMORY.lock().as_mut().unwrap().shrink(&memory_range).map_err(|e| {
+            error!("Failed to use memory range value from DT: {memory_range:#x?}: {e}");
             RebootReason::InvalidFdt
         })?;
 
         if get_hypervisor().has_cap(HypervisorCap::DYNAMIC_MEM_SHARE) {
-            memory.init_dynamic_shared_pool().map_err(|e| {
+            MEMORY.lock().as_mut().unwrap().init_dynamic_shared_pool().map_err(|e| {
                 error!("Failed to initialize dynamically shared pool: {e}");
                 RebootReason::InternalError
             })?;
@@ -123,14 +122,14 @@ impl<'a> MemorySlices<'a> {
                 RebootReason::InvalidFdt
             })?;
 
-            memory.init_static_shared_pool(range).map_err(|e| {
+            MEMORY.lock().as_mut().unwrap().init_static_shared_pool(range).map_err(|e| {
                 error!("Failed to initialize pre-shared pool {e}");
                 RebootReason::InvalidFdt
             })?;
         }
 
         let kernel_range = if let Some(r) = info.kernel_range {
-            memory.alloc_range(&r).map_err(|e| {
+            MEMORY.lock().as_mut().unwrap().alloc_range(&r).map_err(|e| {
                 error!("Failed to obtain the kernel range with DT range: {e}");
                 RebootReason::InternalError
             })?
@@ -142,7 +141,7 @@ impl<'a> MemorySlices<'a> {
                 RebootReason::InvalidPayload
             })?;
 
-            memory.alloc(kernel, kernel_size).map_err(|e| {
+            MEMORY.lock().as_mut().unwrap().alloc(kernel, kernel_size).map_err(|e| {
                 error!("Failed to obtain the kernel range with legacy range: {e}");
                 RebootReason::InternalError
             })?
@@ -157,7 +156,7 @@ impl<'a> MemorySlices<'a> {
 
         let ramdisk = if let Some(r) = info.initrd_range {
             debug!("Located ramdisk at {r:?}");
-            let r = memory.alloc_range(&r).map_err(|e| {
+            let r = MEMORY.lock().as_mut().unwrap().alloc_range(&r).map_err(|e| {
                 error!("Failed to obtain the initrd range: {e}");
                 RebootReason::InvalidRamdisk
             })?;
@@ -188,9 +187,6 @@ fn main_wrapper(
     // - only perform logging once the logger has been initialized
     // - only access non-pvmfw memory once (and while) it has been mapped
 
-    // SAFETY - This function should and will only be called once, here.
-    unsafe { heap::init() };
-
     logger::init(LevelFilter::Info).map_err(|_| RebootReason::InternalError)?;
 
     // Use debug!() to avoid printing to the UART if we failed to configure it as only local
@@ -211,8 +207,6 @@ fn main_wrapper(
     // SAFETY - We only get the appended payload from here, once. It is mapped and the linker
     // script prevents it from overlapping with other objects.
     let appended_data = unsafe { get_appended_data_slice() };
-
-    // Up to this point, we were using the built-in static (from .rodata) page tables.
 
     let mut page_table = mmu::PageTable::from_static_layout().map_err(|e| {
         error!("Failed to set up the dynamic page tables: {e}");
@@ -235,14 +229,10 @@ fn main_wrapper(
 
     let (bcc_slice, debug_policy) = appended.get_entries();
 
-    debug!("Activating dynamic page table...");
-    // SAFETY - page_table duplicates the static mappings for everything that the Rust code is
-    // aware of so activating it shouldn't have any visible effect.
-    unsafe { page_table.activate() };
-    debug!("... Success!");
-
+    // Up to this point, we were using the built-in static (from .rodata) page tables.
     MEMORY.lock().replace(MemoryTracker::new(page_table));
-    let slices = MemorySlices::new(fdt, payload, payload_size, MEMORY.lock().as_mut().unwrap())?;
+
+    let slices = MemorySlices::new(fdt, payload, payload_size)?;
 
     rand::init().map_err(|e| {
         error!("Failed to initialize rand: {e}");
@@ -250,16 +240,10 @@ fn main_wrapper(
     })?;
 
     // This wrapper allows main() to be blissfully ignorant of platform details.
-    let next_bcc = crate::main(
-        slices.fdt,
-        slices.kernel,
-        slices.ramdisk,
-        bcc_slice,
-        debug_policy,
-        MEMORY.lock().as_mut().unwrap(),
-    )?;
+    let next_bcc = crate::main(slices.fdt, slices.kernel, slices.ramdisk, bcc_slice, debug_policy)?;
 
-    helpers::flushed_zeroize(bcc_slice);
+    // Writable-dirty regions will be flushed when MemoryTracker is dropped.
+    bcc_slice.zeroize();
 
     info!("Expecting a bug making MMIO_GUARD_UNMAP return NOT_SUPPORTED on success");
     MEMORY.lock().as_mut().unwrap().mmio_unmap_all().map_err(|e| {
@@ -272,7 +256,9 @@ fn main_wrapper(
         error!("Failed to unshare the UART: {e}");
         RebootReason::InternalError
     })?;
-    MEMORY.lock().take().unwrap();
+
+    // Drop MemoryTracker and deactivate page table.
+    drop(MEMORY.lock().take());
 
     Ok((slices.kernel.as_ptr() as usize, next_bcc))
 }
@@ -402,13 +388,10 @@ fn jump_to_payload(fdt_address: u64, payload_start: u64, bcc: Range<usize>) -> !
 }
 
 unsafe fn get_appended_data_slice() -> &'static mut [u8] {
-    let base = helpers::align_up(layout::binary_end(), helpers::SIZE_4KB).unwrap();
-    // pvmfw is contained in a 2MiB region so the payload can't be larger than the 2MiB alignment.
-    let size = helpers::align_up(base, helpers::SIZE_2MB).unwrap() - base;
-
+    let range = mmu::PageTable::appended_payload_range();
     // SAFETY: This region is mapped and the linker script prevents it from overlapping with other
     // objects.
-    unsafe { slice::from_raw_parts_mut(base as *mut u8, size) }
+    unsafe { slice::from_raw_parts_mut(range.start as *mut u8, range.len()) }
 }
 
 enum AppendedConfigType {
