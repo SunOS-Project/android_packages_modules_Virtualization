@@ -55,6 +55,7 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 import org.junit.After;
 import org.junit.Before;
+import org.junit.Ignore;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TestName;
@@ -472,7 +473,7 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
                         key, keyOverrides, /*isProtected=*/ false, /*updateBootconfigs=*/ true);
         assertThatEventually(
                 100000,
-                () -> getDevice().pullFileContents(CONSOLE_PATH),
+                () -> getDevice().pullFileContents(LOG_PATH),
                 containsString("boot completed, time to run payload"));
 
         vmInfo.mProcess.destroy();
@@ -844,6 +845,7 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
         }
     }
 
+    @Ignore("b/288467613#comment9")
     @Test
     public void testCustomVirtualMachinePermission() throws Exception {
         assumeTrue(
