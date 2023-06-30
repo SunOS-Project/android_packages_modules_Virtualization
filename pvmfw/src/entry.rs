@@ -17,9 +17,7 @@
 use crate::config;
 use crate::crypto;
 use crate::fdt;
-use crate::heap;
 use crate::memory;
-use crate::rand;
 use core::arch::asm;
 use core::mem::{drop, size_of};
 use core::num::NonZeroUsize;
@@ -33,11 +31,12 @@ use log::warn;
 use log::LevelFilter;
 use vmbase::util::RangeExt as _;
 use vmbase::{
-    console,
+    configure_heap, console,
     layout::{self, crosvm},
     logger, main,
-    memory::{min_dcache_line_size, MemoryTracker, MEMORY, SIZE_4KB},
+    memory::{min_dcache_line_size, MemoryTracker, MEMORY, SIZE_128KB, SIZE_4KB},
     power::reboot,
+    rand,
 };
 use zeroize::Zeroize;
 
@@ -62,15 +61,13 @@ pub enum RebootReason {
 }
 
 main!(start);
+configure_heap!(SIZE_128KB);
 
 /// Entry point for pVM firmware.
 pub fn start(fdt_address: u64, payload_start: u64, payload_size: u64, _arg3: u64) {
     // Limitations in this function:
     // - can't access non-pvmfw memory (only statically-mapped memory)
     // - can't access MMIO (therefore, no logging)
-
-    // SAFETY - This function should and will only be called once, here.
-    unsafe { heap::init() };
 
     match main_wrapper(fdt_address as usize, payload_start as usize, payload_size as usize) {
         Ok((entry, bcc)) => jump_to_payload(fdt_address, entry.try_into().unwrap(), bcc),
