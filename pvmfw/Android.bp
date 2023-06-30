@@ -15,7 +15,6 @@ rust_ffi_static {
     rustlibs: [
         "libaarch64_paging",
         "libbssl_ffi_nostd",
-        "libbuddy_system_allocator",
         "libciborium_nostd",
         "libciborium_io_nostd",
         "libdiced_open_dice_nostd",
@@ -136,7 +135,6 @@ rust_library_rlib {
     defaults: ["vmbase_rlib_defaults"],
     srcs: [":pvmfw_embedded_key_rs"],
     crate_name: "pvmfw_embedded_key",
-    apex_available: ["com.android.virt"],
 }
 
 prebuilt_etc {
