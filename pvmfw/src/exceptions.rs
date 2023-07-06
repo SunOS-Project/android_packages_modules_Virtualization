@@ -114,9 +114,22 @@ fn handle_exception(esr: Esr, far: usize) -> Result<(), HandleExceptionError> {
     }
 }
 
+/// Prints the details of an exception failure, excluding UART exceptions.
 #[inline]
-fn handling_uart_exception(esr: Esr, far: usize) -> bool {
-    esr == Esr::DataAbortSyncExternalAbort && page_4kb_of(far) == UART_PAGE
+fn print_exception_failure(
+    esr: Esr,
+    far: usize,
+    elr: u64,
+    e: HandleExceptionError,
+    exception_name: &str,
+) {
+    let is_uart_exception = esr == Esr::DataAbortSyncExternalAbort && page_4kb_of(far) == UART_PAGE;
+    // Don't print to the UART if we are handling an exception it could raise.
+    if !is_uart_exception {
+        eprintln!("{exception_name}");
+        eprintln!("{e}");
+        eprintln!("{esr}, far={far:#08x}, elr={elr:#08x}");
+    }
 }
 
 #[no_mangle]
@@ -127,12 +140,7 @@ extern "C" fn sync_exception_current(elr: u64, _spsr: u64) {
     let far = read_sysreg!("far_el1");
 
     if let Err(e) = handle_exception(esr, far) {
-        // Don't print to the UART if we are handling an exception it could raise.
-        if !handling_uart_exception(esr, far) {
-            eprintln!("sync_exception_current");
-            eprintln!("{e}");
-            eprintln!("{esr}, far={far:#08x}, elr={elr:#08x}");
-        }
+        print_exception_failure(esr, far, elr, e, "sync_exception_current");
         reboot()
     }
 }
