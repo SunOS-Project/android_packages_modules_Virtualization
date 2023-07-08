@@ -23,7 +23,7 @@ mod pci;
 
 extern crate alloc;
 
-use crate::layout::{bionic_tls, boot_stack_range, print_addresses, DEVICE_REGION};
+use crate::layout::{boot_stack_range, print_addresses, DEVICE_REGION};
 use crate::pci::{check_pci, get_bar_region};
 use aarch64_paging::paging::MemoryRegion;
 use aarch64_paging::MapError;
@@ -32,9 +32,9 @@ use fdtpci::PciInfo;
 use libfdt::Fdt;
 use log::{debug, error, info, trace, warn, LevelFilter};
 use vmbase::{
-    configure_heap, cstr,
-    layout::{dtb_range, rodata_range, scratch_range, stack_chk_guard, text_range},
-    logger, main,
+    bionic, configure_heap, cstr,
+    layout::{dtb_range, rodata_range, scratch_range, text_range},
+    linker, logger, main,
     memory::{PageTable, SIZE_64KB},
 };
 
@@ -69,7 +69,7 @@ fn init_page_table(pci_bar_range: &MemoryRegion) -> Result<(), MapError> {
 
 /// Entry point for VM bootloader.
 pub fn main(arg0: u64, arg1: u64, arg2: u64, arg3: u64) {
-    logger::init(LevelFilter::Debug).unwrap();
+    log::set_max_level(LevelFilter::Debug);
 
     info!("Hello world");
     info!("x0={:#018x}, x1={:#018x}, x2={:#018x}, x3={:#018x}", arg0, arg1, arg2, arg3);
@@ -105,42 +105,52 @@ pub fn main(arg0: u64, arg1: u64, arg2: u64, arg3: u64) {
 }
 
 fn check_stack_guard() {
-    const BIONIC_TLS_STACK_GRD_OFF: usize = 40;
-
     info!("Testing stack guard");
-    assert_eq!(bionic_tls(BIONIC_TLS_STACK_GRD_OFF), stack_chk_guard());
+    // SAFETY: No concurrency issue should occur when running these tests.
+    let stack_guard = unsafe { bionic::TLS.stack_guard };
+    assert_ne!(stack_guard, 0);
+    // Check that a NULL-terminating value is added for C functions consuming strings from stack.
+    assert_eq!(stack_guard.to_ne_bytes().last(), Some(&0));
+    // Check that the TLS and guard are properly accessible from the dedicated register.
+    assert_eq!(stack_guard, bionic::__get_tls().stack_guard);
+    // Check that the LLVM __stack_chk_guard alias is also properly set up.
+    assert_eq!(
+        stack_guard,
+        // SAFETY: No concurrency issue should occur when running these tests.
+        unsafe { linker::__stack_chk_guard },
+    );
 }
 
 fn check_data() {
     info!("INITIALISED_DATA: {:?}", INITIALISED_DATA.as_ptr());
-    unsafe {
-        info!("ZEROED_DATA: {:?}", ZEROED_DATA.as_ptr());
-        info!("MUTABLE_DATA: {:?}", MUTABLE_DATA.as_ptr());
-    }
+    info!("ZEROED_DATA: {:?}", unsafe { ZEROED_DATA.as_ptr() });
+    info!("MUTABLE_DATA: {:?}", unsafe { MUTABLE_DATA.as_ptr() });
 
     assert_eq!(INITIALISED_DATA[0], 1);
     assert_eq!(INITIALISED_DATA[1], 2);
     assert_eq!(INITIALISED_DATA[2], 3);
     assert_eq!(INITIALISED_DATA[3], 4);
 
-    unsafe {
-        for element in ZEROED_DATA.iter() {
-            assert_eq!(*element, 0);
-        }
-        ZEROED_DATA[0] = 13;
-        assert_eq!(ZEROED_DATA[0], 13);
-        ZEROED_DATA[0] = 0;
-        assert_eq!(ZEROED_DATA[0], 0);
+    let zeroed_data = unsafe { &mut ZEROED_DATA };
+    let mutable_data = unsafe { &mut MUTABLE_DATA };
 
-        assert_eq!(MUTABLE_DATA[0], 1);
-        assert_eq!(MUTABLE_DATA[1], 2);
-        assert_eq!(MUTABLE_DATA[2], 3);
-        assert_eq!(MUTABLE_DATA[3], 4);
-        MUTABLE_DATA[0] += 41;
-        assert_eq!(MUTABLE_DATA[0], 42);
-        MUTABLE_DATA[0] -= 41;
-        assert_eq!(MUTABLE_DATA[0], 1);
+    for element in zeroed_data.iter() {
+        assert_eq!(*element, 0);
     }
+    zeroed_data[0] = 13;
+    assert_eq!(zeroed_data[0], 13);
+    zeroed_data[0] = 0;
+    assert_eq!(zeroed_data[0], 0);
+
+    assert_eq!(mutable_data[0], 1);
+    assert_eq!(mutable_data[1], 2);
+    assert_eq!(mutable_data[2], 3);
+    assert_eq!(mutable_data[3], 4);
+    mutable_data[0] += 41;
+    assert_eq!(mutable_data[0], 42);
+    mutable_data[0] -= 41;
+    assert_eq!(mutable_data[0], 1);
+
     info!("Data looks good");
 }
 

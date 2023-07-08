@@ -14,16 +14,29 @@
 
 //! Functions and drivers for obtaining true entropy.
 
-use crate::hvc;
+use crate::hvc::{self, TrngRng64Entropy};
 use core::fmt;
 use core::mem::size_of;
+use smccc::{self, Hvc};
 
 /// Error type for rand operations.
 pub enum Error {
+    /// No source of entropy found.
+    NoEntropySource,
+    /// Error during architectural SMCCC call.
+    Smccc(smccc::arch::Error),
     /// Error during SMCCC TRNG call.
     Trng(hvc::trng::Error),
+    /// Unsupported SMCCC version.
+    UnsupportedSmcccVersion(smccc::arch::Version),
     /// Unsupported SMCCC TRNG version.
-    UnsupportedVersion((u16, u16)),
+    UnsupportedTrngVersion(hvc::trng::Version),
+}
+
+impl From<smccc::arch::Error> for Error {
+    fn from(e: smccc::arch::Error) -> Self {
+        Self::Smccc(e)
+    }
 }
 
 impl From<hvc::trng::Error> for Error {
@@ -38,10 +51,11 @@ pub type Result<T> = core::result::Result<T, Error>;
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
+            Self::NoEntropySource => write!(f, "No source of entropy available"),
+            Self::Smccc(e) => write!(f, "Architectural SMCCC error: {e}"),
             Self::Trng(e) => write!(f, "SMCCC TRNG error: {e}"),
-            Self::UnsupportedVersion((x, y)) => {
-                write!(f, "Unsupported SMCCC TRNG version v{x}.{y}")
-            }
+            Self::UnsupportedSmcccVersion(v) => write!(f, "Unsupported SMCCC version {v}"),
+            Self::UnsupportedTrngVersion(v) => write!(f, "Unsupported SMCCC TRNG version {v}"),
         }
     }
 }
@@ -53,15 +67,35 @@ impl fmt::Debug for Error {
 }
 
 /// Configure the source of entropy.
-pub fn init() -> Result<()> {
-    match hvc::trng_version()? {
-        (1, _) => Ok(()),
-        version => Err(Error::UnsupportedVersion(version)),
+pub(crate) fn init() -> Result<()> {
+    // SMCCC TRNG requires SMCCC v1.1.
+    match smccc::arch::version::<Hvc>()? {
+        smccc::arch::Version { major: 1, minor } if minor >= 1 => (),
+        version => return Err(Error::UnsupportedSmcccVersion(version)),
     }
+
+    // TRNG_RND requires SMCCC TRNG v1.0.
+    match hvc::trng_version()? {
+        hvc::trng::Version { major: 1, minor: _ } => (),
+        version => return Err(Error::UnsupportedTrngVersion(version)),
+    }
+
+    // TRNG_RND64 doesn't define any special capabilities so ignore the successful result.
+    let _ = hvc::trng_features(hvc::ARM_SMCCC_TRNG_RND64).map_err(|e| {
+        if e == hvc::trng::Error::NotSupported {
+            // SMCCC TRNG is currently our only source of entropy.
+            Error::NoEntropySource
+        } else {
+            e.into()
+        }
+    })?;
+
+    Ok(())
 }
 
-fn fill_with_entropy(s: &mut [u8]) -> Result<()> {
-    const MAX_BYTES_PER_CALL: usize = size_of::<hvc::TrngRng64Entropy>();
+/// Fills a slice of bytes with true entropy.
+pub fn fill_with_entropy(s: &mut [u8]) -> Result<()> {
+    const MAX_BYTES_PER_CALL: usize = size_of::<TrngRng64Entropy>();
 
     let (aligned, remainder) = s.split_at_mut(s.len() - s.len() % MAX_BYTES_PER_CALL);
 
@@ -89,13 +123,14 @@ fn fill_with_entropy(s: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
-fn repeat_trng_rnd(n_bytes: usize) -> hvc::trng::Result<hvc::TrngRng64Entropy> {
+fn repeat_trng_rnd(n_bytes: usize) -> Result<TrngRng64Entropy> {
     let bits = usize::try_from(u8::BITS).unwrap();
     let n_bits = (n_bytes * bits).try_into().unwrap();
     loop {
         match hvc::trng_rnd64(n_bits) {
-            Err(hvc::trng::Error::NoEntropy) => continue,
-            res => return res,
+            Ok(entropy) => return Ok(entropy),
+            Err(hvc::trng::Error::NoEntropy) => (),
+            Err(e) => return Err(e.into()),
         }
     }
 }
