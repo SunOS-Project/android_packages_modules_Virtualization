@@ -27,6 +27,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use buddy_system_allocator::{FrameAllocator, LockedFrameAllocator};
 use core::alloc::Layout;
+use core::cmp::max;
 use core::mem::size_of;
 use core::num::NonZeroUsize;
 use core::ops::Range;
@@ -343,7 +344,7 @@ impl Drop for MemoryTracker {
 
 /// Allocates a memory range of at least the given size and alignment that is shared with the host.
 /// Returns a pointer to the buffer.
-pub fn alloc_shared(layout: Layout) -> hyp::Result<NonNull<u8>> {
+pub(crate) fn alloc_shared(layout: Layout) -> hyp::Result<NonNull<u8>> {
     assert_ne!(layout.size(), 0);
     let Some(buffer) = try_shared_alloc(layout) else {
         handle_alloc_error(layout);
@@ -359,7 +360,11 @@ fn try_shared_alloc(layout: Layout) -> Option<NonNull<u8>> {
     if let Some(buffer) = shared_pool.alloc_aligned(layout) {
         Some(NonNull::new(buffer as _).unwrap())
     } else if let Some(shared_memory) = SHARED_MEMORY.lock().as_mut() {
-        shared_memory.refill(&mut shared_pool, layout);
+        // Adjusts the layout size to the max of the next power of two and the alignment,
+        // as this is the actual size of the memory allocated in `alloc_aligned()`.
+        let size = max(layout.size().next_power_of_two(), layout.align());
+        let refill_layout = Layout::from_size_align(size, layout.align()).unwrap();
+        shared_memory.refill(&mut shared_pool, refill_layout);
         shared_pool.alloc_aligned(layout).map(|buffer| NonNull::new(buffer as _).unwrap())
     } else {
         None
@@ -374,7 +379,7 @@ fn try_shared_alloc(layout: Layout) -> Option<NonNull<u8>> {
 ///
 /// The memory must have been allocated by `alloc_shared` with the same layout, and not yet
 /// deallocated.
-pub unsafe fn dealloc_shared(vaddr: NonNull<u8>, layout: Layout) -> hyp::Result<()> {
+pub(crate) unsafe fn dealloc_shared(vaddr: NonNull<u8>, layout: Layout) -> hyp::Result<()> {
     SHARED_POOL.get().unwrap().lock().dealloc_aligned(vaddr.as_ptr() as usize, layout);
 
     trace!("Deallocated shared buffer at {vaddr:?} with {layout:?}");
