@@ -23,7 +23,6 @@ mod exceptions;
 extern crate alloc;
 
 use crate::error::{Error, Result};
-use buddy_system_allocator::LockedHeap;
 use core::num::NonZeroUsize;
 use core::result;
 use core::slice;
@@ -32,32 +31,18 @@ use hyp::{get_hypervisor, HypervisorCap, KvmError};
 use libfdt::FdtError;
 use log::{debug, error, info};
 use vmbase::{
+    configure_heap,
     fdt::SwiotlbInfo,
     layout::{self, crosvm},
     main,
-    memory::{MemoryTracker, PageTable, MEMORY, PAGE_SIZE},
+    memory::{MemoryTracker, PageTable, MEMORY, PAGE_SIZE, SIZE_64KB},
     power::reboot,
+    virtio::pci,
 };
-
-const SZ_1K: usize = 1024;
-const SZ_64K: usize = 64 * SZ_1K;
-
-#[global_allocator]
-static HEAP_ALLOCATOR: LockedHeap<32> = LockedHeap::<32>::new();
-
-static mut HEAP: [u8; SZ_64K] = [0; SZ_64K];
-
-fn init_heap() {
-    // SAFETY: Allocator set to otherwise unused, static memory.
-    unsafe {
-        HEAP_ALLOCATOR.lock().init(&mut HEAP as *mut u8 as usize, HEAP.len());
-    }
-}
 
 fn new_page_table() -> Result<PageTable> {
     let mut page_table = PageTable::default();
 
-    page_table.map_device(&crosvm::MMIO_RANGE)?;
     page_table.map_data(&layout::scratch_range())?;
     page_table.map_data(&layout::stack_range(40 * PAGE_SIZE))?;
     page_table.map_code(&layout::text_range())?;
@@ -106,8 +91,6 @@ unsafe fn try_main(fdt_addr: usize) -> Result<()> {
     let fdt = unsafe { slice::from_raw_parts(fdt_range.start as *mut u8, fdt_range.len()) };
     // We do not need to validate the DT since it is already validated in pvmfw.
     let fdt = libfdt::Fdt::from_slice(fdt)?;
-    let pci_info = PciInfo::from_fdt(fdt)?;
-    debug!("PCI: {pci_info:#x?}");
 
     let memory_range = fdt.first_memory_range()?;
     MEMORY.lock().as_mut().unwrap().shrink(&memory_range).map_err(|e| {
@@ -131,6 +114,12 @@ unsafe fn try_main(fdt_addr: usize) -> Result<()> {
             e
         })?;
     }
+
+    let pci_info = PciInfo::from_fdt(fdt)?;
+    debug!("PCI: {pci_info:#x?}");
+    let pci_root = pci::initialize(pci_info, MEMORY.lock().as_mut().unwrap())
+        .map_err(Error::PciInitializationFailed)?;
+    debug!("PCI root: {pci_root:#x?}");
     Ok(())
 }
 
@@ -163,7 +152,6 @@ fn unshare_all_memory(mmio_guard_supported: bool) {
 
 /// Entry point for Rialto.
 pub fn main(fdt_addr: u64, _a1: u64, _a2: u64, _a3: u64) {
-    init_heap();
     let Ok(mmio_guard_supported) = try_init_logger() else {
         // Don't log anything if the logger initialization fails.
         reboot();
@@ -181,3 +169,4 @@ pub fn main(fdt_addr: u64, _a1: u64, _a2: u64, _a3: u64) {
 }
 
 main!(main);
+configure_heap!(SIZE_64KB);
