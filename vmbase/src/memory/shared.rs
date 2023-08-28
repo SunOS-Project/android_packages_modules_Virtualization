@@ -19,18 +19,21 @@ use super::error::MemoryTrackerError;
 use super::page_table::{is_leaf_pte, PageTable, MMIO_LAZY_MAP_FLAG};
 use super::util::{page_4kb_of, virt_to_phys};
 use crate::dsb;
+use crate::exceptions::HandleExceptionError;
 use crate::util::RangeExt as _;
-use aarch64_paging::paging::{Attributes, Descriptor, MemoryRegion as VaRange};
+use aarch64_paging::paging::{Attributes, Descriptor, MemoryRegion as VaRange, VirtualAddress};
 use alloc::alloc::{alloc_zeroed, dealloc, handle_alloc_error};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use buddy_system_allocator::{FrameAllocator, LockedFrameAllocator};
 use core::alloc::Layout;
+use core::cmp::max;
+use core::mem::size_of;
 use core::num::NonZeroUsize;
 use core::ops::Range;
 use core::ptr::NonNull;
 use core::result;
-use hyp::{get_hypervisor, MMIO_GUARD_GRANULE_SIZE};
+use hyp::{get_mem_sharer, get_mmio_guard, MMIO_GUARD_GRANULE_SIZE};
 use log::{debug, error, trace};
 use once_cell::race::OnceBox;
 use spin::mutex::SpinMutex;
@@ -44,6 +47,11 @@ static SHARED_MEMORY: SpinMutex<Option<MemorySharer>> = SpinMutex::new(None);
 
 /// Memory range.
 pub type MemoryRange = Range<usize>;
+
+fn get_va_range(range: &MemoryRange) -> VaRange {
+    VaRange::new(range.start, range.end)
+}
+
 type Result<T> = result::Result<T, MemoryTrackerError>;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -69,8 +77,6 @@ pub struct MemoryTracker {
     payload_range: Option<MemoryRange>,
 }
 
-unsafe impl Send for MemoryTracker {}
-
 impl MemoryTracker {
     const CAPACITY: usize = 5;
     const MMIO_CAPACITY: usize = 5;
@@ -80,7 +86,7 @@ impl MemoryTracker {
         mut page_table: PageTable,
         total: MemoryRange,
         mmio_range: MemoryRange,
-        payload_range: Option<MemoryRange>,
+        payload_range: Option<Range<VirtualAddress>>,
     ) -> Self {
         assert!(
             !total.overlaps(&mmio_range),
@@ -93,7 +99,7 @@ impl MemoryTracker {
         set_dbm_enabled(true);
 
         debug!("Activating dynamic page table...");
-        // SAFETY - page_table duplicates the static mappings for everything that the Rust code is
+        // SAFETY: page_table duplicates the static mappings for everything that the Rust code is
         // aware of so activating it shouldn't have any visible effect.
         unsafe { page_table.activate() }
         debug!("... Success!");
@@ -104,7 +110,7 @@ impl MemoryTracker {
             regions: ArrayVec::new(),
             mmio_regions: ArrayVec::new(),
             mmio_range,
-            payload_range,
+            payload_range: payload_range.map(|r| r.start.0..r.end.0),
         }
     }
 
@@ -130,7 +136,7 @@ impl MemoryTracker {
     pub fn alloc_range(&mut self, range: &MemoryRange) -> Result<MemoryRange> {
         let region = MemoryRegion { range: range.clone(), mem_type: MemoryType::ReadOnly };
         self.check(&region)?;
-        self.page_table.map_rodata(range).map_err(|e| {
+        self.page_table.map_rodata(&get_va_range(range)).map_err(|e| {
             error!("Error during range allocation: {e}");
             MemoryTrackerError::FailedToMap
         })?;
@@ -141,7 +147,7 @@ impl MemoryTracker {
     pub fn alloc_range_mut(&mut self, range: &MemoryRange) -> Result<MemoryRange> {
         let region = MemoryRegion { range: range.clone(), mem_type: MemoryType::ReadWrite };
         self.check(&region)?;
-        self.page_table.map_data_dbm(range).map_err(|e| {
+        self.page_table.map_data_dbm(&get_va_range(range)).map_err(|e| {
             error!("Error during mutable range allocation: {e}");
             MemoryTrackerError::FailedToMap
         })?;
@@ -171,10 +177,17 @@ impl MemoryTracker {
             return Err(MemoryTrackerError::Full);
         }
 
-        self.page_table.map_device_lazy(&range).map_err(|e| {
-            error!("Error during MMIO device mapping: {e}");
-            MemoryTrackerError::FailedToMap
-        })?;
+        if get_mmio_guard().is_some() {
+            self.page_table.map_device_lazy(&get_va_range(&range)).map_err(|e| {
+                error!("Error during lazy MMIO device mapping: {e}");
+                MemoryTrackerError::FailedToMap
+            })?;
+        } else {
+            self.page_table.map_device(&get_va_range(&range)).map_err(|e| {
+                error!("Error during MMIO device mapping: {e}");
+                MemoryTrackerError::FailedToMap
+            })?;
+        }
 
         if self.mmio_regions.try_push(range).is_some() {
             return Err(MemoryTrackerError::Full);
@@ -211,10 +224,12 @@ impl MemoryTracker {
     ///
     /// Note that they are not unmapped from the page table.
     pub fn mmio_unmap_all(&mut self) -> Result<()> {
-        for range in &self.mmio_regions {
-            self.page_table
-                .modify_range(range, &mmio_guard_unmap_page)
-                .map_err(|_| MemoryTrackerError::FailedToUnmap)?;
+        if get_mmio_guard().is_some() {
+            for range in &self.mmio_regions {
+                self.page_table
+                    .modify_range(&get_va_range(range), &mmio_guard_unmap_page)
+                    .map_err(|_| MemoryTrackerError::FailedToUnmap)?;
+            }
         }
         Ok(())
     }
@@ -256,6 +271,19 @@ impl MemoryTracker {
         Ok(())
     }
 
+    /// Initialize the shared heap to use heap memory directly.
+    ///
+    /// When running on "non-protected" hypervisors which permit host direct accesses to guest
+    /// memory, there is no need to perform any memory sharing and/or allocate buffers from a
+    /// dedicated region so this function instructs the shared pool to use the global allocator.
+    pub fn init_heap_shared_pool(&mut self) -> Result<()> {
+        // As MemorySharer only calls MEM_SHARE methods if the hypervisor supports them, internally
+        // using init_dynamic_shared_pool() on a non-protected platform will make use of the heap
+        // without any actual "dynamic memory sharing" taking place and, as such, the granule may
+        // be set to the one of the global_allocator i.e. a byte.
+        self.init_dynamic_shared_pool(size_of::<u8>())
+    }
+
     /// Unshares any memory that may have been shared.
     pub fn unshare_all_memory(&mut self) {
         drop(SHARED_MEMORY.lock().take());
@@ -263,12 +291,14 @@ impl MemoryTracker {
 
     /// Handles translation fault for blocks flagged for lazy MMIO mapping by enabling the page
     /// table entry and MMIO guard mapping the block. Breaks apart a block entry if required.
-    pub fn handle_mmio_fault(&mut self, addr: usize) -> Result<()> {
-        let page_range = page_4kb_of(addr)..page_4kb_of(addr) + MMIO_GUARD_GRANULE_SIZE;
+    fn handle_mmio_fault(&mut self, addr: VirtualAddress) -> Result<()> {
+        let page_start = VirtualAddress(page_4kb_of(addr.0));
+        let page_range: VaRange = (page_start..page_start + MMIO_GUARD_GRANULE_SIZE).into();
+        let mmio_guard = get_mmio_guard().unwrap();
         self.page_table
             .modify_range(&page_range, &verify_lazy_mapped_block)
             .map_err(|_| MemoryTrackerError::InvalidPte)?;
-        get_hypervisor().mmio_guard_map(page_range.start)?;
+        mmio_guard.map(page_start.0)?;
         // Maps a single device page, breaking up block mappings if necessary.
         self.page_table.map_device(&page_range).map_err(|_| MemoryTrackerError::FailedToMap)
     }
@@ -284,7 +314,7 @@ impl MemoryTracker {
         // Now flush writable-dirty pages in those regions.
         for range in writable_regions.chain(self.payload_range.as_ref().into_iter()) {
             self.page_table
-                .modify_range(range, &flush_dirty_range)
+                .modify_range(&get_va_range(range), &flush_dirty_range)
                 .map_err(|_| MemoryTrackerError::FlushRegionFailed)?;
         }
         Ok(())
@@ -293,9 +323,9 @@ impl MemoryTracker {
     /// Handles permission fault for read-only blocks by setting writable-dirty state.
     /// In general, this should be called from the exception handler when hardware dirty
     /// state management is disabled or unavailable.
-    pub fn handle_permission_fault(&mut self, addr: usize) -> Result<()> {
+    fn handle_permission_fault(&mut self, addr: VirtualAddress) -> Result<()> {
         self.page_table
-            .modify_range(&(addr..addr + 1), &mark_dirty_block)
+            .modify_range(&(addr..addr + 1).into(), &mark_dirty_block)
             .map_err(|_| MemoryTrackerError::SetPteDirtyFailed)
     }
 }
@@ -310,7 +340,7 @@ impl Drop for MemoryTracker {
 
 /// Allocates a memory range of at least the given size and alignment that is shared with the host.
 /// Returns a pointer to the buffer.
-pub fn alloc_shared(layout: Layout) -> hyp::Result<NonNull<u8>> {
+pub(crate) fn alloc_shared(layout: Layout) -> hyp::Result<NonNull<u8>> {
     assert_ne!(layout.size(), 0);
     let Some(buffer) = try_shared_alloc(layout) else {
         handle_alloc_error(layout);
@@ -326,7 +356,11 @@ fn try_shared_alloc(layout: Layout) -> Option<NonNull<u8>> {
     if let Some(buffer) = shared_pool.alloc_aligned(layout) {
         Some(NonNull::new(buffer as _).unwrap())
     } else if let Some(shared_memory) = SHARED_MEMORY.lock().as_mut() {
-        shared_memory.refill(&mut shared_pool, layout);
+        // Adjusts the layout size to the max of the next power of two and the alignment,
+        // as this is the actual size of the memory allocated in `alloc_aligned()`.
+        let size = max(layout.size().next_power_of_two(), layout.align());
+        let refill_layout = Layout::from_size_align(size, layout.align()).unwrap();
+        shared_memory.refill(&mut shared_pool, refill_layout);
         shared_pool.alloc_aligned(layout).map(|buffer| NonNull::new(buffer as _).unwrap())
     } else {
         None
@@ -341,7 +375,7 @@ fn try_shared_alloc(layout: Layout) -> Option<NonNull<u8>> {
 ///
 /// The memory must have been allocated by `alloc_shared` with the same layout, and not yet
 /// deallocated.
-pub unsafe fn dealloc_shared(vaddr: NonNull<u8>, layout: Layout) -> hyp::Result<()> {
+pub(crate) unsafe fn dealloc_shared(vaddr: NonNull<u8>, layout: Layout) -> hyp::Result<()> {
     SHARED_POOL.get().unwrap().lock().dealloc_aligned(vaddr.as_ptr() as usize, layout);
 
     trace!("Deallocated shared buffer at {vaddr:?} with {layout:?}");
@@ -353,7 +387,7 @@ pub unsafe fn dealloc_shared(vaddr: NonNull<u8>, layout: Layout) -> hyp::Result<
 /// Unshares all pages when dropped.
 struct MemorySharer {
     granule: usize,
-    shared_regions: Vec<(usize, Layout)>,
+    frames: Vec<(usize, Layout)>,
 }
 
 impl MemorySharer {
@@ -361,42 +395,47 @@ impl MemorySharer {
     /// `granule` must be a power of 2.
     fn new(granule: usize, capacity: usize) -> Self {
         assert!(granule.is_power_of_two());
-        Self { granule, shared_regions: Vec::with_capacity(capacity) }
+        Self { granule, frames: Vec::with_capacity(capacity) }
     }
 
     /// Gets from the global allocator a granule-aligned region that suits `hint` and share it.
     fn refill(&mut self, pool: &mut FrameAllocator<32>, hint: Layout) {
         let layout = hint.align_to(self.granule).unwrap().pad_to_align();
         assert_ne!(layout.size(), 0);
-        // SAFETY - layout has non-zero size.
+        // SAFETY: layout has non-zero size.
         let Some(shared) = NonNull::new(unsafe { alloc_zeroed(layout) }) else {
             handle_alloc_error(layout);
         };
 
         let base = shared.as_ptr() as usize;
         let end = base.checked_add(layout.size()).unwrap();
-        trace!("Sharing memory region {:#x?}", base..end);
-        for vaddr in (base..end).step_by(self.granule) {
-            let vaddr = NonNull::new(vaddr as *mut _).unwrap();
-            get_hypervisor().mem_share(virt_to_phys(vaddr).try_into().unwrap()).unwrap();
-        }
-        self.shared_regions.push((base, layout));
 
+        if let Some(mem_sharer) = get_mem_sharer() {
+            trace!("Sharing memory region {:#x?}", base..end);
+            for vaddr in (base..end).step_by(self.granule) {
+                let vaddr = NonNull::new(vaddr as *mut _).unwrap();
+                mem_sharer.share(virt_to_phys(vaddr).try_into().unwrap()).unwrap();
+            }
+        }
+
+        self.frames.push((base, layout));
         pool.add_frame(base, end);
     }
 }
 
 impl Drop for MemorySharer {
     fn drop(&mut self) {
-        while let Some((base, layout)) = self.shared_regions.pop() {
-            let end = base.checked_add(layout.size()).unwrap();
-            trace!("Unsharing memory region {:#x?}", base..end);
-            for vaddr in (base..end).step_by(self.granule) {
-                let vaddr = NonNull::new(vaddr as *mut _).unwrap();
-                get_hypervisor().mem_unshare(virt_to_phys(vaddr).try_into().unwrap()).unwrap();
+        while let Some((base, layout)) = self.frames.pop() {
+            if let Some(mem_sharer) = get_mem_sharer() {
+                let end = base.checked_add(layout.size()).unwrap();
+                trace!("Unsharing memory region {:#x?}", base..end);
+                for vaddr in (base..end).step_by(self.granule) {
+                    let vaddr = NonNull::new(vaddr as *mut _).unwrap();
+                    mem_sharer.unshare(virt_to_phys(vaddr).try_into().unwrap()).unwrap();
+                }
             }
 
-            // SAFETY - The region was obtained from alloc_zeroed() with the recorded layout.
+            // SAFETY: The region was obtained from alloc_zeroed() with the recorded layout.
             unsafe { dealloc(base as *mut _, layout) };
         }
     }
@@ -448,9 +487,25 @@ fn mmio_guard_unmap_page(
         // Since mmio_guard_map takes IPAs, if pvmfw moves non-ID address mapping, page_base
         // should be converted to IPA. However, since 0x0 is a valid MMIO address, we don't use
         // virt_to_phys here, and just pass page_base instead.
-        get_hypervisor().mmio_guard_unmap(page_base).map_err(|e| {
+        get_mmio_guard().unwrap().unmap(page_base).map_err(|e| {
             error!("Error MMIO guard unmapping: {e}");
         })?;
     }
     Ok(())
+}
+
+/// Handles a translation fault with the given fault address register (FAR).
+#[inline]
+pub fn handle_translation_fault(far: VirtualAddress) -> result::Result<(), HandleExceptionError> {
+    let mut guard = MEMORY.try_lock().ok_or(HandleExceptionError::PageTableUnavailable)?;
+    let memory = guard.as_mut().ok_or(HandleExceptionError::PageTableNotInitialized)?;
+    Ok(memory.handle_mmio_fault(far)?)
+}
+
+/// Handles a permission fault with the given fault address register (FAR).
+#[inline]
+pub fn handle_permission_fault(far: VirtualAddress) -> result::Result<(), HandleExceptionError> {
+    let mut guard = MEMORY.try_lock().ok_or(HandleExceptionError::PageTableUnavailable)?;
+    let memory = guard.as_mut().ok_or(HandleExceptionError::PageTableNotInitialized)?;
+    Ok(memory.handle_permission_fault(far)?)
 }
