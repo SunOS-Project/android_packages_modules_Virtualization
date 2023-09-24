@@ -341,7 +341,9 @@ fn get_debug_policy_bool(path: &'static str) -> Result<Option<bool>> {
     let mut file = match File::open(path) {
         Ok(dp) => dp,
         Err(e) => {
-            info!("{e:?}. Assumes <0>");
+            info!(
+                "Assumes that debug policy is disabled because failed to read debug policy ({e:?})"
+            );
             return Ok(Some(false));
         }
     };
@@ -853,7 +855,7 @@ fn exec_task(task: &Task, service: &Strong<dyn IVirtualMachineService>) -> Resul
     info!("executing main task {:?}...", task);
     let mut command = match task.type_ {
         TaskType::Executable => {
-            // TODO(b/296393106): Run system payloads as non-root.
+            // TODO(b/297501338): Figure out how to handle non-root for system payloads.
             Command::new(&task.command)
         }
         TaskType::MicrodroidLauncher => {

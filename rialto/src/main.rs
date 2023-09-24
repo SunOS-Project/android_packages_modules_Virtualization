@@ -20,11 +20,13 @@
 mod communication;
 mod error;
 mod exceptions;
+mod requests;
 
 extern crate alloc;
 
-use crate::communication::DataChannel;
+use crate::communication::VsockStream;
 use crate::error::{Error, Result};
+use ciborium_io::Write;
 use core::num::NonZeroUsize;
 use core::slice;
 use fdtpci::PciInfo;
@@ -32,7 +34,7 @@ use hyp::{get_mem_sharer, get_mmio_guard};
 use libfdt::FdtError;
 use log::{debug, error, info};
 use virtio_drivers::{
-    device::socket::VsockAddr,
+    device::socket::{VsockAddr, VMADDR_CID_HOST},
     transport::{pci::bus::PciRoot, DeviceType, Transport},
     Hal,
 };
@@ -50,12 +52,7 @@ use vmbase::{
 };
 
 fn host_addr() -> VsockAddr {
-    const PROTECTED_VM_PORT: u32 = 5679;
-    const NON_PROTECTED_VM_PORT: u32 = 5680;
-    const VMADDR_CID_HOST: u64 = 2;
-
-    let port = if is_protected_vm() { PROTECTED_VM_PORT } else { NON_PROTECTED_VM_PORT };
-    VsockAddr { cid: VMADDR_CID_HOST, port }
+    VsockAddr { cid: VMADDR_CID_HOST, port: service_vm_comm::host_port(is_protected_vm()) }
 }
 
 fn is_protected_vm() -> bool {
@@ -137,10 +134,11 @@ unsafe fn try_main(fdt_addr: usize) -> Result<()> {
     let socket_device = find_socket_device::<HalImpl>(&mut pci_root)?;
     debug!("Found socket device: guest cid = {:?}", socket_device.guest_cid());
 
-    let mut data_channel = DataChannel::from(socket_device);
-    data_channel.connect(host_addr())?;
-    data_channel.handle_incoming_request()?;
-    data_channel.force_close()?;
+    let mut vsock_stream = VsockStream::new(socket_device, host_addr())?;
+    let response = requests::process_request(vsock_stream.read_request()?);
+    vsock_stream.write_response(&response)?;
+    vsock_stream.flush()?;
+    vsock_stream.shutdown()?;
 
     Ok(())
 }
