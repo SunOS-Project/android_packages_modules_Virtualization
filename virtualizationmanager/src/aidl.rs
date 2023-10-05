@@ -35,6 +35,8 @@ use android_system_virtualizationservice::aidl::android::system::virtualizations
     IVirtualMachineCallback::IVirtualMachineCallback,
     IVirtualizationService::IVirtualizationService,
     IVirtualizationService::FEATURE_PAYLOAD_NON_ROOT,
+    IVirtualizationService::FEATURE_VENDOR_MODULES,
+    IVirtualizationService::FEATURE_DICE_CHANGES,
     MemoryTrimLevel::MemoryTrimLevel,
     Partition::Partition,
     PartitionType::PartitionType,
@@ -273,9 +275,11 @@ impl IVirtualizationService for VirtualizationService {
         // This approach is quite cumbersome, but will do the work for the short term.
         // TODO(b/298012279): make this scalable.
         match feature {
+            FEATURE_DICE_CHANGES => Ok(cfg!(dice_changes)),
             FEATURE_PAYLOAD_NON_ROOT => Ok(cfg!(payload_not_root)),
+            FEATURE_VENDOR_MODULES => Ok(cfg!(vendor_modules)),
             _ => {
-                warn!("unknown feature {}", feature);
+                warn!("unknown feature {feature}");
                 Ok(false)
             }
         }
@@ -325,6 +329,8 @@ impl VirtualizationService {
     ) -> binder::Result<Strong<dyn IVirtualMachine>> {
         let requester_uid = get_calling_uid();
         let requester_debug_pid = get_calling_pid();
+
+        check_config_features(config)?;
 
         // Allocating VM context checks the MANAGE_VIRTUAL_MACHINE permission.
         let (vm_context, cid, temporary_directory) = self.create_vm_context(requester_debug_pid)?;
@@ -396,8 +402,9 @@ impl VirtualizationService {
 
         // Check if partition images are labeled incorrectly. This is to prevent random images
         // which are not protected by the Android Verified Boot (e.g. bits downloaded by apps) from
-        // being loaded in a pVM. This applies to everything but the instance image in the raw config,
-        // and everything but the non-executable, generated partitions in the app config.
+        // being loaded in a pVM. This applies to everything but the instance image in the raw
+        // config, and everything but the non-executable, generated partitions in the app
+        // config.
         config
             .disks
             .iter()
@@ -451,7 +458,7 @@ impl VirtualizationService {
             }
         };
 
-        let devices_dtbo = if !config.devices.is_empty() {
+        if !config.devices.is_empty() {
             let mut set = HashSet::new();
             for device in config.devices.iter() {
                 let path = canonicalize(device)
@@ -462,30 +469,8 @@ impl VirtualizationService {
                         .or_binder_exception(ExceptionCode::ILLEGAL_ARGUMENT);
                 }
             }
-            let dtbo_path = temporary_directory.join("dtbo");
-            // open a writable file descriptor for vfio_handler
-            let dtbo = File::create(&dtbo_path).map_err(|e| {
-                error!("Failed to create VM DTBO file {dtbo_path:?}: {e:?}");
-                Status::new_service_specific_error_str(
-                    -1,
-                    Some(format!("Failed to create VM DTBO file {dtbo_path:?}: {e:?}")),
-                )
-            })?;
-            GLOBAL_SERVICE
-                .bindDevicesToVfioDriver(&config.devices, &ParcelFileDescriptor::new(dtbo))?;
-
-            // open (again) a readable file descriptor for crosvm
-            let dtbo = File::open(&dtbo_path).map_err(|e| {
-                error!("Failed to open VM DTBO file {dtbo_path:?}: {e:?}");
-                Status::new_service_specific_error_str(
-                    -1,
-                    Some(format!("Failed to open VM DTBO file {dtbo_path:?}: {e:?}")),
-                )
-            })?;
-            Some(dtbo)
-        } else {
-            None
-        };
+            GLOBAL_SERVICE.bindDevicesToVfioDriver(&config.devices)?;
+        }
 
         // Actually start the VM.
         let crosvm_config = CrosvmConfig {
@@ -511,7 +496,6 @@ impl VirtualizationService {
             detect_hangup: is_app_config,
             gdb_port,
             vfio_devices: config.devices.iter().map(PathBuf::from).collect(),
-            devices_dtbo,
         };
         let instance = Arc::new(
             VmInstance::new(
@@ -985,10 +969,10 @@ impl VirtualMachineCallbacks {
 /// struct.
 #[derive(Debug, Default)]
 struct State {
-    /// The VMs which have been started. When VMs are started a weak reference is added to this list
-    /// while a strong reference is returned to the caller over Binder. Once all copies of the
-    /// Binder client are dropped the weak reference here will become invalid, and will be removed
-    /// from the list opportunistically the next time `add_vm` is called.
+    /// The VMs which have been started. When VMs are started a weak reference is added to this
+    /// list while a strong reference is returned to the caller over Binder. Once all copies of
+    /// the Binder client are dropped the weak reference here will become invalid, and will be
+    /// removed from the list opportunistically the next time `add_vm` is called.
     vms: Vec<Weak<VmInstance>>,
 }
 
@@ -1103,6 +1087,24 @@ fn extract_gdb_port(config: &VirtualMachineConfig) -> Option<NonZeroU16> {
             NonZeroU16::new(config.customConfig.as_ref().map(|c| c.gdbPort).unwrap_or(0) as u16)
         }
     }
+}
+
+fn check_no_vendor_modules(config: &VirtualMachineConfig) -> binder::Result<()> {
+    let VirtualMachineConfig::AppConfig(config) = config else { return Ok(()) };
+    if let Some(custom_config) = &config.customConfig {
+        if custom_config.vendorImage.is_some() || custom_config.customKernelImage.is_some() {
+            return Err(anyhow!("vendor modules feature is disabled"))
+                .or_binder_exception(ExceptionCode::UNSUPPORTED_OPERATION);
+        }
+    }
+    Ok(())
+}
+
+fn check_config_features(config: &VirtualMachineConfig) -> binder::Result<()> {
+    if !cfg!(vendor_modules) {
+        check_no_vendor_modules(config)?;
+    }
+    Ok(())
 }
 
 fn clone_or_prepare_logger_fd(

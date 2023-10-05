@@ -22,5 +22,7 @@ extern crate alloc;
 mod message;
 mod vsock;
 
-pub use message::{Request, Response};
-pub use vsock::host_port;
+pub use message::{
+    EcdsaP256KeyPair, GenerateCertificateRequestParams, Request, Response, ServiceVmRequest,
+};
+pub use vsock::VmType;

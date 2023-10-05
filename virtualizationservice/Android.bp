@@ -21,6 +21,7 @@ rust_binary {
     },
     prefer_rlib: true,
     rustlibs: [
+        "android.hardware.security.rkp-V3-rust",
         "android.system.virtualizationcommon-rust",
         "android.system.virtualizationservice-rust",
         "android.system.virtualizationservice_internal-rust",
@@ -40,6 +41,8 @@ rust_binary {
         "libvsock",
         "libserde",
         "libserde_xml_rs",
+        "libservice_vm_comm",
+        "libservice_vm_manager",
     ],
     apex_available: ["com.android.virt"],
 }

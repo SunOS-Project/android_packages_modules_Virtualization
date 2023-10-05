@@ -107,9 +107,16 @@ public class VirtualMachineManager {
     @Retention(RetentionPolicy.SOURCE)
     @StringDef(
             prefix = "FEATURE_",
-            value = {FEATURE_PAYLOAD_NOT_ROOT})
+            value = {FEATURE_DICE_CHANGES, FEATURE_PAYLOAD_NOT_ROOT, FEATURE_VENDOR_MODULES})
     public @interface Features {}
 
+    /**
+     * Feature to include new data in the VM DICE chain.
+     *
+     * @hide
+     */
+    @TestApi
+    public static final String FEATURE_DICE_CHANGES = IVirtualizationService.FEATURE_DICE_CHANGES;
     /**
      * Feature to run payload as non-root user.
      *
@@ -118,6 +125,15 @@ public class VirtualMachineManager {
     @TestApi
     public static final String FEATURE_PAYLOAD_NOT_ROOT =
             IVirtualizationService.FEATURE_PAYLOAD_NON_ROOT;
+
+    /**
+     * Feature to allow vendor modules in Microdroid.
+     *
+     * @hide
+     */
+    @TestApi
+    public static final String FEATURE_VENDOR_MODULES =
+            IVirtualizationService.FEATURE_VENDOR_MODULES;
 
     /**
      * Returns a set of flags indicating what this implementation of virtualization is capable of.
