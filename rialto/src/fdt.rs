@@ -12,12 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! This module contains functions for the request processing.
+//! High-level FDT functions.
 
-mod api;
-mod cbb;
-mod ec_key;
-mod pub_key;
-mod rkp;
+use core::ops::Range;
+use libfdt::{Fdt, FdtError};
+use vmbase::cstr;
 
-pub use api::process_request;
+/// Reads the DICE data range from the given `fdt`.
+pub fn read_dice_range_from(fdt: &Fdt) -> libfdt::Result<Range<usize>> {
+    let node = fdt.node(cstr!("/reserved-memory"))?.ok_or(FdtError::NotFound)?;
+    let node = node.next_compatible(cstr!("google,open-dice"))?.ok_or(FdtError::NotFound)?;
+    node.first_reg()?.try_into()
+}
