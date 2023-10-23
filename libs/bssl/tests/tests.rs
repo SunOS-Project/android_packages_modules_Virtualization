@@ -12,12 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! This module contains functions for the request processing.
+//! API tests of the crate `bssl_avf`.
 
-mod api;
-mod cbb;
-mod ec_key;
-mod pub_key;
-mod rkp;
-
-pub use api::process_request;
+mod aead_test;
+mod hkdf_test;
+mod hmac_test;

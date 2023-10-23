@@ -13,6 +13,7 @@
 // limitations under the License.
 
 //! Helpers for using BoringSSL CBB (crypto byte builder) objects.
+
 use bssl_ffi::{CBB_init_fixed, CBB};
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;
@@ -21,14 +22,14 @@ use core::mem::MaybeUninit;
 /// buffer cannot grow.
 pub struct CbbFixed<'a> {
     cbb: CBB,
-    // The CBB contains a mutable reference to the buffer, disguised as a pointer.
-    // Make sure the borrow checker knows that.
+    /// The CBB contains a mutable reference to the buffer, disguised as a pointer.
+    /// Make sure the borrow checker knows that.
     _buffer: PhantomData<&'a mut [u8]>,
 }
 
-impl CbbFixed<'_> {
-    // Create a new CBB that writes to the given buffer.
-    pub fn new(buffer: &mut [u8]) -> Self {
+impl<'a> CbbFixed<'a> {
+    /// Create a new CBB that writes to the given buffer.
+    pub fn new(buffer: &'a mut [u8]) -> Self {
         let mut cbb = MaybeUninit::uninit();
         // SAFETY: `CBB_init_fixed()` is infallible and always returns one.
         // The buffer remains valid during the lifetime of `cbb`.
@@ -39,13 +40,13 @@ impl CbbFixed<'_> {
     }
 }
 
-impl AsRef<CBB> for CbbFixed<'_> {
+impl<'a> AsRef<CBB> for CbbFixed<'a> {
     fn as_ref(&self) -> &CBB {
         &self.cbb
     }
 }
 
-impl AsMut<CBB> for CbbFixed<'_> {
+impl<'a> AsMut<CBB> for CbbFixed<'a> {
     fn as_mut(&mut self) -> &mut CBB {
         &mut self.cbb
     }

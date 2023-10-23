@@ -12,18 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! This library contains the communication protocol used between the host
-//! and the service VM.
+//! Safe wrappers around the BoringSSL API.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
 
-mod message;
-mod vsock;
+mod aead;
+mod cbb;
+mod digest;
+mod ec_key;
+mod err;
+mod hkdf;
+mod hmac;
+mod util;
 
-pub use message::{
-    EcdsaP256KeyPair, GenerateCertificateRequestParams, Request, RequestProcessingError, Response,
-    ServiceVmRequest,
-};
-pub use vsock::VmType;
+pub use bssl_avf_error::{ApiName, CipherError, Error, ReasonCode, Result};
+
+pub use aead::{Aead, AeadCtx};
+pub use cbb::CbbFixed;
+pub use digest::Digester;
+pub use ec_key::{EcKey, ZVec};
+pub use hkdf::hkdf;
+pub use hmac::hmac_sha256;

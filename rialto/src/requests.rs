@@ -12,18 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! This library contains the communication protocol used between the host
-//! and the service VM.
+//! This module contains functions for the request processing.
 
-#![cfg_attr(not(feature = "std"), no_std)]
+mod api;
+mod pub_key;
+mod rkp;
 
-extern crate alloc;
-
-mod message;
-mod vsock;
-
-pub use message::{
-    EcdsaP256KeyPair, GenerateCertificateRequestParams, Request, RequestProcessingError, Response,
-    ServiceVmRequest,
-};
-pub use vsock::VmType;
+pub use api::process_request;
