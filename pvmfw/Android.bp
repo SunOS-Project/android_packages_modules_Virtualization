@@ -12,6 +12,7 @@ rust_ffi_static {
     ],
     rustlibs: [
         "libaarch64_paging",
+        "libbssl_avf_nostd",
         "libbssl_ffi_nostd",
         "libciborium_nostd",
         "libciborium_io_nostd",
@@ -48,6 +49,7 @@ rust_test {
     host_supported: true,
     // For now, only bootargs.rs is written to be conditionally compiled with std.
     srcs: ["src/bootargs.rs"],
+    defaults: ["avf_build_flags_rust"],
     test_suites: ["general-tests"],
     test_options: {
         unit_test: true,

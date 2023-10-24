@@ -3,7 +3,7 @@
 {
   "avf-presubmit" : [
     {
-      "name" : "libavb_bindgen_test"
+      "name" : "libbssl_avf_nostd.test"
     }
   ]
 }

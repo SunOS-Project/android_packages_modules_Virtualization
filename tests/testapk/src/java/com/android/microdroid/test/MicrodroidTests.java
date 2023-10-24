@@ -72,7 +72,6 @@ import com.google.common.truth.BooleanSubject;
 
 import org.junit.After;
 import org.junit.Before;
-import org.junit.Ignore;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.function.ThrowingRunnable;
@@ -947,12 +946,18 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
     @Test
     @CddTest(requirements = {"9.17/C-1-1", "9.17/C-2-7"})
     public void changingNonDebuggableVmDebuggableInvalidatesVmIdentity() throws Exception {
+        // Debuggability changes initrd which is verified by pvmfw.
+        // Therefore, skip this on non-protected VM.
+        assumeProtectedVM();
         changeDebugLevel(DEBUG_LEVEL_NONE, DEBUG_LEVEL_FULL);
     }
 
     @Test
     @CddTest(requirements = {"9.17/C-1-1", "9.17/C-2-7"})
     public void changingDebuggableVmNonDebuggableInvalidatesVmIdentity() throws Exception {
+        // Debuggability changes initrd which is verified by pvmfw.
+        // Therefore, skip this on non-protected VM.
+        assumeProtectedVM();
         changeDebugLevel(DEBUG_LEVEL_FULL, DEBUG_LEVEL_NONE);
     }
 
@@ -1104,11 +1109,18 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
         assertThat(dataItems.size()).isEqualTo(1);
         assertThat(dataItems.get(0).getMajorType()).isEqualTo(MajorType.ARRAY);
         List<DataItem> rootArrayItems = ((Array) dataItems.get(0)).getDataItems();
-        assertThat(rootArrayItems.size()).isAtLeast(2); // Public key and one certificate
+        assertThat(rootArrayItems.size()).isAtLeast(2); // Root public key and one certificate
         if (mProtectedVm) {
-            // pvmfw truncates the DICE chain it gets, so we expect exactly entries for: public key,
-            // Microdroid and app payload.
-            assertThat(rootArrayItems.size()).isEqualTo(3);
+            if (isFeatureEnabled(VirtualMachineManager.FEATURE_DICE_CHANGES)) {
+                // When a true DICE chain is created, we expect the root public key, at least one
+                // entry for the boot before pvmfw, then pvmfw, vm_entry (Microdroid kernel) and
+                // Microdroid payload entries.
+                assertThat(rootArrayItems.size()).isAtLeast(5);
+            } else {
+                // pvmfw truncates the DICE chain it gets, so we expect exactly entries for
+                // public key, vm_entry (Microdroid kernel) and Microdroid payload.
+                assertThat(rootArrayItems.size()).isEqualTo(3);
+            }
         }
     }
 
@@ -1130,6 +1142,17 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
         assertThrows(Exception.class, () -> launchVmAndGetCdis("test_vm"));
     }
 
+    @Test
+    public void isFeatureEnabled_requiresManagePermission() throws Exception {
+        revokePermission(VirtualMachine.MANAGE_VIRTUAL_MACHINE_PERMISSION);
+
+        VirtualMachineManager vmm = getVirtualMachineManager();
+        SecurityException e =
+                assertThrows(SecurityException.class, () -> vmm.isFeatureEnabled("whatever"));
+        assertThat(e)
+                .hasMessageThat()
+                .contains("android.permission.MANAGE_VIRTUAL_MACHINE permission");
+    }
 
     private static final UUID MICRODROID_PARTITION_UUID =
             UUID.fromString("cf9afe9a-0662-11ec-a329-c32663a09d75");
@@ -1524,10 +1547,10 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
     }
 
     @Test
-    @Ignore // Figure out how to run this conditionally
     @CddTest(requirements = {"9.17/C-1-1"})
     public void payloadIsNotRoot() throws Exception {
         assumeSupportedDevice();
+        assumeFeatureEnabled(VirtualMachineManager.FEATURE_MULTI_TENANT);
 
         VirtualMachineConfig config =
                 newVmConfigBuilder()
@@ -2084,6 +2107,7 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
     @Test
     public void configuringVendorDiskImageRequiresCustomPermission() throws Exception {
         assumeSupportedDevice();
+        assumeFeatureEnabled(VirtualMachineManager.FEATURE_VENDOR_MODULES);
 
         File vendorDiskImage =
                 new File("/data/local/tmp/cts/microdroid/test_microdroid_vendor_image.img");
@@ -2108,6 +2132,7 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
     @Test
     public void bootsWithVendorPartition() throws Exception {
         assumeSupportedDevice();
+        assumeFeatureEnabled(VirtualMachineManager.FEATURE_VENDOR_MODULES);
 
         grantPermission(VirtualMachine.USE_CUSTOM_VIRTUAL_MACHINE_PERMISSION);
 

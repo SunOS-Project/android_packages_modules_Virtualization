@@ -12,6 +12,9 @@
       "name": "MicrodroidTestApp"
     },
     {
+      "name": "CustomPvmfwHostTestCases"
+    },
+    {
       "name": "art_standalone_dexpreopt_tests"
     },
     {
@@ -25,6 +28,9 @@
     },
     {
       "name": "initrd_bootconfig.test"
+    },
+    {
+      "name": "libdice_policy.test"
     }
   ],
   "avf-postsubmit": [
@@ -64,6 +70,9 @@
     },
     {
       "path": "packages/modules/Virtualization/libs/avb"
+    },
+    {
+      "path": "packages/modules/Virtualization/libs/bssl"
     },
     {
       "path": "packages/modules/Virtualization/libs/capabilities"
