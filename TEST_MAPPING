@@ -31,6 +31,9 @@
     },
     {
       "name": "libdice_policy.test"
+    },
+    {
+      "name": "libapkzip.test"
     }
   ],
   "avf-postsubmit": [
@@ -97,6 +100,9 @@
     },
     {
       "path": "packages/modules/Virtualization/rialto"
+    },
+    {
+      "path": "packages/modules/Virtualization/service_vm/requests"
     },
     {
       "path": "packages/modules/Virtualization/vm"
