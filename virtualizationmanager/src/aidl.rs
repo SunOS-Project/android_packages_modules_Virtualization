@@ -66,6 +66,7 @@ use libfdt::Fdt;
 use log::{debug, error, info, warn};
 use microdroid_payload_config::{OsConfig, Task, TaskType, VmPayloadConfig};
 use nix::unistd::pipe;
+use regex::Regex;
 use rpcbinder::RpcServer;
 use rustutils::system_properties;
 use semver::VersionReq;
@@ -101,8 +102,6 @@ const ANDROID_VM_INSTANCE_VERSION: u16 = 1;
 
 const MICRODROID_OS_NAME: &str = "microdroid";
 
-const MICRODROID_GKI_OS_NAME: &str = "microdroid_gki";
-
 const UNFORMATTED_STORAGE_MAGIC: &str = "UNFORMATTED-STORAGE";
 
 /// Roughly estimated sufficient size for storing vendor public key into DTBO.
@@ -115,6 +114,8 @@ lazy_static! {
     pub static ref GLOBAL_SERVICE: Strong<dyn IVirtualizationServiceInternal> =
         wait_for_interface(BINDER_SERVICE_IDENTIFIER)
             .expect("Could not connect to VirtualizationServiceInternal");
+    static ref MICRODROID_GKI_OS_NAME_PATTERN: Regex =
+        Regex::new(r"^microdroid_gki-\d+\.\d+$").expect("Failed to construct Regex");
 }
 
 fn create_or_update_idsig_file(
@@ -482,7 +483,7 @@ impl VirtualizationService {
             }
         };
 
-        let vfio_devices = if !config.devices.is_empty() {
+        let (vfio_devices, dtbo) = if !config.devices.is_empty() {
             let mut set = HashSet::new();
             for device in config.devices.iter() {
                 let path = canonicalize(device)
@@ -493,16 +494,25 @@ impl VirtualizationService {
                         .or_binder_exception(ExceptionCode::ILLEGAL_ARGUMENT);
                 }
             }
-            GLOBAL_SERVICE
+            let devices = GLOBAL_SERVICE
                 .bindDevicesToVfioDriver(&config.devices)?
                 .into_iter()
                 .map(|x| VfioDevice {
                     sysfs_path: PathBuf::from(&x.sysfsPath),
                     dtbo_label: x.dtboLabel,
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            let dtbo_file = File::from(
+                GLOBAL_SERVICE
+                    .getDtboFile()?
+                    .as_ref()
+                    .try_clone()
+                    .context("Failed to create File from ParcelFileDescriptor")
+                    .or_binder_exception(ExceptionCode::BAD_PARCELABLE)?,
+            );
+            (devices, Some(dtbo_file))
         } else {
-            vec![]
+            (vec![], None)
         };
 
         // Actually start the VM.
@@ -529,6 +539,7 @@ impl VirtualizationService {
             detect_hangup: is_app_config,
             gdb_port,
             vfio_devices,
+            dtbo,
             dtbo_vendor,
         };
         let instance = Arc::new(
@@ -698,12 +709,12 @@ fn append_kernel_param(param: &str, vm_config: &mut VirtualMachineRawConfig) {
 
 fn is_valid_os(os_name: &str) -> bool {
     if os_name == MICRODROID_OS_NAME {
-        return true;
+        true
+    } else if cfg!(vendor_modules) && MICRODROID_GKI_OS_NAME_PATTERN.is_match(os_name) {
+        PathBuf::from(format!("/apex/com.android.virt/etc/{}.json", os_name)).exists()
+    } else {
+        false
     }
-    if cfg!(vendor_modules) && os_name == MICRODROID_GKI_OS_NAME {
-        return true;
-    }
-    false
 }
 
 fn load_app_config(
