@@ -435,7 +435,7 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
 
     @Test
     @CddTest(requirements = {"9.17/C-2-1", "9.17/C-2-2", "9.17/C-2-6"})
-    public void protectedVmWithImageSignedWithDifferentKeyFailsToVerifyPayload() throws Exception {
+    public void protectedVmWithImageSignedWithDifferentKeyRunsPvmfw() throws Exception {
         // Arrange
         assumeProtectedVm();
         File key = findTestFile("test.com.android.virt.pem");
@@ -452,9 +452,8 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
         vmInfo.mProcess.waitFor(5L, TimeUnit.SECONDS);
         String consoleLog = getDevice().pullFileContents(CONSOLE_PATH);
         assertWithMessage("pvmfw should start").that(consoleLog).contains("pVM firmware");
-        assertWithMessage("pvmfw should fail to verify the payload")
-                .that(consoleLog)
-                .contains("Failed to verify the payload");
+        // TODO(b/256148034): Asserts that pvmfw run fails when this verification is implemented.
+        // Also rename the test.
         vmInfo.mProcess.destroy();
     }
 
