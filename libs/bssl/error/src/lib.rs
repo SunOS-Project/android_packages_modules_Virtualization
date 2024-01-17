@@ -21,7 +21,7 @@ mod code;
 use core::{fmt, result};
 use serde::{Deserialize, Serialize};
 
-pub use crate::code::{CipherError, GlobalError, ReasonCode};
+pub use crate::code::{CipherError, EcError, EcdsaError, GlobalError, ReasonCode};
 
 /// libbssl_avf result type.
 pub type Result<T> = result::Result<T, Error>;
@@ -34,6 +34,15 @@ pub enum Error {
 
     /// An unexpected internal error occurred.
     InternalError,
+
+    /// Failed to decode the COSE_Key.
+    CoseKeyDecodingFailed,
+
+    /// An error occurred when interacting with the coset crate.
+    CosetError,
+
+    /// Unimplemented operation.
+    Unimplemented,
 }
 
 impl fmt::Display for Error {
@@ -43,7 +52,19 @@ impl fmt::Display for Error {
                 write!(f, "Failed to invoke the BoringSSL API: {api_name:?}. Reason: {reason}")
             }
             Self::InternalError => write!(f, "An unexpected internal error occurred"),
+            Self::CoseKeyDecodingFailed => write!(f, "Failed to decode the COSE_Key"),
+            Self::CosetError => {
+                write!(f, "An error occurred when interacting with the coset crate")
+            }
+            Self::Unimplemented => write!(f, "Unimplemented operation"),
         }
+    }
+}
+
+impl From<coset::CoseError> for Error {
+    fn from(e: coset::CoseError) -> Self {
+        log::error!("Coset error: {e}");
+        Self::CosetError
     }
 }
 
@@ -53,20 +74,37 @@ impl fmt::Display for Error {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApiName {
     BN_new,
+    BN_bin2bn,
     BN_bn2bin_padded,
     CBB_flush,
     CBB_len,
+    EC_GROUP_new_by_curve_name,
     EC_KEY_check_key,
     EC_KEY_generate_key,
     EC_KEY_get0_group,
     EC_KEY_get0_public_key,
     EC_KEY_marshal_private_key,
+    EC_KEY_parse_private_key,
     EC_KEY_new_by_curve_name,
+    EC_KEY_set_public_key_affine_coordinates,
     EC_POINT_get_affine_coordinates,
+    ECDSA_sign,
+    ECDSA_size,
+    ECDSA_verify,
+    ED25519_verify,
     EVP_AEAD_CTX_new,
     EVP_AEAD_CTX_open,
     EVP_AEAD_CTX_seal,
+    EVP_Digest,
+    EVP_MD_CTX_new,
+    EVP_PKEY_new,
+    EVP_PKEY_new_raw_public_key,
+    EVP_PKEY_set1_EC_KEY,
+    EVP_marshal_public_key,
+    EVP_DigestVerify,
+    EVP_DigestVerifyInit,
     HKDF,
     HMAC,
     RAND_bytes,
+    SHA256,
 }

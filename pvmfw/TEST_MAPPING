@@ -7,6 +7,12 @@
     },
     {
       "name" : "libpvmfw.bootargs.test"
+    },
+    {
+      "name" : "libpvmfw.device_assignment.test"
+    },
+    {
+      "name" : "libpvmfw.dice.test"
     }
   ]
 }

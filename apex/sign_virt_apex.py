@@ -27,6 +27,7 @@ sign_virt_apex uses external tools which are assumed to be available via PATH.
 - lpmake, lpunpack, simg2img, img2simg, initrd_bootconfig
 """
 import argparse
+import builtins
 import hashlib
 import os
 import re
@@ -107,6 +108,7 @@ def ParseArgs(argv):
         action='store_true',
         help='This will NOT update the vbmeta related bootconfigs while signing the apex.\
             Used for testing only!!')
+    parser.add_argument('--do_not_validate_avb_version', action='store_true', help='Do not validate the avb_version when updating vbmeta bootconfig. Only use in tests!')
     args = parser.parse_args(argv)
     # preprocess --key_override into a map
     args.key_overrides = {}
@@ -282,7 +284,7 @@ def UpdateVbmetaBootconfig(args, initrds, vbmeta_img):
         avb_version_bc = re.search(
             r"androidboot.vbmeta.avb_version = \"([^\"]*)\"", bootconfigs).group(1)
         if avb_version_curr != avb_version_bc:
-            raise Exception(f'AVB version mismatch between current & one & \
+            raise builtins.Exception(f'AVB version mismatch between current & one & \
                 used to build bootconfigs:{avb_version_curr}&{avb_version_bc}')
 
     def calc_vbmeta_digest():
@@ -327,7 +329,8 @@ def UpdateVbmetaBootconfig(args, initrds, vbmeta_img):
             detach_bootconfigs(initrd, tmp_initrd, tmp_bc)
             bc_file = open(tmp_bc, "rt", encoding="utf-8")
             bc_data = bc_file.read()
-            validate_avb_version(bc_data)
+            if not args.do_not_validate_avb_version:
+                validate_avb_version(bc_data)
             bc_data = update_vbmeta_digest(bc_data)
             bc_data = update_vbmeta_size(bc_data)
             bc_file.close()
@@ -409,8 +412,11 @@ def GenVbmetaImage(args, image, output, partition_name):
            '--output_vbmeta_image', output]
     RunCommand(args, cmd)
 
+
+gki_versions = ['android14-6.1']
+
 # dict of (key, file) for re-sign/verification. keys are un-versioned for readability.
-virt_apex_files = {
+virt_apex_non_gki_files = {
     'kernel': 'etc/fs/microdroid_kernel',
     'vbmeta.img': 'etc/fs/microdroid_vbmeta.img',
     'super.img': 'etc/fs/microdroid_super.img',
@@ -418,9 +424,23 @@ virt_apex_files = {
     'initrd_debuggable.img': 'etc/microdroid_initrd_debuggable.img',
 }
 
-
 def TargetFiles(input_dir):
-    return {k: os.path.join(input_dir, v) for k, v in virt_apex_files.items()}
+    ret = {k: os.path.join(input_dir, v) for k, v in virt_apex_non_gki_files.items()}
+
+    for ver in gki_versions:
+        kernel        = os.path.join(input_dir, f'etc/fs/microdroid_gki-{ver}_kernel')
+        initrd_normal = os.path.join(input_dir, f'etc/microdroid_gki-{ver}_initrd_normal.img')
+        initrd_debug  = os.path.join(input_dir, f'etc/microdroid_gki-{ver}_initrd_debuggable.img')
+
+        if os.path.isfile(kernel):
+            ret[f'gki-{ver}_kernel']                = kernel
+            ret[f'gki-{ver}_initrd_normal.img']     = initrd_normal
+            ret[f'gki-{ver}_initrd_debuggable.img'] = initrd_debug
+
+    return ret
+
+def IsInitrdImage(path):
+    return path.endswith('initrd_normal.img') or path.endswith('initrd_debuggable.img')
 
 
 def SignVirtApex(args):
@@ -430,42 +450,67 @@ def SignVirtApex(args):
 
     # unpacked files (will be unpacked from super.img below)
     system_a_img = os.path.join(unpack_dir.name, 'system_a.img')
+    vendor_a_img = os.path.join(unpack_dir.name, 'vendor_a.img')
 
     # re-sign super.img
     # 1. unpack super.img
-    # 2. resign system
-    # 3. repack super.img out of resigned system
+    # 2. resign system and vendor (if exists)
+    # 3. repack super.img out of resigned system and vendor (if exists)
     UnpackSuperImg(args, files['super.img'], unpack_dir.name)
     system_a_f = Async(AddHashTreeFooter, args, key, system_a_img)
     partitions = {"system_a": system_a_img}
+    images = [system_a_img]
+    images_f = [system_a_f]
+
+    # if vendor_a.img exists, resign it
+    if os.path.exists(vendor_a_img):
+        partitions.update({'vendor_a': vendor_a_img})
+        images.append(vendor_a_img)
+        vendor_a_f = Async(AddHashTreeFooter, args, key, vendor_a_img)
+        images_f.append(vendor_a_f)
+
     Async(MakeSuperImage, args, partitions,
-          files['super.img'], wait=[system_a_f])
+          files['super.img'], wait=images_f)
 
     # re-generate vbmeta from re-signed system_a.img
     vbmeta_f = Async(MakeVbmetaImage, args, key, files['vbmeta.img'],
-                     images=[system_a_img],
-                     wait=[system_a_f])
+                     images=images,
+                     wait=images_f)
 
     vbmeta_bc_f = None
     if not args.do_not_update_bootconfigs:
-        vbmeta_bc_f = Async(UpdateVbmetaBootconfig, args,
-                            [files['initrd_normal.img'],
-                                files['initrd_debuggable.img']], files['vbmeta.img'],
+        initrd_files = [v for k, v in files.items() if IsInitrdImage(k)]
+        vbmeta_bc_f = Async(UpdateVbmetaBootconfig, args, initrd_files,
+                            files['vbmeta.img'],
                             wait=[vbmeta_f])
 
     # Re-sign kernel. Note kernel's vbmeta contain addition descriptor from ramdisk(s)
-    initrd_normal_hashdesc = tempfile.NamedTemporaryFile(delete=False).name
-    initrd_debug_hashdesc = tempfile.NamedTemporaryFile(delete=False).name
-    initrd_n_f = Async(GenVbmetaImage, args, files['initrd_normal.img'],
-                       initrd_normal_hashdesc, "initrd_normal",
-                       wait=[vbmeta_bc_f] if vbmeta_bc_f is not None else [])
-    initrd_d_f = Async(GenVbmetaImage, args, files['initrd_debuggable.img'],
-                       initrd_debug_hashdesc, "initrd_debug",
-                       wait=[vbmeta_bc_f] if vbmeta_bc_f is not None else [])
-    Async(AddHashFooter, args, key, files['kernel'], partition_name="boot",
-          additional_descriptors=[
-              initrd_normal_hashdesc, initrd_debug_hashdesc],
-          wait=[initrd_n_f, initrd_d_f])
+    def resign_kernel(kernel, initrd_normal, initrd_debug):
+        kernel_file = files[kernel]
+        initrd_normal_file = files[initrd_normal]
+        initrd_debug_file = files[initrd_debug]
+
+        initrd_normal_hashdesc = tempfile.NamedTemporaryFile(delete=False).name
+        initrd_debug_hashdesc = tempfile.NamedTemporaryFile(delete=False).name
+        initrd_n_f = Async(GenVbmetaImage, args, initrd_normal_file,
+                           initrd_normal_hashdesc, "initrd_normal",
+                           wait=[vbmeta_bc_f] if vbmeta_bc_f is not None else [])
+        initrd_d_f = Async(GenVbmetaImage, args, initrd_debug_file,
+                           initrd_debug_hashdesc, "initrd_debug",
+                           wait=[vbmeta_bc_f] if vbmeta_bc_f is not None else [])
+        Async(AddHashFooter, args, key, kernel_file, partition_name="boot",
+              additional_descriptors=[
+                  initrd_normal_hashdesc, initrd_debug_hashdesc],
+              wait=[initrd_n_f, initrd_d_f])
+
+    resign_kernel('kernel', 'initrd_normal.img', 'initrd_debuggable.img')
+
+    for ver in gki_versions:
+        if f'gki-{ver}_kernel' in files:
+            resign_kernel(
+                f'gki-{ver}_kernel',
+                f'gki-{ver}_initrd_normal.img',
+                f'gki-{ver}_initrd_debuggable.img')
 
 
 def VerifyVirtApex(args):
@@ -489,11 +534,11 @@ def VerifyVirtApex(args):
         assert info is not None, f'no avbinfo: {file}'
         assert info['Public key (sha1)'] == pubkey_digest, f'pubkey mismatch: {file}'
 
-    for f in files.values():
-        if f in (files['initrd_normal.img'], files['initrd_debuggable.img']):
+    for k, f in files.items():
+        if IsInitrdImage(k):
             # TODO(b/245277660): Verify that ramdisks contain the correct vbmeta digest
             continue
-        if f == files['super.img']:
+        if k == 'super.img':
             Async(check_avb_pubkey, system_a_img)
         else:
             # Check pubkey for other files using avbtool

@@ -55,18 +55,4 @@ size_t AVmPayload_getDiceAttestationChain(void* _Nullable data, size_t size);
  */
 size_t AVmPayload_getDiceAttestationCdi(void* _Nullable data, size_t size);
 
-/**
- * Requests a certificate using the provided certificate signing request (CSR).
- *
- * \param csr A pointer to the CSR buffer.
- * \param csr_size The size of the CSR buffer.
- * \param buffer A pointer to the certificate buffer.
- * \param size number of bytes that can be written to the certificate buffer.
- *
- * \return the total size of the certificate
- */
-size_t AVmPayload_requestCertificate(const void* _Nonnull csr, size_t csr_size,
-                                     void* _Nullable buffer, size_t size)
-        __INTRODUCED_IN(__ANDROID_API_V__);
-
 __END_DECLS

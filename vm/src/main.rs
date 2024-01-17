@@ -27,6 +27,7 @@ use binder::{ProcessState, Strong};
 use clap::{Args, Parser};
 use create_idsig::command_create_idsig;
 use create_partition::command_create_partition;
+use glob::glob;
 use run::{command_run, command_run_app, command_run_microdroid};
 use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
@@ -97,32 +98,23 @@ pub struct MicrodroidConfig {
     #[arg(long)]
     storage_size: Option<u64>,
 
-    /// Path to custom kernel image to use when booting Microdroid.
-    #[cfg(vendor_modules)]
-    #[arg(long)]
-    kernel: Option<PathBuf>,
-
     /// Path to disk image containing vendor-specific modules.
     #[cfg(vendor_modules)]
     #[arg(long)]
     vendor: Option<PathBuf>,
 
     /// SysFS nodes of devices to assign to VM
+    #[cfg(device_assignment)]
     #[arg(long)]
     devices: Vec<PathBuf>,
+
+    /// Version of GKI to use. If set, use instead of microdroid kernel
+    #[cfg(vendor_modules)]
+    #[arg(long)]
+    gki: Option<String>,
 }
 
 impl MicrodroidConfig {
-    #[cfg(vendor_modules)]
-    fn kernel(&self) -> &Option<PathBuf> {
-        &self.kernel
-    }
-
-    #[cfg(not(vendor_modules))]
-    fn kernel(&self) -> Option<PathBuf> {
-        None
-    }
-
     #[cfg(vendor_modules)]
     fn vendor(&self) -> &Option<PathBuf> {
         &self.vendor
@@ -131,6 +123,26 @@ impl MicrodroidConfig {
     #[cfg(not(vendor_modules))]
     fn vendor(&self) -> Option<PathBuf> {
         None
+    }
+
+    #[cfg(vendor_modules)]
+    fn gki(&self) -> Option<&str> {
+        self.gki.as_deref()
+    }
+
+    #[cfg(not(vendor_modules))]
+    fn gki(&self) -> Option<&str> {
+        None
+    }
+
+    #[cfg(device_assignment)]
+    fn devices(&self) -> &Vec<PathBuf> {
+        &self.devices
+    }
+
+    #[cfg(not(device_assignment))]
+    fn devices(&self) -> Vec<PathBuf> {
+        Vec::new()
     }
 }
 
@@ -304,6 +316,12 @@ fn command_list(service: &dyn IVirtualizationService) -> Result<(), Error> {
     Ok(())
 }
 
+fn extract_gki_version(gki_config: &Path) -> Option<&str> {
+    let name = gki_config.file_name()?;
+    let name_str = name.to_str()?;
+    name_str.strip_prefix("microdroid_gki-")?.strip_suffix(".json")
+}
+
 /// Print information about supported VM types.
 fn command_info() -> Result<(), Error> {
     let non_protected_vm_supported = hypervisor_props::is_vm_supported()?;
@@ -342,6 +360,12 @@ fn command_info() -> Result<(), Error> {
     let devices = get_service()?.getAssignableDevices()?;
     let devices = devices.into_iter().map(|x| x.node).collect::<Vec<_>>();
     println!("Assignable devices: {}", serde_json::to_string(&devices)?);
+
+    let gki_configs =
+        glob("/apex/com.android.virt/etc/microdroid_gki-*.json")?.collect::<Result<Vec<_>, _>>()?;
+    let gki_versions =
+        gki_configs.iter().filter_map(|x| extract_gki_version(x)).collect::<Vec<_>>();
+    println!("Available gki versions: {}", serde_json::to_string(&gki_versions)?);
 
     Ok(())
 }

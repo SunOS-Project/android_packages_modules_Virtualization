@@ -15,6 +15,7 @@
 //! High-level FDT functions.
 
 use crate::bootargs::BootArgsIterator;
+use crate::device_assignment::{DeviceAssignmentInfo, VmDtbo};
 use crate::helpers::GUEST_PAGE_SIZE;
 use crate::Box;
 use crate::RebootReason;
@@ -26,6 +27,7 @@ use core::ffi::CStr;
 use core::fmt;
 use core::mem::size_of;
 use core::ops::Range;
+use cstr::cstr;
 use fdtpci::PciMemoryFlags;
 use fdtpci::PciRangeType;
 use libfdt::AddressRange;
@@ -39,7 +41,6 @@ use log::error;
 use log::info;
 use log::warn;
 use tinyvec::ArrayVec;
-use vmbase::cstr;
 use vmbase::fdt::SwiotlbInfo;
 use vmbase::layout::{crosvm::MEM_START, MAX_VIRT_ADDR};
 use vmbase::memory::SIZE_4KB;
@@ -196,6 +197,30 @@ fn patch_num_cpus(fdt: &mut Fdt, num_cpus: usize) -> libfdt::Result<()> {
     while let Some(current) = next {
         next = current.delete_and_next_compatible(cpu)?;
     }
+    Ok(())
+}
+
+fn read_vendor_hashtree_descriptor_root_digest_from(fdt: &Fdt) -> libfdt::Result<Option<Vec<u8>>> {
+    if let Some(avf_node) = fdt.node(cstr!("/avf"))? {
+        if let Some(vendor_hashtree_descriptor_root_digest) =
+            avf_node.getprop(cstr!("vendor_hashtree_descriptor_root_digest"))?
+        {
+            return Ok(Some(vendor_hashtree_descriptor_root_digest.to_vec()));
+        }
+    }
+    Ok(None)
+}
+
+fn patch_vendor_hashtree_descriptor_root_digest(
+    fdt: &mut Fdt,
+    vendor_hashtree_descriptor_root_digest: &[u8],
+) -> libfdt::Result<()> {
+    let mut root_node = fdt.root_mut()?;
+    let mut avf_node = root_node.add_subnode(cstr!("/avf"))?;
+    avf_node.setprop(
+        cstr!("vendor_hashtree_descriptor_root_digest"),
+        vendor_hashtree_descriptor_root_digest,
+    )?;
     Ok(())
 }
 
@@ -590,6 +615,8 @@ pub struct DeviceTreeInfo {
     pci_info: PciInfo,
     serial_info: SerialInfo,
     pub swiotlb_info: SwiotlbInfo,
+    device_assignment: Option<DeviceAssignmentInfo>,
+    vendor_hashtree_descriptor_root_digest: Option<Vec<u8>>,
 }
 
 impl DeviceTreeInfo {
@@ -600,20 +627,63 @@ impl DeviceTreeInfo {
     }
 }
 
-pub fn sanitize_device_tree(fdt: &mut Fdt) -> Result<DeviceTreeInfo, RebootReason> {
-    let info = parse_device_tree(fdt)?;
-    debug!("Device tree info: {:?}", info);
+pub fn sanitize_device_tree(
+    fdt: &mut [u8],
+    vm_dtbo: Option<&mut [u8]>,
+) -> Result<DeviceTreeInfo, RebootReason> {
+    let fdt = Fdt::from_mut_slice(fdt).map_err(|e| {
+        error!("Failed to load FDT: {e}");
+        RebootReason::InvalidFdt
+    })?;
+
+    let vm_dtbo = match vm_dtbo {
+        Some(vm_dtbo) => Some(VmDtbo::from_mut_slice(vm_dtbo).map_err(|e| {
+            error!("Failed to load VM DTBO: {e}");
+            RebootReason::InvalidFdt
+        })?),
+        None => None,
+    };
+
+    let info = parse_device_tree(fdt, vm_dtbo.as_deref())?;
 
     fdt.copy_from_slice(pvmfw_fdt_template::RAW).map_err(|e| {
         error!("Failed to instantiate FDT from the template DT: {e}");
         RebootReason::InvalidFdt
     })?;
 
+    fdt.unpack().map_err(|e| {
+        error!("Failed to unpack DT for patching: {e}");
+        RebootReason::InvalidFdt
+    })?;
+
+    if let Some(device_assignment_info) = &info.device_assignment {
+        let vm_dtbo = vm_dtbo.unwrap();
+        device_assignment_info.filter(vm_dtbo).map_err(|e| {
+            error!("Failed to filter VM DTBO: {e}");
+            RebootReason::InvalidFdt
+        })?;
+        // SAFETY: Damaged VM DTBO isn't used in this API after this unsafe block.
+        // VM DTBO can't be reused in any way as Fdt nor VmDtbo outside of this API because
+        // it can only be instantiated after validation.
+        unsafe {
+            fdt.apply_overlay(vm_dtbo.as_mut()).map_err(|e| {
+                error!("Failed to apply filtered VM DTBO: {e}");
+                RebootReason::InvalidFdt
+            })?;
+        }
+    }
+
     patch_device_tree(fdt, &info)?;
+
+    fdt.pack().map_err(|e| {
+        error!("Failed to unpack DT after patching: {e}");
+        RebootReason::InvalidFdt
+    })?;
+
     Ok(info)
 }
 
-fn parse_device_tree(fdt: &libfdt::Fdt) -> Result<DeviceTreeInfo, RebootReason> {
+fn parse_device_tree(fdt: &Fdt, vm_dtbo: Option<&VmDtbo>) -> Result<DeviceTreeInfo, RebootReason> {
     let kernel_range = read_kernel_range_from(fdt).map_err(|e| {
         error!("Failed to read kernel range from DT: {e}");
         RebootReason::InvalidFdt
@@ -657,6 +727,37 @@ fn parse_device_tree(fdt: &libfdt::Fdt) -> Result<DeviceTreeInfo, RebootReason> 
     })?;
     validate_swiotlb_info(&swiotlb_info, &memory_range)?;
 
+    let device_assignment = match vm_dtbo {
+        Some(vm_dtbo) => {
+            if let Some(hypervisor) = hyp::get_device_assigner() {
+                DeviceAssignmentInfo::parse(fdt, vm_dtbo, hypervisor).map_err(|e| {
+                    error!("Failed to parse device assignment from DT and VM DTBO: {e}");
+                    RebootReason::InvalidFdt
+                })?
+            } else {
+                warn!(
+                    "Device assignment is ignored because device assigning hypervisor is missing"
+                );
+                None
+            }
+        }
+        None => None,
+    };
+
+    // TODO(b/285854379) : A temporary solution lives. This is for enabling
+    // microdroid vendor partition for non-protected VM as well. When passing
+    // DT path containing vendor_hashtree_descriptor_root_digest via fstab, init
+    // stage will check if vendor_hashtree_descriptor_root_digest exists in the
+    // init stage, regardless the protection. Adding this temporary solution
+    // will prevent fatal in init stage for protected VM. However, this data is
+    // not trustable without validating root digest of vendor hashtree
+    // descriptor comes from ABL.
+    let vendor_hashtree_descriptor_root_digest =
+        read_vendor_hashtree_descriptor_root_digest_from(fdt).map_err(|e| {
+            error!("Failed to read vendor_hashtree_descriptor_root_digest from DT: {e}");
+            RebootReason::InvalidFdt
+        })?;
+
     Ok(DeviceTreeInfo {
         kernel_range,
         initrd_range,
@@ -666,15 +767,12 @@ fn parse_device_tree(fdt: &libfdt::Fdt) -> Result<DeviceTreeInfo, RebootReason> 
         pci_info,
         serial_info,
         swiotlb_info,
+        device_assignment,
+        vendor_hashtree_descriptor_root_digest,
     })
 }
 
 fn patch_device_tree(fdt: &mut Fdt, info: &DeviceTreeInfo) -> Result<(), RebootReason> {
-    fdt.unpack().map_err(|e| {
-        error!("Failed to unpack DT for patching: {e}");
-        RebootReason::InvalidFdt
-    })?;
-
     if let Some(initrd_range) = &info.initrd_range {
         patch_initrd_range(fdt, initrd_range).map_err(|e| {
             error!("Failed to patch initrd range to DT: {e}");
@@ -715,11 +813,23 @@ fn patch_device_tree(fdt: &mut Fdt, info: &DeviceTreeInfo) -> Result<(), RebootR
         error!("Failed to patch timer info to DT: {e}");
         RebootReason::InvalidFdt
     })?;
-
-    fdt.pack().map_err(|e| {
-        error!("Failed to pack DT after patching: {e}");
-        RebootReason::InvalidFdt
-    })?;
+    if let Some(device_assignment) = &info.device_assignment {
+        // Note: We patch values after VM DTBO is overlaid because patch may require more space
+        // then VM DTBO's underlying slice is allocated.
+        device_assignment.patch(fdt).map_err(|e| {
+            error!("Failed to patch device assignment info to DT: {e}");
+            RebootReason::InvalidFdt
+        })?;
+    }
+    if let Some(vendor_hashtree_descriptor_root_digest) =
+        &info.vendor_hashtree_descriptor_root_digest
+    {
+        patch_vendor_hashtree_descriptor_root_digest(fdt, vendor_hashtree_descriptor_root_digest)
+            .map_err(|e| {
+            error!("Failed to patch vendor_hashtree_descriptor_root_digest to DT: {e}");
+            RebootReason::InvalidFdt
+        })?;
+    }
 
     Ok(())
 }
@@ -730,7 +840,7 @@ pub fn modify_for_next_stage(
     bcc: &[u8],
     new_instance: bool,
     strict_boot: bool,
-    debug_policy: Option<&mut [u8]>,
+    debug_policy: Option<&[u8]>,
     debuggable: bool,
     kaslr_seed: u64,
 ) -> libfdt::Result<()> {

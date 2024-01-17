@@ -16,6 +16,7 @@ rust_ffi_static {
         "libbssl_ffi_nostd",
         "libciborium_nostd",
         "libciborium_io_nostd",
+        "libcstr",
         "libdiced_open_dice_nostd",
         "libfdtpci",
         "libhyp",
@@ -25,6 +26,7 @@ rust_ffi_static {
         "libpvmfw_avb_nostd",
         "libpvmfw_embedded_key",
         "libpvmfw_fdt_template",
+        "libservice_vm_version",
         "libsmccc",
         "libstatic_assertions",
         "libtinyvec_nostd",
@@ -33,7 +35,6 @@ rust_ffi_static {
         "libvmbase",
         "libzerocopy_nostd",
         "libzeroize_nostd",
-        "libspin_nostd",
     ],
 }
 
@@ -44,19 +45,131 @@ genrule {
     cmd: "touch $(out)",
 }
 
-rust_test {
-    name: "libpvmfw.bootargs.test",
-    host_supported: true,
-    // For now, only bootargs.rs is written to be conditionally compiled with std.
-    srcs: ["src/bootargs.rs"],
+rust_defaults {
+    name: "libpvmfw.test.defaults",
     defaults: ["avf_build_flags_rust"],
     test_suites: ["general-tests"],
     test_options: {
         unit_test: true,
     },
+    prefer_rlib: true,
+    rustlibs: [
+        "libcstr",
+    ],
+}
+
+rust_test {
+    name: "libpvmfw.bootargs.test",
+    host_supported: true,
+    // For now, only bootargs.rs is written to be conditionally compiled with std.
+    srcs: ["src/bootargs.rs"],
+    defaults: ["libpvmfw.test.defaults"],
     rustlibs: [
         "libzeroize",
     ],
+}
+
+rust_test {
+    name: "libpvmfw.device_assignment.test",
+    srcs: ["src/device_assignment.rs"],
+    defaults: ["libpvmfw.test.defaults"],
+    rustlibs: [
+        "libhyp",
+        "liblibfdt",
+        "liblog_rust",
+        "libpvmfw_fdt_template",
+    ],
+    data: [
+        ":test_pvmfw_devices_vm_dtbo",
+        ":test_pvmfw_devices_vm_dtbo_without_symbols",
+        ":test_pvmfw_devices_with_rng",
+        ":test_pvmfw_devices_with_multiple_devices_iommus",
+        ":test_pvmfw_devices_with_iommu_sharing",
+        ":test_pvmfw_devices_with_iommu_id_conflict",
+        ":test_pvmfw_devices_without_device",
+        ":test_pvmfw_devices_without_iommus",
+    ],
+    // To use libpvmfw_fdt_template for testing
+    enabled: false,
+    target: {
+        android_arm64: {
+            enabled: true,
+        },
+    },
+}
+
+rust_test {
+    name: "libpvmfw.dice.test",
+    srcs: ["src/dice.rs"],
+    defaults: ["libpvmfw.test.defaults"],
+    rustlibs: [
+        "libcbor_util",
+        "libciborium",
+        "libdiced_open_dice_nostd",
+        "libpvmfw_avb_nostd",
+    ],
+}
+
+genrule {
+    name: "test_pvmfw_devices_vm_dtbo",
+    defaults: ["dts_to_dtb"],
+    srcs: ["testdata/test_pvmfw_devices_vm_dtbo.dts"],
+    out: ["test_pvmfw_devices_vm_dtbo.dtbo"],
+}
+
+genrule {
+    name: "test_pvmfw_devices_vm_dtbo_without_symbols",
+    defaults: ["dts_to_dtb"],
+    srcs: ["testdata/test_pvmfw_devices_vm_dtbo_without_symbols.dts"],
+    out: ["test_pvmfw_devices_vm_dtbo_without_symbols.dtbo"],
+}
+
+genrule_defaults {
+    name: "test_device_assignment_dts_to_dtb",
+    defaults: ["dts_to_dtb"],
+    srcs: ["testdata/test_crosvm_dt_base.dtsi"],
+}
+
+genrule {
+    name: "test_pvmfw_devices_with_rng",
+    defaults: ["test_device_assignment_dts_to_dtb"],
+    srcs: ["testdata/test_pvmfw_devices_with_rng.dts"],
+    out: ["test_pvmfw_devices_with_rng.dtb"],
+}
+
+genrule {
+    name: "test_pvmfw_devices_without_iommus",
+    defaults: ["test_device_assignment_dts_to_dtb"],
+    srcs: ["testdata/test_pvmfw_devices_without_iommus.dts"],
+    out: ["test_pvmfw_devices_without_iommus.dtb"],
+}
+
+genrule {
+    name: "test_pvmfw_devices_without_device",
+    defaults: ["test_device_assignment_dts_to_dtb"],
+    srcs: ["testdata/test_pvmfw_devices_without_device.dts"],
+    out: ["test_pvmfw_devices_without_device.dtb"],
+}
+
+genrule {
+    name: "test_pvmfw_devices_with_multiple_devices_iommus",
+    defaults: ["test_device_assignment_dts_to_dtb"],
+    srcs: ["testdata/test_pvmfw_devices_with_multiple_devices_iommus.dts"],
+    out: ["test_pvmfw_devices_with_multiple_devices_iommus.dtb"],
+}
+
+genrule {
+    name: "test_pvmfw_devices_with_iommu_sharing",
+    defaults: ["test_device_assignment_dts_to_dtb"],
+    srcs: ["testdata/test_pvmfw_devices_with_iommu_sharing.dts"],
+    out: ["test_pvmfw_devices_with_iommu_sharing.dtb"],
+}
+
+genrule {
+    name: "test_pvmfw_devices_with_iommu_id_conflict",
+    defaults: ["test_device_assignment_dts_to_dtb"],
+    srcs: ["testdata/test_pvmfw_devices_with_iommu_id_conflict.dts"],
+    out: ["test_pvmfw_devices_with_iommu_id_conflict.dtb"],
 }
 
 cc_binary {
@@ -175,7 +288,7 @@ cc_genrule {
     srcs: [":pvmfw_platform.dts.preprocessed"],
     out: ["lib.rs"],
     tools: ["dtc"],
-    cmd: "$(location dtc) -I dts -O dtb -o $(genDir)/compiled.dtbo $(in) && " +
+    cmd: "$(location dtc) -@ -I dts -O dtb -o $(genDir)/compiled.dtbo $(in) && " +
         "(" +
         "    echo '#![no_std]';" +
         "    echo '#![allow(missing_docs)]';" +

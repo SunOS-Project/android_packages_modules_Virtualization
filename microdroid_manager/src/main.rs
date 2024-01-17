@@ -34,7 +34,7 @@ use android_system_virtualization_payload::aidl::android::system::virtualization
 
 use crate::dice::dice_derivation;
 use crate::dice_driver::DiceDriver;
-use crate::instance::{ApexData, InstanceDisk, MicrodroidData};
+use crate::instance::{InstanceDisk, MicrodroidData};
 use crate::verify::verify_payload;
 use crate::vm_payload_service::register_vm_payload_service;
 use anyhow::{anyhow, bail, ensure, Context, Error, Result};
@@ -42,10 +42,10 @@ use binder::Strong;
 use keystore2_crypto::ZVec;
 use libc::VMADDR_CID_HOST;
 use log::{error, info};
-use microdroid_metadata::{write_metadata, PayloadMetadata};
+use microdroid_metadata::PayloadMetadata;
 use microdroid_payload_config::{OsConfig, Task, TaskType, VmPayloadConfig};
 use nix::sys::signal::Signal;
-use payload::{load_metadata, to_metadata};
+use payload::load_metadata;
 use rpcbinder::RpcSession;
 use rustutils::sockets::android_get_control_socket;
 use rustutils::system_properties;
@@ -105,7 +105,6 @@ fn translate_error(err: &Error) -> (ErrorCode, String) {
             MicrodroidError::PayloadInvalidConfig(msg) => {
                 (ErrorCode::PAYLOAD_INVALID_CONFIG, msg.to_string())
             }
-
             // Connection failure won't be reported to VS; return the default value
             MicrodroidError::FailedToConnectToVirtualizationService(msg) => {
                 (ErrorCode::UNKNOWN, msg.to_string())
@@ -143,15 +142,6 @@ fn write_death_reason_to_serial(err: &Error) -> Result<()> {
     Ok(())
 }
 
-fn get_vms_rpc_binder() -> Result<Strong<dyn IVirtualMachineService>> {
-    // The host is running a VirtualMachineService for this VM on a port equal
-    // to the CID of this VM.
-    let port = vsock::get_local_cid().context("Could not determine local CID")?;
-    RpcSession::new()
-        .setup_vsock_client(VMADDR_CID_HOST, port)
-        .context("Could not connect to IVirtualMachineService")
-}
-
 fn main() -> Result<()> {
     // If debuggable, print full backtrace to console log with stdio_to_kmsg
     if is_debuggable()? {
@@ -172,25 +162,6 @@ fn main() -> Result<()> {
         }
         e
     })
-}
-
-/// Prepares a socket file descriptor for the vm payload service.
-///
-/// # Safety
-///
-/// The caller must ensure that this function is the only place that claims ownership
-/// of the file descriptor and it is called only once.
-unsafe fn prepare_vm_payload_service_socket() -> Result<OwnedFd> {
-    let raw_fd = android_get_control_socket(VM_PAYLOAD_SERVICE_SOCKET_NAME)?;
-
-    // Creating OwnedFd for stdio FDs is not safe.
-    if [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO].contains(&raw_fd) {
-        bail!("File descriptor {raw_fd} is standard I/O descriptor");
-    }
-    // SAFETY: Initializing OwnedFd for a RawFd created by the init.
-    // We checked that the integer value corresponds to a valid FD and that the caller
-    // ensures that this is the only place to claim its ownership.
-    Ok(unsafe { OwnedFd::from_raw_fd(raw_fd) })
 }
 
 fn try_main() -> Result<()> {
@@ -245,6 +216,170 @@ fn try_main() -> Result<()> {
     }
 }
 
+fn try_run_payload(
+    service: &Strong<dyn IVirtualMachineService>,
+    vm_payload_service_fd: OwnedFd,
+) -> Result<i32> {
+    let metadata = load_metadata().context("Failed to load payload metadata")?;
+    let dice = DiceDriver::new(Path::new("/dev/open-dice0")).context("Failed to load DICE")?;
+
+    let mut instance = InstanceDisk::new().context("Failed to load instance.img")?;
+    let saved_data =
+        instance.read_microdroid_data(&dice).context("Failed to read identity data")?;
+
+    if is_strict_boot() {
+        // Provisioning must happen on the first boot and never again.
+        if is_new_instance() {
+            ensure!(
+                saved_data.is_none(),
+                MicrodroidError::PayloadInvalidConfig(
+                    "Found instance data on first boot.".to_string()
+                )
+            );
+        } else {
+            ensure!(
+                saved_data.is_some(),
+                MicrodroidError::PayloadInvalidConfig("Instance data not found.".to_string())
+            );
+        };
+    }
+
+    // Verify the payload before using it.
+    let extracted_data = verify_payload(&metadata, saved_data.as_ref())
+        .context("Payload verification failed")
+        .map_err(|e| MicrodroidError::PayloadVerificationFailed(e.to_string()))?;
+
+    // In case identity is ignored (by debug policy), we should reuse existing payload data, even
+    // when the payload is changed. This is to keep the derived secret same as before.
+    let instance_data = if let Some(saved_data) = saved_data {
+        if !is_verified_boot() {
+            if saved_data != extracted_data {
+                info!("Detected an update of the payload, but continue (regarding debug policy)")
+            }
+        } else {
+            ensure!(
+                saved_data == extracted_data,
+                MicrodroidError::PayloadChanged(String::from(
+                    "Detected an update of the payload which isn't supported yet."
+                ))
+            );
+            info!("Saved data is verified.");
+        }
+        saved_data
+    } else {
+        info!("Saving verified data.");
+        instance
+            .write_microdroid_data(&extracted_data, &dice)
+            .context("Failed to write identity data")?;
+        extracted_data
+    };
+
+    let payload_metadata = metadata.payload.ok_or_else(|| {
+        MicrodroidError::PayloadInvalidConfig("No payload config in metadata".to_string())
+    })?;
+
+    // To minimize the exposure to untrusted data, derive dice profile as soon as possible.
+    info!("DICE derivation for payload");
+    let dice_artifacts = dice_derivation(dice, &instance_data, &payload_metadata)?;
+    let vm_secret =
+        VmSecret::new(dice_artifacts, service).context("Failed to create VM secrets")?;
+
+    if cfg!(dice_changes) {
+        // Now that the DICE derivation is done, it's ok to allow payload code to run.
+
+        // Start apexd to activate APEXes. This may allow code within them to run.
+        system_properties::write("ctl.start", "apexd-vm")?;
+    }
+
+    // Run encryptedstore binary to prepare the storage
+    let encryptedstore_child = if Path::new(ENCRYPTEDSTORE_BACKING_DEVICE).exists() {
+        info!("Preparing encryptedstore ...");
+        Some(prepare_encryptedstore(&vm_secret).context("encryptedstore run")?)
+    } else {
+        None
+    };
+
+    let mut zipfuse = Zipfuse::default();
+
+    // Before reading a file from the APK, start zipfuse
+    zipfuse.mount(
+        MountForExec::Allowed,
+        "fscontext=u:object_r:zipfusefs:s0,context=u:object_r:system_file:s0",
+        Path::new(verify::DM_MOUNTED_APK_PATH),
+        Path::new(VM_APK_CONTENTS_PATH),
+        "microdroid_manager.apk.mounted".to_owned(),
+    )?;
+
+    // Restricted APIs are only allowed to be used by platform or test components. Infer this from
+    // the use of a VM config file since those can only be used by platform and test components.
+    let allow_restricted_apis = match payload_metadata {
+        PayloadMetadata::ConfigPath(_) => true,
+        PayloadMetadata::Config(_) => false,
+        _ => false, // default is false for safety
+    };
+
+    let config = load_config(payload_metadata).context("Failed to load payload metadata")?;
+
+    let task = config
+        .task
+        .as_ref()
+        .ok_or_else(|| MicrodroidError::PayloadInvalidConfig("No task in VM config".to_string()))?;
+
+    ensure!(
+        config.extra_apks.len() == instance_data.extra_apks_data.len(),
+        "config expects {} extra apks, but found {}",
+        config.extra_apks.len(),
+        instance_data.extra_apks_data.len()
+    );
+    mount_extra_apks(&config, &mut zipfuse)?;
+
+    register_vm_payload_service(
+        allow_restricted_apis,
+        service.clone(),
+        vm_secret,
+        vm_payload_service_fd,
+    )?;
+
+    // Set export_tombstones if enabled
+    if should_export_tombstones(&config) {
+        // This property is read by tombstone_handler.
+        system_properties::write("microdroid_manager.export_tombstones.enabled", "1")
+            .context("set microdroid_manager.export_tombstones.enabled")?;
+    }
+
+    // Wait until apex config is done. (e.g. linker configuration for apexes)
+    wait_for_property_true(APEX_CONFIG_DONE_PROP).context("Failed waiting for apex config done")?;
+
+    // Trigger init post-fs-data. This will start authfs if we wask it to.
+    if config.enable_authfs {
+        system_properties::write("microdroid_manager.authfs.enabled", "1")
+            .context("failed to write microdroid_manager.authfs.enabled")?;
+    }
+    system_properties::write("microdroid_manager.config_done", "1")
+        .context("failed to write microdroid_manager.config_done")?;
+
+    // Wait until zipfuse has mounted the APKs so we can access the payload
+    zipfuse.wait_until_done()?;
+
+    // Wait for encryptedstore to finish mounting the storage (if enabled) before setting
+    // microdroid_manager.init_done. Reason is init stops uneventd after that.
+    // Encryptedstore, however requires ueventd
+    if let Some(mut child) = encryptedstore_child {
+        let exitcode = child.wait().context("Wait for encryptedstore child")?;
+        ensure!(exitcode.success(), "Unable to prepare encrypted storage. Exitcode={}", exitcode);
+    }
+
+    // Wait for init to have finished booting.
+    wait_for_property_true("dev.bootcomplete").context("failed waiting for dev.bootcomplete")?;
+
+    // And then tell it we're done so unnecessary services can be shut down.
+    system_properties::write("microdroid_manager.init_done", "1")
+        .context("set microdroid_manager.init_done")?;
+
+    info!("boot completed, time to run payload");
+    exec_task(task, service).context("Failed to run payload")
+}
+
 fn post_payload_work() -> Result<()> {
     // Sync the encrypted storage filesystem (flushes the filesystem caches).
     if Path::new(ENCRYPTEDSTORE_BACKING_DEVICE).exists() {
@@ -268,6 +403,55 @@ fn post_payload_work() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn mount_extra_apks(config: &VmPayloadConfig, zipfuse: &mut Zipfuse) -> Result<()> {
+    // For now, only the number of apks is important, as the mount point and dm-verity name is fixed
+    for i in 0..config.extra_apks.len() {
+        let mount_dir = format!("/mnt/extra-apk/{i}");
+        create_dir(Path::new(&mount_dir)).context("Failed to create mount dir for extra apks")?;
+
+        let mount_for_exec =
+            if cfg!(multi_tenant) { MountForExec::Allowed } else { MountForExec::Disallowed };
+        // These run asynchronously in parallel - we wait later for them to complete.
+        zipfuse.mount(
+            mount_for_exec,
+            "fscontext=u:object_r:zipfusefs:s0,context=u:object_r:extra_apk_file:s0",
+            Path::new(&format!("/dev/block/mapper/extra-apk-{i}")),
+            Path::new(&mount_dir),
+            format!("microdroid_manager.extra_apk.mounted.{i}"),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn get_vms_rpc_binder() -> Result<Strong<dyn IVirtualMachineService>> {
+    // The host is running a VirtualMachineService for this VM on a port equal
+    // to the CID of this VM.
+    let port = vsock::get_local_cid().context("Could not determine local CID")?;
+    RpcSession::new()
+        .setup_vsock_client(VMADDR_CID_HOST, port)
+        .context("Could not connect to IVirtualMachineService")
+}
+
+/// Prepares a socket file descriptor for the vm payload service.
+///
+/// # Safety
+///
+/// The caller must ensure that this function is the only place that claims ownership
+/// of the file descriptor and it is called only once.
+unsafe fn prepare_vm_payload_service_socket() -> Result<OwnedFd> {
+    let raw_fd = android_get_control_socket(VM_PAYLOAD_SERVICE_SOCKET_NAME)?;
+
+    // Creating OwnedFd for stdio FDs is not safe.
+    if [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO].contains(&raw_fd) {
+        bail!("File descriptor {raw_fd} is standard I/O descriptor");
+    }
+    // SAFETY: Initializing OwnedFd for a RawFd created by the init.
+    // We checked that the integer value corresponds to a valid FD and that the caller
+    // ensures that this is the only place to claim its ownership.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw_fd) })
 }
 
 fn is_strict_boot() -> bool {
@@ -308,153 +492,6 @@ fn get_debug_policy_bool(path: &'static str) -> Result<Option<bool>> {
     file.read_exact(&mut log).context("Malformed data in {path}")?;
     // DT spec uses big endian although Android is always little endian.
     Ok(Some(u32::from_be_bytes(log) == 1))
-}
-
-fn try_run_payload(
-    service: &Strong<dyn IVirtualMachineService>,
-    vm_payload_service_fd: OwnedFd,
-) -> Result<i32> {
-    let metadata = load_metadata().context("Failed to load payload metadata")?;
-    let dice = DiceDriver::new(Path::new("/dev/open-dice0")).context("Failed to load DICE")?;
-
-    let mut instance = InstanceDisk::new().context("Failed to load instance.img")?;
-    let saved_data =
-        instance.read_microdroid_data(&dice).context("Failed to read identity data")?;
-
-    if is_strict_boot() {
-        // Provisioning must happen on the first boot and never again.
-        if is_new_instance() {
-            ensure!(
-                saved_data.is_none(),
-                MicrodroidError::PayloadInvalidConfig(
-                    "Found instance data on first boot.".to_string()
-                )
-            );
-        } else {
-            ensure!(
-                saved_data.is_some(),
-                MicrodroidError::PayloadInvalidConfig("Instance data not found.".to_string())
-            );
-        };
-    }
-
-    // Verify the payload before using it.
-    let verified_data = verify_payload(&metadata, saved_data.as_ref())
-        .context("Payload verification failed")
-        .map_err(|e| MicrodroidError::PayloadVerificationFailed(e.to_string()))?;
-
-    // In case identity is ignored (by debug policy), we should reuse existing payload data, even
-    // when the payload is changed. This is to keep the derived secret same as before.
-    let verified_data = if let Some(saved_data) = saved_data {
-        if !is_verified_boot() {
-            if saved_data != verified_data {
-                info!("Detected an update of the payload, but continue (regarding debug policy)")
-            }
-        } else {
-            ensure!(
-                saved_data == verified_data,
-                MicrodroidError::PayloadChanged(String::from(
-                    "Detected an update of the payload which isn't supported yet."
-                ))
-            );
-            info!("Saved data is verified.");
-        }
-        saved_data
-    } else {
-        info!("Saving verified data.");
-        instance
-            .write_microdroid_data(&verified_data, &dice)
-            .context("Failed to write identity data")?;
-        verified_data
-    };
-
-    let payload_metadata = metadata.payload.ok_or_else(|| {
-        MicrodroidError::PayloadInvalidConfig("No payload config in metadata".to_string())
-    })?;
-
-    // To minimize the exposure to untrusted data, derive dice profile as soon as possible.
-    info!("DICE derivation for payload");
-    let dice_artifacts = dice_derivation(dice, &verified_data, &payload_metadata)?;
-    let vm_secret = VmSecret::new(dice_artifacts).context("Failed to create VM secrets")?;
-
-    // Run encryptedstore binary to prepare the storage
-    let encryptedstore_child = if Path::new(ENCRYPTEDSTORE_BACKING_DEVICE).exists() {
-        info!("Preparing encryptedstore ...");
-        Some(prepare_encryptedstore(&vm_secret).context("encryptedstore run")?)
-    } else {
-        None
-    };
-
-    let mut zipfuse = Zipfuse::default();
-
-    // Before reading a file from the APK, start zipfuse
-    zipfuse.mount(
-        MountForExec::Allowed,
-        "fscontext=u:object_r:zipfusefs:s0,context=u:object_r:system_file:s0",
-        Path::new(verify::DM_MOUNTED_APK_PATH),
-        Path::new(VM_APK_CONTENTS_PATH),
-        "microdroid_manager.apk.mounted".to_owned(),
-    )?;
-
-    // Restricted APIs are only allowed to be used by platform or test components. Infer this from
-    // the use of a VM config file since those can only be used by platform and test components.
-    let allow_restricted_apis = match payload_metadata {
-        PayloadMetadata::ConfigPath(_) => true,
-        PayloadMetadata::Config(_) => false,
-        _ => false, // default is false for safety
-    };
-
-    let config = load_config(payload_metadata).context("Failed to load payload metadata")?;
-
-    let task = config
-        .task
-        .as_ref()
-        .ok_or_else(|| MicrodroidError::PayloadInvalidConfig("No task in VM config".to_string()))?;
-
-    ensure!(
-        config.extra_apks.len() == verified_data.extra_apks_data.len(),
-        "config expects {} extra apks, but found {}",
-        config.extra_apks.len(),
-        verified_data.extra_apks_data.len()
-    );
-    mount_extra_apks(&config, &mut zipfuse)?;
-
-    // Wait until apex config is done. (e.g. linker configuration for apexes)
-    wait_for_apex_config_done()?;
-
-    setup_config_sysprops(&config)?;
-
-    // Set export_tombstones if enabled
-    if should_export_tombstones(&config) {
-        // This property is read by tombstone_handler.
-        system_properties::write("microdroid_manager.export_tombstones.enabled", "1")
-            .context("set microdroid_manager.export_tombstones.enabled")?;
-    }
-
-    // Wait until zipfuse has mounted the APKs so we can access the payload
-    zipfuse.wait_until_done()?;
-
-    register_vm_payload_service(
-        allow_restricted_apis,
-        service.clone(),
-        vm_secret,
-        vm_payload_service_fd,
-    )?;
-
-    // Wait for encryptedstore to finish mounting the storage (if enabled) before setting
-    // microdroid_manager.init_done. Reason is init stops uneventd after that.
-    // Encryptedstore, however requires ueventd
-    if let Some(mut child) = encryptedstore_child {
-        let exitcode = child.wait().context("Wait for encryptedstore child")?;
-        ensure!(exitcode.success(), "Unable to prepare encrypted storage. Exitcode={}", exitcode);
-    }
-
-    wait_for_property_true("dev.bootcomplete").context("failed waiting for dev.bootcomplete")?;
-    system_properties::write("microdroid_manager.init_done", "1")
-        .context("set microdroid_manager.init_done")?;
-
-    info!("boot completed, time to run payload");
-    exec_task(task, service).context("Failed to run payload")
 }
 
 enum MountForExec {
@@ -502,65 +539,6 @@ impl Zipfuse {
         }
         Ok(())
     }
-}
-
-fn write_apex_payload_data(
-    saved_data: Option<&MicrodroidData>,
-    apex_data_from_payload: &[ApexData],
-) -> Result<()> {
-    if let Some(saved_apex_data) = saved_data.map(|d| &d.apex_data) {
-        // We don't support APEX updates. (assuming that update will change root digest)
-        ensure!(
-            saved_apex_data == apex_data_from_payload,
-            MicrodroidError::PayloadChanged(String::from("APEXes have changed."))
-        );
-        let apex_metadata = to_metadata(apex_data_from_payload);
-        // Pass metadata(with public keys and root digests) to apexd so that it uses the passed
-        // metadata instead of the default one (/dev/block/by-name/payload-metadata)
-        OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open("/apex/vm-payload-metadata")
-            .context("Failed to open /apex/vm-payload-metadata")
-            .and_then(|f| write_metadata(&apex_metadata, f))?;
-    }
-    Ok(())
-}
-
-fn mount_extra_apks(config: &VmPayloadConfig, zipfuse: &mut Zipfuse) -> Result<()> {
-    // For now, only the number of apks is important, as the mount point and dm-verity name is fixed
-    for i in 0..config.extra_apks.len() {
-        let mount_dir = format!("/mnt/extra-apk/{i}");
-        create_dir(Path::new(&mount_dir)).context("Failed to create mount dir for extra apks")?;
-
-        let mount_for_exec =
-            if cfg!(multi_tenant) { MountForExec::Allowed } else { MountForExec::Disallowed };
-        // These run asynchronously in parallel - we wait later for them to complete.
-        zipfuse.mount(
-            mount_for_exec,
-            "fscontext=u:object_r:zipfusefs:s0,context=u:object_r:extra_apk_file:s0",
-            Path::new(&format!("/dev/block/mapper/extra-apk-{i}")),
-            Path::new(&mount_dir),
-            format!("microdroid_manager.extra_apk.mounted.{i}"),
-        )?;
-    }
-
-    Ok(())
-}
-
-fn setup_config_sysprops(config: &VmPayloadConfig) -> Result<()> {
-    if config.enable_authfs {
-        system_properties::write("microdroid_manager.authfs.enabled", "1")
-            .context("failed to write microdroid_manager.authfs.enabled")?;
-    }
-    system_properties::write("microdroid_manager.config_done", "1")
-        .context("failed to write microdroid_manager.config_done")?;
-    Ok(())
-}
-
-// Waits until linker config is generated
-fn wait_for_apex_config_done() -> Result<()> {
-    wait_for_property_true(APEX_CONFIG_DONE_PROP).context("Failed waiting for apex config done")
 }
 
 fn wait_for_property_true(property_name: &str) -> Result<()> {

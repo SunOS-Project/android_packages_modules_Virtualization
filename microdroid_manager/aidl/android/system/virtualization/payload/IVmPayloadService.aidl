@@ -16,11 +16,17 @@
 
 package android.system.virtualization.payload;
 
+import android.system.virtualizationcommon.Certificate;
+
 /**
  * This interface regroups the tasks that payloads delegate to
  * Microdroid Manager for execution.
  */
 interface IVmPayloadService {
+    /** The constants STATUS_* are status code returned by this service. */
+    /** Failed to prepare the CSR and key pair for attestation. */
+    const int STATUS_FAILED_TO_PREPARE_CSR_AND_KEY = 1;
+
     /** Socket name of the service IVmPayloadService. */
     const String VM_PAYLOAD_SERVICE_SOCKET_NAME = "vm_payload_service";
 
@@ -32,6 +38,32 @@ interface IVmPayloadService {
      * is not enabled.
      */
     const String ENCRYPTEDSTORE_MOUNTPOINT = "/mnt/encryptedstore";
+
+    /**
+     * An {@link AttestationResult} holds an attested private key and the remotely
+     * provisioned certificate chain covering its corresponding public key.
+     */
+    parcelable AttestationResult {
+        /**
+         * DER-encoded ECPrivateKey structure specified in [RFC 5915 s3] for the
+         * EC P-256 private key, which is attested.
+         *
+         * The corresponding public key is included in the leaf certificate of
+         * the certificate chain.
+         *
+         * [RFC 5915 s3]: https://datatracker.ietf.org/doc/html/rfc5915#section-3
+         */
+        byte[] privateKey;
+
+        /**
+         * Sequence of DER-encoded X.509 certificates that make up the attestation
+         * key's certificate chain.
+         *
+         * The certificate chain starts with a leaf certificate covering the attested
+         * public key and ends with a root certificate.
+         */
+        Certificate[] certificateChain;
+    }
 
     /** Notifies that the payload is ready to serve. */
     void notifyPayloadReady();
@@ -69,11 +101,15 @@ interface IVmPayloadService {
     byte[] getDiceAttestationCdi();
 
     /**
-     * Requests a certificate using the provided certificate signing request (CSR).
+     * Requests the remote attestation of the client VM.
      *
-     * TODO(b/271275206): Define the format of the CSR properly.
-     * @param csr the certificate signing request.
-     * @return the X.509 encoded certificate.
+     * The challenge will be included in the certificate chain in the attestation result,
+     * serving as proof of the freshness of the result.
+     *
+     * @param challenge the maximum supported challenge size is 64 bytes.
+     *
+     * @return An {@link AttestationResult} parcelable containing an attested key pair and its
+     *         certification chain.
      */
-    byte[] requestCertificate(in byte[] csr);
+    AttestationResult requestAttestation(in byte[] challenge);
 }
