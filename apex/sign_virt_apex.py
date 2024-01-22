@@ -27,6 +27,7 @@ sign_virt_apex uses external tools which are assumed to be available via PATH.
 - lpmake, lpunpack, simg2img, img2simg, initrd_bootconfig
 """
 import argparse
+import binascii
 import builtins
 import hashlib
 import os
@@ -212,32 +213,62 @@ def AvbInfo(args, image_path):
 def LookUp(pairs, key):
     return [v for (k, v) in pairs if k == key]
 
+# Extract properties from the descriptors of original vbmeta image,
+# append to command as parameter.
+def AppendPropArgument(cmd, descriptors):
+    for prop in LookUp(descriptors, 'Prop'):
+        cmd.append('--prop')
+        result = re.match(r"(.+) -> '(.+)'", prop)
+        cmd.append(result.group(1) + ":" + result.group(2))
 
-def AddHashFooter(args, key, image_path, partition_name, additional_descriptors=None):
+
+def check_no_size_change_on_resigned_image(image_path, original_image_info, resigned_image_info):
+    assert original_image_info is not None, f'no avbinfo on original image: {image_path}'
+    assert resigned_image_info is not None, f'no avbinfo on resigned image: {image_path}'
+    assert_same_value(original_image_info, resigned_image_info, "Header Block", image_path)
+    assert_same_value(original_image_info, resigned_image_info, "Authentication Block", image_path)
+    assert_same_value(original_image_info, resigned_image_info, "Auxiliary Block", image_path)
+
+def AddHashFooter(args, key, image_path, additional_images=None):
     if os.path.basename(image_path) in args.key_overrides:
         key = args.key_overrides[os.path.basename(image_path)]
-    info, _ = AvbInfo(args, image_path)
+    info, descriptors = AvbInfo(args, image_path)
     if info:
+        # Extract hash descriptor of original image.
+        descs = {desc['Partition Name']:desc for desc in LookUp(descriptors, 'Hash descriptor')}
+        if additional_images:
+            for additional_image in additional_images:
+                _, additional_desc = AvbInfo(args, additional_image)
+                del descs[LookUp(additional_desc, 'Hash descriptor')[0]['Partition Name']]
+        assert len(descs) == 1, \
+            f'multiple hash descriptors except additional descriptors exist in {image_path}'
+        original_image_descriptor = list(descs.values())[0]
+
         image_size = ReadBytesSize(info['Image size'])
         algorithm = info['Algorithm']
+        original_image_partition_name = original_image_descriptor['Partition Name']
+        original_image_salt = original_image_descriptor['Salt']
         partition_size = str(image_size)
 
         cmd = ['avbtool', 'add_hash_footer',
                '--key', key,
                '--algorithm', algorithm,
-               '--partition_name', partition_name,
+               '--partition_name', original_image_partition_name,
+               '--salt', original_image_salt,
                '--partition_size', partition_size,
                '--image', image_path]
+        AppendPropArgument(cmd, descriptors)
         if args.signing_args:
             cmd.extend(shlex.split(args.signing_args))
-        if additional_descriptors:
-            for image in additional_descriptors:
-                cmd.extend(['--include_descriptors_from_image', image])
+        if additional_images:
+            for additional_image in additional_images:
+                cmd.extend(['--include_descriptors_from_image', additional_image])
 
         if 'Rollback Index' in info:
             cmd.extend(['--rollback_index', info['Rollback Index']])
         RunCommand(args, cmd)
-
+        resigned_info, _ = AvbInfo(args, image_path)
+        check_no_size_change_on_resigned_image(image_path, info, resigned_info)
 
 def AddHashTreeFooter(args, key, image_path):
     if os.path.basename(image_path) in args.key_overrides:
@@ -249,6 +280,7 @@ def AddHashTreeFooter(args, key, image_path):
         algorithm = info['Algorithm']
         partition_name = descriptor['Partition Name']
         hash_algorithm = descriptor['Hash Algorithm']
+        salt = descriptor['Salt']
         partition_size = str(image_size)
         cmd = ['avbtool', 'add_hashtree_footer',
                '--key', key,
@@ -257,10 +289,14 @@ def AddHashTreeFooter(args, key, image_path):
                '--partition_size', partition_size,
                '--do_not_generate_fec',
                '--hash_algorithm', hash_algorithm,
+               '--salt', salt,
                '--image', image_path]
+        AppendPropArgument(cmd, descriptors)
         if args.signing_args:
             cmd.extend(shlex.split(args.signing_args))
         RunCommand(args, cmd)
+        resigned_info, _ = AvbInfo(args, image_path)
+        check_no_size_change_on_resigned_image(image_path, info, resigned_info)
 
 
 def UpdateVbmetaBootconfig(args, initrds, vbmeta_img):
@@ -376,6 +412,8 @@ def MakeVbmetaImage(args, key, vbmeta_img, images=None, chained_partitions=None)
             cmd.extend(shlex.split(args.signing_args))
 
         RunCommand(args, cmd)
+        resigned_info, _ = AvbInfo(args, vbmeta_img)
+        check_no_size_change_on_resigned_image(vbmeta_img, info, resigned_info)
         # libavb expects to be able to read the maximum vbmeta size, so we must provide a partition
         # which matches this or the read will fail.
         with open(vbmeta_img, 'a', encoding='utf8') as f:
@@ -404,10 +442,11 @@ def MakeSuperImage(args, partitions, output):
         RunCommand(args, cmd)
 
 
-def GenVbmetaImage(args, image, output, partition_name):
+def GenVbmetaImage(args, image, output, partition_name, salt):
     cmd = ['avbtool', 'add_hash_footer', '--dynamic_partition_size',
            '--do_not_append_vbmeta_image',
            '--partition_name', partition_name,
+           '--salt', salt,
            '--image', image,
            '--output_vbmeta_image', output]
     RunCommand(args, cmd)
@@ -422,6 +461,7 @@ virt_apex_non_gki_files = {
     'super.img': 'etc/fs/microdroid_super.img',
     'initrd_normal.img': 'etc/microdroid_initrd_normal.img',
     'initrd_debuggable.img': 'etc/microdroid_initrd_debuggable.img',
+    'rialto': 'etc/rialto.bin',
 }
 
 def TargetFiles(input_dir):
@@ -490,20 +530,22 @@ def SignVirtApex(args):
         initrd_normal_file = files[initrd_normal]
         initrd_debug_file = files[initrd_debug]
 
+        _, kernel_image_descriptors = AvbInfo(args, kernel_file)
+        salts = {desc['Partition Name']:desc['Salt'] for desc in LookUp(kernel_image_descriptors, 'Hash descriptor')}
         initrd_normal_hashdesc = tempfile.NamedTemporaryFile(delete=False).name
         initrd_debug_hashdesc = tempfile.NamedTemporaryFile(delete=False).name
         initrd_n_f = Async(GenVbmetaImage, args, initrd_normal_file,
-                           initrd_normal_hashdesc, "initrd_normal",
+                           initrd_normal_hashdesc, "initrd_normal", salts["initrd_normal"],
                            wait=[vbmeta_bc_f] if vbmeta_bc_f is not None else [])
         initrd_d_f = Async(GenVbmetaImage, args, initrd_debug_file,
-                           initrd_debug_hashdesc, "initrd_debug",
+                           initrd_debug_hashdesc, "initrd_debug", salts["initrd_debug"],
                            wait=[vbmeta_bc_f] if vbmeta_bc_f is not None else [])
-        Async(AddHashFooter, args, key, kernel_file, partition_name="boot",
-              additional_descriptors=[
-                  initrd_normal_hashdesc, initrd_debug_hashdesc],
+        return Async(AddHashFooter, args, key, kernel_file,
+              additional_images=[initrd_normal_hashdesc, initrd_debug_hashdesc],
               wait=[initrd_n_f, initrd_d_f])
 
-    resign_kernel('kernel', 'initrd_normal.img', 'initrd_debuggable.img')
+    _, original_kernel_descriptors = AvbInfo(args, files['kernel'])
+    resign_kernel_task = resign_kernel('kernel', 'initrd_normal.img', 'initrd_debuggable.img')
 
     for ver in gki_versions:
         if f'gki-{ver}_kernel' in files:
@@ -512,6 +554,98 @@ def SignVirtApex(args):
                 f'gki-{ver}_initrd_normal.img',
                 f'gki-{ver}_initrd_debuggable.img')
 
+    # Re-sign rialto if it exists. Rialto only exists in arm64 environment.
+    if os.path.exists(files['rialto']):
+        update_kernel_hashes_task = Async(
+            update_initrd_hashes_in_rialto, original_kernel_descriptors, args,
+            files, wait=[resign_kernel_task])
+        Async(resign_rialto, args, key, files['rialto'], wait=[update_kernel_hashes_task])
+
+def resign_rialto(args, key, rialto_path):
+    original_info, original_descriptors = AvbInfo(args, rialto_path)
+    AddHashFooter(args, key, rialto_path)
+
+    # Verify the new AVB footer.
+    updated_info, updated_descriptors = AvbInfo(args, rialto_path)
+    assert_same_value(original_info, updated_info, "Original image size", "rialto")
+    original_descriptor = find_hash_descriptor_by_partition_name(original_descriptors, 'boot')
+    updated_descriptor = find_hash_descriptor_by_partition_name(updated_descriptors, 'boot')
+    # Since salt is not updated, the change of digest reflects the change of content of rialto
+    # kernel.
+    assert_same_value(original_descriptor, updated_descriptor, "Salt", "rialto_hash_descriptor")
+    if not args.do_not_update_bootconfigs:
+        assert_different_value(original_descriptor, updated_descriptor, "Digest",
+                               "rialto_hash_descriptor")
+
+def assert_same_value(original, updated, key, context):
+    assert original[key] == updated[key], \
+        f"Value of '{key}' should not change for '{context}'" \
+        f"Original value: {original[key]}, updated value: {updated[key]}"
+
+def assert_different_value(original, updated, key, context):
+    assert original[key] != updated[key], \
+        f"Value of '{key}' should change for '{context}'" \
+        f"Original value: {original[key]}, updated value: {updated[key]}"
+
+def update_initrd_hashes_in_rialto(original_descriptors, args, files):
+    _, updated_descriptors = AvbInfo(args, files['kernel'])
+
+    original_kernel_descriptor = find_hash_descriptor_by_partition_name(
+        original_descriptors, 'boot')
+    updated_kernel_descriptor = find_hash_descriptor_by_partition_name(
+        updated_descriptors, 'boot')
+    assert_same_value(original_kernel_descriptor, updated_kernel_descriptor,
+                      "Digest", "microdroid_kernel_hash_descriptor")
+
+    # Update the hashes of initrd_normal and initrd_debug in rialto if the
+    # bootconfigs in them are updated.
+    if args.do_not_update_bootconfigs:
+        return
+
+    with open(files['rialto'], "rb") as file:
+        content = file.read()
+
+    partition_names = ['initrd_normal', 'initrd_debug']
+    all_digests = set()
+    for partition_name in partition_names:
+        original_descriptor = find_hash_descriptor_by_partition_name(
+            original_descriptors, partition_name)
+        update_descriptor = find_hash_descriptor_by_partition_name(
+            updated_descriptors, partition_name)
+
+        original_digest = binascii.unhexlify(original_descriptor['Digest'])
+        updated_digest = binascii.unhexlify(update_descriptor['Digest'])
+        assert len(original_digest) == len(updated_digest), \
+            f"Length of original_digest and updated_digest must be the same for {partition_name}." \
+            f" Original digest: {original_digest}, updated digest: {updated_digest}"
+        assert original_digest != updated_digest, \
+            f"Digest of the partition {partition_name} should change. " \
+            f"Original digest: {original_digest}, updated digest: {updated_digest}"
+        all_digests.add(original_digest)
+        all_digests.add(updated_digest)
+
+        new_content = content.replace(original_digest, updated_digest)
+        assert len(new_content) == len(content), \
+            "Length of new_content and content must be the same."
+        assert new_content != content, \
+            f"original digest of the partition {partition_name} not found. " \
+            f"Original descriptor: {original_descriptor}"
+        content = new_content
+
+    assert len(all_digests) == len(partition_names) * 2, \
+        f"There should be {len(partition_names) * 2} different digests for the original and " \
+        f"updated descriptors for initrd. Original descriptors: {original_descriptors}, " \
+        f"updated descriptors: {updated_descriptors}"
+
+    with open(files['rialto'], "wb") as file:
+        file.write(content)
+
+def find_hash_descriptor_by_partition_name(descriptors, partition_name):
+    """Find the hash descriptor of the partition in the descriptors."""
+    for descriptor_type, descriptor in descriptors:
+        if descriptor_type == 'Hash descriptor' and descriptor['Partition Name'] == partition_name:
+            return descriptor
+    assert False, f'Failed to find hash descriptor for partition {partition_name}'
 
 def VerifyVirtApex(args):
     key = args.key
@@ -537,6 +671,9 @@ def VerifyVirtApex(args):
     for k, f in files.items():
         if IsInitrdImage(k):
             # TODO(b/245277660): Verify that ramdisks contain the correct vbmeta digest
+            continue
+        if k == 'rialto' and not os.path.exists(f):
+            # Rialto only exists in arm64 environment.
             continue
         if k == 'super.img':
             Async(check_avb_pubkey, system_a_img)
