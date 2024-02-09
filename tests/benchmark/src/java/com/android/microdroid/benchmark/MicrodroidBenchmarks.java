@@ -119,7 +119,7 @@ public class MicrodroidBenchmarks extends MicrodroidDeviceTestBase {
     public void setup() throws IOException {
         grantPermission(VirtualMachine.MANAGE_VIRTUAL_MACHINE_PERMISSION);
         grantPermission(VirtualMachine.USE_CUSTOM_VIRTUAL_MACHINE_PERMISSION);
-        prepareTestSetup(mProtectedVm);
+        prepareTestSetup(mProtectedVm, null /* gki */);
         setMaxPerformanceTaskProfile();
         mInstrumentation = getInstrumentation();
     }
@@ -200,8 +200,10 @@ public class MicrodroidBenchmarks extends MicrodroidDeviceTestBase {
         }
     }
 
-    private BootTimeStats runBootTimeTest(
+    private void runBootTimeTest(
             String name,
+            String payloadConfig,
+            boolean fullDebug,
             Function<VirtualMachineConfig.Builder, VirtualMachineConfig.Builder> fnConfig)
             throws VirtualMachineException, InterruptedException, IOException {
         assume().withMessage("Skip on CF; too slow").that(isCuttlefish()).isFalse();
@@ -212,9 +214,12 @@ public class MicrodroidBenchmarks extends MicrodroidDeviceTestBase {
         for (int i = 0; i < trialCount; i++) {
             VirtualMachineConfig.Builder builder =
                     newVmConfigBuilder()
-                            .setPayloadBinaryName("MicrodroidIdleNativeLib.so")
+                            .setPayloadConfigPath(payloadConfig)
                             .setMemoryBytes(256 * ONE_MEBI)
                             .setDebugLevel(DEBUG_LEVEL_NONE);
+            if (fullDebug) {
+                builder = builder.setDebugLevel(DEBUG_LEVEL_FULL).setVmOutputCaptured(true);
+            }
             VirtualMachineConfig config = fnConfig.apply(builder).build();
             forceCreateNewVirtualMachine(name, config);
 
@@ -222,62 +227,102 @@ public class MicrodroidBenchmarks extends MicrodroidDeviceTestBase {
             assertThat(result.payloadStarted).isTrue();
             stats.collect(result);
         }
-        return stats;
+
+        reportMetrics(stats.get(BootTimeMetric.TOTAL), "boot_time", "ms");
+        if (fullDebug) {
+            reportMetrics(stats.get(BootTimeMetric.VM_START), "vm_starting_time", "ms");
+            reportMetrics(stats.get(BootTimeMetric.BOOTLOADER), "bootloader_time", "ms");
+            reportMetrics(stats.get(BootTimeMetric.KERNEL), "kernel_boot_time", "ms");
+            reportMetrics(stats.get(BootTimeMetric.USERSPACE), "userspace_boot_time", "ms");
+        }
     }
 
     @Test
     public void testMicrodroidBootTime()
             throws VirtualMachineException, InterruptedException, IOException {
-        BootTimeStats stats =
-                runBootTimeTest(
-                        "test_vm_boot_time",
-                        (builder) -> builder.setCpuTopology(CPU_TOPOLOGY_ONE_CPU));
-        reportMetrics(stats.get(BootTimeMetric.TOTAL), "boot_time", "ms");
+        runBootTimeTest(
+                "test_vm_boot_time",
+                "assets/vm_config.json",
+                /* fullDebug */ false,
+                (builder) -> builder.setCpuTopology(CPU_TOPOLOGY_ONE_CPU));
+    }
+
+    @Test
+    public void testMicrodroidGkiBootTime()
+            throws VirtualMachineException, InterruptedException, IOException {
+        runBootTimeTest(
+                "test_vm_boot_time",
+                "assets/vm_config_gki-android14-6.1.json",
+                /* reportDetailed */ false,
+                (builder) -> builder.setCpuTopology(CPU_TOPOLOGY_ONE_CPU));
     }
 
     @Test
     public void testMicrodroidHostCpuTopologyBootTime()
             throws VirtualMachineException, InterruptedException, IOException {
-        BootTimeStats stats =
-                runBootTimeTest(
-                        "test_vm_boot_time_host_topology",
-                        (builder) -> builder.setCpuTopology(CPU_TOPOLOGY_MATCH_HOST));
-        reportMetrics(stats.get(BootTimeMetric.TOTAL), "boot_time", "ms");
+        runBootTimeTest(
+                "test_vm_boot_time_host_topology",
+                "assets/vm_config.json",
+                /* fullDebug */ false,
+                (builder) -> builder.setCpuTopology(CPU_TOPOLOGY_MATCH_HOST));
+    }
+
+    @Test
+    public void testMicrodroidGkiHostCpuTopologyBootTime()
+            throws VirtualMachineException, InterruptedException, IOException {
+        runBootTimeTest(
+                "test_vm_boot_time_host_topology",
+                "assets/vm_config_gki-android14-6.1.json",
+                /* reportDetailed */ false,
+                (builder) -> builder.setCpuTopology(CPU_TOPOLOGY_MATCH_HOST));
     }
 
     @Test
     public void testMicrodroidDebugBootTime()
             throws VirtualMachineException, InterruptedException, IOException {
-        BootTimeStats stats =
-                runBootTimeTest(
-                        "test_vm_boot_time_debug",
-                        (builder) ->
-                                builder.setDebugLevel(DEBUG_LEVEL_FULL).setVmOutputCaptured(true));
-        reportMetrics(stats.get(BootTimeMetric.TOTAL), "boot_time", "ms");
-        reportMetrics(stats.get(BootTimeMetric.VM_START), "vm_starting_time", "ms");
-        reportMetrics(stats.get(BootTimeMetric.BOOTLOADER), "bootloader_time", "ms");
-        reportMetrics(stats.get(BootTimeMetric.KERNEL), "kernel_boot_time", "ms");
-        reportMetrics(stats.get(BootTimeMetric.USERSPACE), "userspace_boot_time", "ms");
+        runBootTimeTest(
+                "test_vm_boot_time_debug",
+                "assets/vm_config.json",
+                /* fullDebug */ true,
+                (builder) -> builder);
+    }
+
+    @Test
+    public void testMicrodroidGkiDebugBootTime()
+            throws VirtualMachineException, InterruptedException, IOException {
+        runBootTimeTest(
+                "test_vm_boot_time_debug",
+                "assets/vm_config_gki-android14-6.1.json",
+                /* reportDetailed */ true,
+                (builder) -> builder);
     }
 
     @Test
     public void testMicrodroidDebugBootTime_withVendorPartition() throws Exception {
+        assume().withMessage(
+                        "Cuttlefish doesn't support device tree under"
+                                + " /sys/firmware/devicetree/base")
+                .that(isCuttlefish())
+                .isFalse();
+        // TODO(b/317567210): Boots fails with vendor partition in HWASAN enabled microdroid
+        // after introducing verification based on DT and fstab in microdroid vendor partition.
+        assume().withMessage("Boot with vendor partition is failing in HWASAN enabled Microdroid.")
+                .that(isHwasan())
+                .isFalse();
+        assume().withMessage(
+                        "Skip test for protected VM, pvmfw config data doesn't contain any"
+                                + " information of test images, such as root digest.")
+                .that(mProtectedVm)
+                .isFalse();
         assumeFeatureEnabled(VirtualMachineManager.FEATURE_VENDOR_MODULES);
 
         File vendorDiskImage =
                 new File("/data/local/tmp/microdroid-bench/microdroid_vendor_image.img");
-        BootTimeStats stats =
-                runBootTimeTest(
-                        "test_vm_boot_time_debug_with_vendor_partition",
-                        (builder) ->
-                                builder.setDebugLevel(DEBUG_LEVEL_FULL)
-                                        .setVmOutputCaptured(true)
-                                        .setVendorDiskImage(vendorDiskImage));
-        reportMetrics(stats.get(BootTimeMetric.TOTAL), "boot_time", "ms");
-        reportMetrics(stats.get(BootTimeMetric.VM_START), "vm_starting_time", "ms");
-        reportMetrics(stats.get(BootTimeMetric.BOOTLOADER), "bootloader_time", "ms");
-        reportMetrics(stats.get(BootTimeMetric.KERNEL), "kernel_boot_time", "ms");
-        reportMetrics(stats.get(BootTimeMetric.USERSPACE), "userspace_boot_time", "ms");
+        runBootTimeTest(
+                "test_vm_boot_time_debug_with_vendor_partition",
+                "assets/vm_config.json",
+                /* fullDebug */ true,
+                (builder) -> builder.setVendorDiskImage(vendorDiskImage));
     }
 
     @Test

@@ -25,6 +25,7 @@ import static com.google.common.truth.Truth.assertWithMessage;
 
 import static org.hamcrest.CoreMatchers.containsString;
 import static org.junit.Assert.assertThat;
+import static org.junit.Assert.assertTrue;
 import static org.junit.Assume.assumeFalse;
 import static org.junit.Assume.assumeTrue;
 
@@ -89,7 +90,7 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
     private static final String SHELL_PACKAGE_NAME = "com.android.shell";
     private static final String VIRT_APEX = "/apex/com.android.virt/";
 
-    private static final int MIN_MEM_ARM64 = 145;
+    private static final int MIN_MEM_ARM64 = 160;
     private static final int MIN_MEM_X86_64 = 196;
 
     private static final int BOOT_COMPLETE_TIMEOUT = 30000; // 30 seconds
@@ -102,13 +103,26 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
         }
     }
 
-    @Parameterized.Parameters(name = "protectedVm={0}")
+    @Parameterized.Parameters(name = "protectedVm={0},gki={1}")
     public static Collection<Object[]> params() {
-        return List.of(new Object[] {true}, new Object[] {false});
+        List<Object[]> ret = new ArrayList<>();
+        ret.add(new Object[] {true /* protectedVm */, null /* use microdroid kernel */});
+        ret.add(new Object[] {false /* protectedVm */, null /* use microdroid kernel */});
+        // TODO(b/302465542): run only the latest GKI on presubmit to reduce running time
+        for (String gki : SUPPORTED_GKI_VERSIONS) {
+            ret.add(new Object[] {true /* protectedVm */, gki});
+            ret.add(new Object[] {false /* protectedVm */, gki});
+        }
+        return ret;
     }
 
     @Parameterized.Parameter(0)
     public boolean mProtectedVm;
+
+    @Parameterized.Parameter(1)
+    public String mGki;
+
+    private String mOs;
 
     @Rule public TestLogData mTestLogs = new TestLogData();
     @Rule public TestName mTestName = new TestName();
@@ -138,7 +152,7 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
             throws Exception {
         PayloadMetadata.write(
                 PayloadMetadata.metadata(
-                        "/mnt/apk/assets/vm_config.json",
+                        "/mnt/apk/assets/" + mOs + "/vm_config.json",
                         PayloadMetadata.apk("microdroid-apk"),
                         apexes.stream()
                                 .map(apex -> PayloadMetadata.apex(apex.name))
@@ -322,7 +336,7 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
         //   - its idsig
 
         // Load etc/microdroid.json
-        File microdroidConfigFile = new File(virtApexEtcDir, "microdroid.json");
+        File microdroidConfigFile = new File(virtApexEtcDir, mOs + ".json");
         JSONObject config = new JSONObject(FileUtil.readStringFromFile(microdroidConfigFile));
 
         // Replace paths so that the config uses re-signed images from TEST_ROOT
@@ -338,7 +352,7 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
         }
 
         // Add partitions to the second disk
-        final String initrdPath = TEST_ROOT + "etc/microdroid_initrd_debuggable.img";
+        final String initrdPath = TEST_ROOT + "etc/" + mOs + "_initrd_debuggable.img";
         config.put("initrd", initrdPath);
         // Add instance image as a partition in disks[1]
         disks.put(
@@ -397,7 +411,7 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
     public void protectedVmRunsPvmfw() throws Exception {
         // Arrange
         assumeProtectedVm();
-        final String configPath = "assets/vm_config_apex.json";
+        final String configPath = "assets/" + mOs + "/vm_config_apex.json";
 
         // Act
         mMicrodroidDevice =
@@ -422,7 +436,7 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
 
     @Test
     @CddTest(requirements = {"9.17/C-2-1", "9.17/C-2-2", "9.17/C-2-6"})
-    public void protectedVmWithImageSignedWithDifferentKeyRunsPvmfw() throws Exception {
+    public void protectedVmWithImageSignedWithDifferentKeyFailsToVerifyPayload() throws Exception {
         // Arrange
         assumeProtectedVm();
         File key = findTestFile("test.com.android.virt.pem");
@@ -439,8 +453,9 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
         vmInfo.mProcess.waitFor(5L, TimeUnit.SECONDS);
         String consoleLog = getDevice().pullFileContents(CONSOLE_PATH);
         assertWithMessage("pvmfw should start").that(consoleLog).contains("pVM firmware");
-        // TODO(b/256148034): Asserts that pvmfw run fails when this verification is implemented.
-        // Also rename the test.
+        assertWithMessage("pvmfw should fail to verify the payload")
+                .that(consoleLog)
+                .contains("Failed to verify the payload");
         vmInfo.mProcess.destroy();
     }
 
@@ -552,7 +567,7 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
         assertThat(
                         isTombstoneGeneratedWithCmd(
                                 mProtectedVm,
-                                "assets/vm_config.json",
+                                "assets/" + mOs + "/vm_config.json",
                                 "kill",
                                 "-SIGSEGV",
                                 "$(pidof microdroid_launcher)"))
@@ -566,7 +581,7 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
         assertThat(
                         isTombstoneGeneratedWithCmd(
                                 mProtectedVm,
-                                "assets/vm_config_no_tombstone.json",
+                                "assets/" + mOs + "/vm_config_no_tombstone.json",
                                 "kill",
                                 "-SIGSEGV",
                                 "$(pidof microdroid_launcher)"))
@@ -580,7 +595,7 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
         assertThat(
                         isTombstoneGeneratedWithCmd(
                                 mProtectedVm,
-                                "assets/vm_config.json",
+                                "assets/" + mOs + "/vm_config.json",
                                 "echo",
                                 "c",
                                 ">",
@@ -644,7 +659,10 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
     private boolean isTombstoneGeneratedWithCrashConfig(boolean protectedVm, boolean debuggable)
             throws Exception {
         return isTombstoneGeneratedWithVmRunApp(
-                protectedVm, debuggable, "--config-path", "assets/vm_config_crash.json");
+                protectedVm,
+                debuggable,
+                "--config-path",
+                "assets/" + mOs + "/vm_config_crash.json");
     }
 
     @Test
@@ -679,7 +697,7 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
 
         // Create VM with microdroid
         TestDevice device = getAndroidDevice();
-        final String configPath = "assets/vm_config_apex.json"; // path inside the APK
+        final String configPath = "assets/" + mOs + "/vm_config_apex.json"; // path inside the APK
         ITestDevice microdroid =
                 MicrodroidBuilder.fromDevicePath(getPathForPackage(PACKAGE_NAME), configPath)
                         .debugLevel("full")
@@ -808,7 +826,7 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
     @Test
     @CddTest(requirements = {"9.17/C-1-1", "9.17/C-1-2", "9.17/C/1-3"})
     public void testMicrodroidBoots() throws Exception {
-        final String configPath = "assets/vm_config.json"; // path inside the APK
+        final String configPath = "assets/" + mOs + "/vm_config.json"; // path inside the APK
         testMicrodroidBootsWithBuilder(
                 MicrodroidBuilder.fromDevicePath(getPathForPackage(PACKAGE_NAME), configPath)
                         .debugLevel("full")
@@ -818,25 +836,8 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
     }
 
     @Test
-    @CddTest(requirements = {"9.17/C-1-1", "9.17/C-1-2", "9.17/C/1-3"})
-    public void testMicrodroidBootsWithGki() throws Exception {
-        List<String> supportedVersions = getSupportedGKIVersions();
-        assumeFalse("no available gki", supportedVersions.isEmpty());
-        for (String ver : supportedVersions) {
-            final String configPath = "assets/vm_config.json"; // path inside the APK
-            testMicrodroidBootsWithBuilder(
-                    MicrodroidBuilder.fromDevicePath(getPathForPackage(PACKAGE_NAME), configPath)
-                            .debugLevel("full")
-                            .memoryMib(minMemorySize())
-                            .cpuTopology("match_host")
-                            .protectedVm(mProtectedVm)
-                            .gki(ver));
-        }
-    }
-
-    @Test
     public void testMicrodroidRamUsage() throws Exception {
-        final String configPath = "assets/vm_config.json";
+        final String configPath = "assets/" + mOs + "/vm_config.json";
         mMicrodroidDevice =
                 MicrodroidBuilder.fromDevicePath(getPathForPackage(PACKAGE_NAME), configPath)
                         .debugLevel("full")
@@ -990,7 +991,7 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
         List<String> devices = getAssignableDevices();
         assumeFalse("no assignable devices", devices.isEmpty());
 
-        final String configPath = "assets/vm_config.json";
+        final String configPath = "assets/" + mOs + "/vm_config.json";
         mMicrodroidDevice =
                 MicrodroidBuilder.fromDevicePath(getPathForPackage(PACKAGE_NAME), configPath)
                         .debugLevel("full")
@@ -1001,6 +1002,15 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
                         .build(getAndroidDevice());
 
         mMicrodroidDevice.waitForBootComplete(BOOT_COMPLETE_TIMEOUT);
+    }
+
+    @Test
+    public void testGkiVersions() throws Exception {
+        for (String gki : getSupportedGKIVersions()) {
+            assertTrue(
+                    "Unknown gki \"" + gki + "\". Supported gkis: " + SUPPORTED_GKI_VERSIONS,
+                    SUPPORTED_GKI_VERSIONS.contains(gki));
+        }
     }
 
     @Before
@@ -1017,6 +1027,14 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
         assumeTrue(
                 "Microdroid is not supported for specific VM protection type",
                 getAndroidDevice().supportsMicrodroid(mProtectedVm));
+
+        if (mGki != null) {
+            assumeTrue(
+                    "GKI version \"" + mGki + "\" is not supported on this device",
+                    getSupportedGKIVersions().contains(mGki));
+        }
+
+        mOs = (mGki != null) ? "microdroid_gki-" + mGki : "microdroid";
     }
 
     @After
@@ -1077,8 +1095,15 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
         return parseStringArrayFieldsFromVmInfo("Assignable devices: ");
     }
 
+    private List<String> getSupportedOSList() throws Exception {
+        return parseStringArrayFieldsFromVmInfo("Available OS list: ");
+    }
+
     private List<String> getSupportedGKIVersions() throws Exception {
-        return parseStringArrayFieldsFromVmInfo("Available gki versions: ");
+        return getSupportedOSList().stream()
+                .filter(os -> os.startsWith("microdroid_gki-"))
+                .map(os -> os.replaceFirst("^microdroid_gki-", ""))
+                .collect(Collectors.toList());
     }
 
     private TestDevice getAndroidDevice() {

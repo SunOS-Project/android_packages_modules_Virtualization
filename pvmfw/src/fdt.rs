@@ -19,6 +19,7 @@ use crate::device_assignment::{DeviceAssignmentInfo, VmDtbo};
 use crate::helpers::GUEST_PAGE_SIZE;
 use crate::Box;
 use crate::RebootReason;
+use alloc::collections::BTreeMap;
 use alloc::ffi::CString;
 use alloc::vec::Vec;
 use core::cmp::max;
@@ -200,27 +201,46 @@ fn patch_num_cpus(fdt: &mut Fdt, num_cpus: usize) -> libfdt::Result<()> {
     Ok(())
 }
 
-fn read_vendor_hashtree_descriptor_root_digest_from(fdt: &Fdt) -> libfdt::Result<Option<Vec<u8>>> {
+/// Read candidate properties' names from DT which could be overlaid
+fn parse_vm_ref_dt(fdt: &Fdt) -> libfdt::Result<BTreeMap<CString, Vec<u8>>> {
+    let mut property_map = BTreeMap::new();
     if let Some(avf_node) = fdt.node(cstr!("/avf"))? {
-        if let Some(vendor_hashtree_descriptor_root_digest) =
-            avf_node.getprop(cstr!("vendor_hashtree_descriptor_root_digest"))?
-        {
-            return Ok(Some(vendor_hashtree_descriptor_root_digest.to_vec()));
+        for property in avf_node.properties()? {
+            let name = property.name()?;
+            let value = property.value()?;
+            property_map.insert(
+                CString::new(name.to_bytes()).map_err(|_| FdtError::BadValue)?,
+                value.to_vec(),
+            );
         }
     }
-    Ok(None)
+    Ok(property_map)
 }
 
-fn patch_vendor_hashtree_descriptor_root_digest(
-    fdt: &mut Fdt,
-    vendor_hashtree_descriptor_root_digest: &[u8],
+/// Overlay VM reference DT into VM DT based on the props_info. Property is overlaid in vm_dt only
+/// when it exists both in vm_ref_dt and props_info. If the values mismatch, it returns error.
+fn validate_vm_ref_dt(
+    vm_dt: &mut Fdt,
+    vm_ref_dt: &Fdt,
+    props_info: &BTreeMap<CString, Vec<u8>>,
 ) -> libfdt::Result<()> {
-    let mut root_node = fdt.root_mut()?;
-    let mut avf_node = root_node.add_subnode(cstr!("/avf"))?;
-    avf_node.setprop(
-        cstr!("vendor_hashtree_descriptor_root_digest"),
-        vendor_hashtree_descriptor_root_digest,
-    )?;
+    let mut root_vm_dt = vm_dt.root_mut()?;
+    let mut avf_vm_dt = root_vm_dt.add_subnode(cstr!("avf"))?;
+    // TODO(b/318431677): Validate nodes beyond /avf.
+    let avf_node = vm_ref_dt.node(cstr!("/avf"))?.ok_or(FdtError::NotFound)?;
+    for (name, value) in props_info.iter() {
+        if let Some(ref_value) = avf_node.getprop(name)? {
+            if value != ref_value {
+                error!(
+                    "Property mismatches while applying overlay VM reference DT. \
+                    Name:{:?}, Value from host as hex:{:x?}, Value from VM reference DT as hex:{:x?}",
+                    name, value, ref_value
+                );
+                return Err(FdtError::BadValue);
+            }
+            avf_vm_dt.setprop(name, ref_value)?;
+        }
+    }
     Ok(())
 }
 
@@ -616,7 +636,7 @@ pub struct DeviceTreeInfo {
     serial_info: SerialInfo,
     pub swiotlb_info: SwiotlbInfo,
     device_assignment: Option<DeviceAssignmentInfo>,
-    vendor_hashtree_descriptor_root_digest: Option<Vec<u8>>,
+    vm_ref_dt_props_info: BTreeMap<CString, Vec<u8>>,
 }
 
 impl DeviceTreeInfo {
@@ -630,6 +650,7 @@ impl DeviceTreeInfo {
 pub fn sanitize_device_tree(
     fdt: &mut [u8],
     vm_dtbo: Option<&mut [u8]>,
+    vm_ref_dt: Option<&[u8]>,
 ) -> Result<DeviceTreeInfo, RebootReason> {
     let fdt = Fdt::from_mut_slice(fdt).map_err(|e| {
         error!("Failed to load FDT: {e}");
@@ -673,7 +694,21 @@ pub fn sanitize_device_tree(
         }
     }
 
+    if let Some(vm_ref_dt) = vm_ref_dt {
+        let vm_ref_dt = Fdt::from_slice(vm_ref_dt).map_err(|e| {
+            error!("Failed to load VM reference DT: {e}");
+            RebootReason::InvalidFdt
+        })?;
+
+        validate_vm_ref_dt(fdt, vm_ref_dt, &info.vm_ref_dt_props_info).map_err(|e| {
+            error!("Failed to apply VM reference DT: {e}");
+            RebootReason::InvalidFdt
+        })?;
+    }
+
     patch_device_tree(fdt, &info)?;
+
+    // TODO(b/317201360): Ensure no overlapping in <reg> among devices
 
     fdt.pack().map_err(|e| {
         error!("Failed to unpack DT after patching: {e}");
@@ -744,19 +779,10 @@ fn parse_device_tree(fdt: &Fdt, vm_dtbo: Option<&VmDtbo>) -> Result<DeviceTreeIn
         None => None,
     };
 
-    // TODO(b/285854379) : A temporary solution lives. This is for enabling
-    // microdroid vendor partition for non-protected VM as well. When passing
-    // DT path containing vendor_hashtree_descriptor_root_digest via fstab, init
-    // stage will check if vendor_hashtree_descriptor_root_digest exists in the
-    // init stage, regardless the protection. Adding this temporary solution
-    // will prevent fatal in init stage for protected VM. However, this data is
-    // not trustable without validating root digest of vendor hashtree
-    // descriptor comes from ABL.
-    let vendor_hashtree_descriptor_root_digest =
-        read_vendor_hashtree_descriptor_root_digest_from(fdt).map_err(|e| {
-            error!("Failed to read vendor_hashtree_descriptor_root_digest from DT: {e}");
-            RebootReason::InvalidFdt
-        })?;
+    let vm_ref_dt_props_info = parse_vm_ref_dt(fdt).map_err(|e| {
+        error!("Failed to read names of properties under /avf from DT: {e}");
+        RebootReason::InvalidFdt
+    })?;
 
     Ok(DeviceTreeInfo {
         kernel_range,
@@ -768,7 +794,7 @@ fn parse_device_tree(fdt: &Fdt, vm_dtbo: Option<&VmDtbo>) -> Result<DeviceTreeIn
         serial_info,
         swiotlb_info,
         device_assignment,
-        vendor_hashtree_descriptor_root_digest,
+        vm_ref_dt_props_info,
     })
 }
 
@@ -818,15 +844,6 @@ fn patch_device_tree(fdt: &mut Fdt, info: &DeviceTreeInfo) -> Result<(), RebootR
         // then VM DTBO's underlying slice is allocated.
         device_assignment.patch(fdt).map_err(|e| {
             error!("Failed to patch device assignment info to DT: {e}");
-            RebootReason::InvalidFdt
-        })?;
-    }
-    if let Some(vendor_hashtree_descriptor_root_digest) =
-        &info.vendor_hashtree_descriptor_root_digest
-    {
-        patch_vendor_hashtree_descriptor_root_digest(fdt, vendor_hashtree_descriptor_root_digest)
-            .map_err(|e| {
-            error!("Failed to patch vendor_hashtree_descriptor_root_digest to DT: {e}");
             RebootReason::InvalidFdt
         })?;
     }

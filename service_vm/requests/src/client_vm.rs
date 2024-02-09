@@ -22,13 +22,13 @@ use crate::dice::{
 use crate::keyblob::decrypt_private_key;
 use alloc::vec::Vec;
 use bssl_avf::{rand_bytes, sha256, Digester, EcKey, PKey};
-use cbor_util::value_to_array;
+use cbor_util::parse_value_array;
 use ciborium::value::Value;
 use core::result;
 use coset::{AsCborValue, CborSerializable, CoseSign, CoseSign1};
 use der::{Decode, Encode};
 use diced_open_dice::{DiceArtifacts, HASH_SIZE};
-use log::error;
+use log::{error, info};
 use microdroid_kernel_hashes::{INITRD_DEBUG_HASH, INITRD_NORMAL_HASH, KERNEL_HASH};
 use service_vm_comm::{ClientVmAttestationParams, Csr, CsrPayload, RequestProcessingError};
 use x509_cert::{certificate::Certificate, name::Name};
@@ -53,10 +53,8 @@ pub(super) fn request_attestation(
     // Validates the prefix of the Client VM DICE chain in the CSR.
     let service_vm_dice_chain =
         dice_artifacts.bcc().ok_or(RequestProcessingError::MissingDiceChain)?;
-    let service_vm_dice_chain =
-        value_to_array(Value::from_slice(service_vm_dice_chain)?, "service_vm_dice_chain")?;
-    let client_vm_dice_chain =
-        value_to_array(Value::from_slice(&csr.dice_cert_chain)?, "client_vm_dice_chain")?;
+    let service_vm_dice_chain = parse_value_array(service_vm_dice_chain, "service_vm_dice_chain")?;
+    let client_vm_dice_chain = parse_value_array(&csr.dice_cert_chain, "client_vm_dice_chain")?;
     validate_client_vm_dice_chain_prefix_match(&client_vm_dice_chain, &service_vm_dice_chain)?;
     // Validates the signatures in the Client VM DICE chain and extracts the partially decoded
     // DiceChainEntryPayloads.
@@ -86,9 +84,11 @@ pub(super) fn request_attestation(
 
     // Builds the TBSCertificate.
     // The serial number can be up to 20 bytes according to RFC5280 s4.1.2.2.
-    // In this case, a serial number with a length of 20 bytes is used to ensure that each
+    // In this case, a serial number with a length of 16 bytes is used to ensure that each
     // certificate signed by RKP VM has a unique serial number.
-    let mut serial_number = [0u8; 20];
+    // Attention: Do not use 20 bytes here as when the MSB is 1, a leading 0 byte can be
+    // added during the encoding to make the serial number length exceed 20 bytes.
+    let mut serial_number = [0u8; 16];
     rand_bytes(&mut serial_number)?;
     let subject = Name::encode_from_string("CN=Android Protected Virtual Machine Key")?;
     let rkp_cert = Certificate::from_der(&params.remotely_provisioned_cert)?;
@@ -98,6 +98,8 @@ pub(super) fn request_attestation(
         } else {
             Vec::new()
         };
+
+    info!("The client VM DICE chain validation succeeded. Beginning to generate the certificate.");
     let attestation_ext = cert::AttestationExtension::new(
         &csr_payload.challenge,
         client_vm_dice_chain.all_entries_are_secure(),
