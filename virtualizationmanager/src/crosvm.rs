@@ -118,7 +118,7 @@ pub struct CrosvmConfig {
     pub gdb_port: Option<NonZeroU16>,
     pub vfio_devices: Vec<VfioDevice>,
     pub dtbo: Option<File>,
-    pub dtbo_vendor: Option<File>,
+    pub reference_dt: Option<File>,
 }
 
 /// A disk image to pass to crosvm for a VM.
@@ -810,8 +810,10 @@ fn run_vm(
     }
 
     if config.host_cpu_topology {
-        // TODO(b/266664564): replace with --host-cpu-topology once available
-        if let Some(cpus) = get_num_cpus() {
+        if cfg!(virt_cpufreq) {
+            command.arg("--host-cpu-topology");
+            command.arg("--virt-cpufreq");
+        } else if let Some(cpus) = get_num_cpus() {
             command.arg("--cpus").arg(cpus.to_string());
         } else {
             bail!("Could not determine the number of CPUs in the system");
@@ -894,8 +896,10 @@ fn run_vm(
         .arg("--socket")
         .arg(add_preserved_fd(&mut preserved_fds, &control_server_socket.as_raw_descriptor()));
 
-    if let Some(dtbo_vendor) = &config.dtbo_vendor {
-        command.arg("--device-tree-overlay").arg(add_preserved_fd(&mut preserved_fds, dtbo_vendor));
+    if let Some(reference_dt) = &config.reference_dt {
+        command
+            .arg("--device-tree-overlay")
+            .arg(add_preserved_fd(&mut preserved_fds, reference_dt));
     }
 
     append_platform_devices(&mut command, &mut preserved_fds, &config)?;
