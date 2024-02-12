@@ -42,7 +42,6 @@ cc_binary {
         "image.ld",
         ":vmbase_sections",
     ],
-    sdclang: false,
 }
 
 raw_binary {
