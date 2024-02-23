@@ -21,7 +21,7 @@ AVF components:
 * [vmbase](vmbase/README.md)
 
 AVF APIs:
-* [Java API](javalib/README.md)
+* [Java API](java/framework/README.md)
 * [VM Payload API](vm_payload/README.md)
 
 How-Tos:
@@ -29,3 +29,4 @@ How-Tos:
 * [Building and running a demo app in C++](demo_native/README.md)
 * [Debugging](docs/debug)
 * [Using custom VM](docs/custom_vm.md)
+* [Device assignment](docs/device_assignment.md)

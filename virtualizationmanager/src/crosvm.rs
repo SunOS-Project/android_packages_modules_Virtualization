@@ -107,7 +107,6 @@ pub struct CrosvmConfig {
     pub memory_mib: Option<NonZeroU32>,
     pub cpus: Option<NonZeroU32>,
     pub host_cpu_topology: bool,
-    pub task_profiles: Vec<String>,
     pub console_out_fd: Option<File>,
     pub console_in_fd: Option<File>,
     pub log_fd: Option<File>,
@@ -118,7 +117,7 @@ pub struct CrosvmConfig {
     pub gdb_port: Option<NonZeroU16>,
     pub vfio_devices: Vec<VfioDevice>,
     pub dtbo: Option<File>,
-    pub reference_dt: Option<File>,
+    pub device_tree_overlay: Option<File>,
 }
 
 /// A disk image to pass to crosvm for a VM.
@@ -450,20 +449,20 @@ impl VmInstance {
                 let mut vm_metric = self.vm_metric.lock().unwrap();
 
                 // Get CPU Information
-                if let Ok(guest_time) = get_guest_time(pid) {
-                    vm_metric.cpu_guest_time = Some(guest_time);
-                } else {
-                    error!("Failed to parse /proc/[pid]/stat");
+                match get_guest_time(pid) {
+                    Ok(guest_time) => vm_metric.cpu_guest_time = Some(guest_time),
+                    Err(e) => error!("Failed to get guest CPU time: {e:?}"),
                 }
 
                 // Get Memory Information
-                if let Ok(rss) = get_rss(pid) {
-                    vm_metric.rss = match &vm_metric.rss {
-                        Some(x) => Some(Rss::extract_max(x, &rss)),
-                        None => Some(rss),
+                match get_rss(pid) {
+                    Ok(rss) => {
+                        vm_metric.rss = match &vm_metric.rss {
+                            Some(x) => Some(Rss::extract_max(x, &rss)),
+                            None => Some(rss),
+                        }
                     }
-                } else {
-                    error!("Failed to parse /proc/[pid]/smaps");
+                    Err(e) => error!("Failed to get guest RSS: {}", e),
                 }
             }
 
@@ -812,16 +811,16 @@ fn run_vm(
     if config.host_cpu_topology {
         if cfg!(virt_cpufreq) {
             command.arg("--host-cpu-topology");
-            command.arg("--virt-cpufreq");
+            cfg_if::cfg_if! {
+                if #[cfg(any(target_arch = "aarch64"))] {
+                    command.arg("--virt-cpufreq");
+                }
+            }
         } else if let Some(cpus) = get_num_cpus() {
             command.arg("--cpus").arg(cpus.to_string());
         } else {
             bail!("Could not determine the number of CPUs in the system");
         }
-    }
-
-    if !config.task_profiles.is_empty() {
-        command.arg("--task-profiles").arg(config.task_profiles.join(","));
     }
 
     if let Some(gdb_port) = config.gdb_port {
@@ -896,10 +895,8 @@ fn run_vm(
         .arg("--socket")
         .arg(add_preserved_fd(&mut preserved_fds, &control_server_socket.as_raw_descriptor()));
 
-    if let Some(reference_dt) = &config.reference_dt {
-        command
-            .arg("--device-tree-overlay")
-            .arg(add_preserved_fd(&mut preserved_fds, reference_dt));
+    if let Some(dt_overlay) = &config.device_tree_overlay {
+        command.arg("--device-tree-overlay").arg(add_preserved_fd(&mut preserved_fds, dt_overlay));
     }
 
     append_platform_devices(&mut command, &mut preserved_fds, &config)?;
