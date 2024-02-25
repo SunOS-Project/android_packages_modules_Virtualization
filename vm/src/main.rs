@@ -45,10 +45,6 @@ pub struct CommonConfig {
     #[arg(long, default_value = "one_cpu", value_parser = parse_cpu_topology)]
     cpu_topology: CpuTopology,
 
-    /// Comma separated list of task profile names to apply to the VM
-    #[arg(long)]
-    task_profiles: Vec<String>,
-
     /// Memory size (in MiB) of the VM. If unspecified, defaults to the value of `memory_mib`
     /// in the VM config file.
     #[arg(short, long)]
@@ -232,6 +228,8 @@ pub struct RunCustomVmConfig {
 
 #[derive(Parser)]
 enum Opt {
+    /// Check if the feature is enabled on device.
+    CheckFeatureEnabled { feature: String },
     /// Run a virtual machine with a config in APK
     RunApp {
         #[command(flatten)]
@@ -304,6 +302,13 @@ fn get_service() -> Result<Strong<dyn IVirtualizationService>, Error> {
     virtmgr.connect().context("Failed to connect to VirtualizationService")
 }
 
+fn command_check_feature_enabled(feature: &str) {
+    println!(
+        "Feature {feature} is {}",
+        if avf_features::is_feature_enabled(feature) { "enabled" } else { "disabled" }
+    );
+}
+
 fn main() -> Result<(), Error> {
     env_logger::init();
     let opt = Opt::parse();
@@ -312,6 +317,10 @@ fn main() -> Result<(), Error> {
     ProcessState::start_thread_pool();
 
     match opt {
+        Opt::CheckFeatureEnabled { feature } => {
+            command_check_feature_enabled(&feature);
+            Ok(())
+        }
         Opt::RunApp { config } => command_run_app(config),
         Opt::RunMicrodroid { config } => command_run_microdroid(config),
         Opt::Run { config } => command_run(config),

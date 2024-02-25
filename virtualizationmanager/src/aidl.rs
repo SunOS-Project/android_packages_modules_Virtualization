@@ -19,9 +19,9 @@ use crate::atom::{write_vm_booted_stats, write_vm_creation_stats};
 use crate::composite::make_composite_image;
 use crate::crosvm::{CrosvmConfig, DiskFile, PayloadState, VmContext, VmInstance, VmState};
 use crate::debug_config::DebugConfig;
+use crate::dt_overlay::{create_device_tree_overlay, VM_DT_OVERLAY_MAX_SIZE, VM_DT_OVERLAY_PATH};
 use crate::payload::{add_microdroid_payload_images, add_microdroid_system_images, add_microdroid_vendor_image};
 use crate::selinux::{getfilecon, SeContext};
-use crate::reference_dt;
 use android_os_permissions_aidl::aidl::android::os::IPermissionController;
 use android_system_virtualizationcommon::aidl::android::system::virtualizationcommon::{
     Certificate::Certificate,
@@ -35,10 +35,6 @@ use android_system_virtualizationservice::aidl::android::system::virtualizations
     IVirtualMachine::{BnVirtualMachine, IVirtualMachine},
     IVirtualMachineCallback::IVirtualMachineCallback,
     IVirtualizationService::IVirtualizationService,
-    IVirtualizationService::FEATURE_MULTI_TENANT,
-    IVirtualizationService::FEATURE_VENDOR_MODULES,
-    IVirtualizationService::FEATURE_DICE_CHANGES,
-    IVirtualizationService::FEATURE_REMOTE_ATTESTATION,
     MemoryTrimLevel::MemoryTrimLevel,
     Partition::Partition,
     PartitionType::PartitionType,
@@ -69,6 +65,7 @@ use binder::{
     Status, StatusCode, Strong,
     IntoBinderResult,
 };
+use cstr::cstr;
 use disk::QcowFile;
 use glob::glob;
 use lazy_static::lazy_static;
@@ -80,6 +77,7 @@ use rustutils::system_properties;
 use semver::VersionReq;
 use std::collections::HashSet;
 use std::convert::TryInto;
+use std::fs;
 use std::ffi::CStr;
 use std::fs::{canonicalize, read_dir, remove_file, File, OpenOptions};
 use std::io::{BufRead, BufReader, Error, ErrorKind, Seek, SeekFrom, Write};
@@ -89,6 +87,7 @@ use std::os::unix::io::{FromRawFd, IntoRawFd};
 use std::os::unix::raw::pid_t;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
+use vbmeta::VbMetaImage;
 use vmconfig::VmConfig;
 use vsock::VsockStream;
 use zip::ZipArchive;
@@ -118,6 +117,8 @@ const UNFORMATTED_STORAGE_MAGIC: &str = "UNFORMATTED-STORAGE";
 
 /// crosvm requires all partitions to be a multiple of 4KiB.
 const PARTITION_GRANULARITY_BYTES: u64 = 4096;
+
+const VM_REFERENCE_DT_ON_HOST_PATH: &str = "/proc/device-tree/avf/reference";
 
 lazy_static! {
     pub static ref GLOBAL_SERVICE: Strong<dyn IVirtualizationServiceInternal> =
@@ -302,19 +303,7 @@ impl IVirtualizationService for VirtualizationService {
     /// Returns whether given feature is enabled
     fn isFeatureEnabled(&self, feature: &str) -> binder::Result<bool> {
         check_manage_access()?;
-
-        // This approach is quite cumbersome, but will do the work for the short term.
-        // TODO(b/298012279): make this scalable.
-        match feature {
-            FEATURE_DICE_CHANGES => Ok(cfg!(dice_changes)),
-            FEATURE_MULTI_TENANT => Ok(cfg!(multi_tenant)),
-            FEATURE_REMOTE_ATTESTATION => Ok(cfg!(remote_attestation)),
-            FEATURE_VENDOR_MODULES => Ok(cfg!(vendor_modules)),
-            _ => {
-                warn!("unknown feature {feature}");
-                Ok(false)
-            }
-        }
+        Ok(avf_features::is_feature_enabled(feature))
     }
 
     fn enableTestAttestation(&self) -> binder::Result<()> {
@@ -382,12 +371,59 @@ impl VirtualizationService {
             check_gdb_allowed(config)?;
         }
 
-        let reference_dt = reference_dt::parse_reference_dt(&temporary_directory)
-            .context("Failed to create VM reference DT")
+        // Currently, VirtMgr adds the host copy of reference DT & an untrusted prop (instance-id)
+        let host_ref_dt = Path::new(VM_REFERENCE_DT_ON_HOST_PATH);
+        let host_ref_dt = if host_ref_dt.exists()
+            && read_dir(host_ref_dt).or_service_specific_exception(-1)?.next().is_some()
+        {
+            Some(host_ref_dt)
+        } else {
+            warn!("VM reference DT doesn't exist in host DT");
+            None
+        };
+
+        let vendor_hashtree_digest = extract_vendor_hashtree_digest(config)
+            .context("Failed to extract vendor hashtree digest")
             .or_service_specific_exception(-1)?;
-        if reference_dt.is_none() {
-            warn!("VM reference DT doesn't exist");
-        }
+
+        let trusted_props = if let Some(ref vendor_hashtree_digest) = vendor_hashtree_digest {
+            info!(
+                "Passing vendor hashtree digest to pvmfw. This will be rejected if it doesn't \
+                match the trusted digest in the pvmfw config, causing the VM to fail to start."
+            );
+            vec![(
+                cstr!("vendor_hashtree_descriptor_root_digest"),
+                vendor_hashtree_digest.as_slice(),
+            )]
+        } else {
+            vec![]
+        };
+
+        let untrusted_props = if cfg!(llpvm_changes) {
+            // TODO(b/291213394): Replace this with a per-VM instance Id.
+            let instance_id = b"sixtyfourbyteslonghardcoded_indeed_sixtyfourbyteslonghardcoded_h";
+            vec![(cstr!("instance-id"), &instance_id[..])]
+        } else {
+            vec![]
+        };
+
+        let device_tree_overlay =
+            if host_ref_dt.is_some() || !untrusted_props.is_empty() || !trusted_props.is_empty() {
+                let dt_output = temporary_directory.join(VM_DT_OVERLAY_PATH);
+                let mut data = [0_u8; VM_DT_OVERLAY_MAX_SIZE];
+                let fdt = create_device_tree_overlay(
+                    &mut data,
+                    host_ref_dt,
+                    &untrusted_props,
+                    &trusted_props,
+                )
+                .map_err(|e| anyhow!("Failed to create DT overlay, {e:?}"))
+                .or_service_specific_exception(-1)?;
+                fs::write(&dt_output, fdt.as_slice()).or_service_specific_exception(-1)?;
+                Some(File::open(dt_output).or_service_specific_exception(-1)?)
+            } else {
+                None
+            };
 
         let debug_level = match config {
             VirtualMachineConfig::AppConfig(config) => config.debugLevel,
@@ -526,7 +562,6 @@ impl VirtualizationService {
             memory_mib: config.memoryMib.try_into().ok().and_then(NonZeroU32::new),
             cpus,
             host_cpu_topology,
-            task_profiles: config.taskProfiles.clone(),
             console_out_fd,
             console_in_fd,
             log_fd,
@@ -537,7 +572,7 @@ impl VirtualizationService {
             gdb_port,
             vfio_devices,
             dtbo,
-            reference_dt,
+            device_tree_overlay,
         };
         let instance = Arc::new(
             VmInstance::new(
@@ -575,14 +610,44 @@ fn is_custom_config(config: &VirtualMachineConfig) -> bool {
             } else {
                 // Additional custom features not included in CustomConfig:
                 // - specifying a config file;
-                // - specifying extra APKs.
+                // - specifying extra APKs;
+                // - specifying an OS other than Microdroid.
                 match &config.payload {
                     Payload::ConfigPath(_) => true,
-                    Payload::PayloadConfig(payload_config) => !payload_config.extraApks.is_empty(),
+                    Payload::PayloadConfig(payload_config) => {
+                        !payload_config.extraApks.is_empty()
+                            || payload_config.osName != MICRODROID_OS_NAME
+                    }
                 }
             }
         }
     }
+}
+
+fn extract_vendor_hashtree_digest(config: &VirtualMachineConfig) -> Result<Option<Vec<u8>>> {
+    let VirtualMachineConfig::AppConfig(config) = config else {
+        return Ok(None);
+    };
+    let Some(custom_config) = &config.customConfig else {
+        return Ok(None);
+    };
+    let Some(file) = custom_config.vendorImage.as_ref() else {
+        return Ok(None);
+    };
+
+    let file = clone_file(file)?;
+    let size =
+        file.metadata().context("Failed to get metadata from microdroid vendor image")?.len();
+    let vbmeta = VbMetaImage::verify_reader_region(&file, 0, size)
+        .context("Failed to get vbmeta from microdroid-vendor.img")?;
+
+    for descriptor in vbmeta.descriptors()?.iter() {
+        if let vbmeta::Descriptor::Hashtree(_) = descriptor {
+            let root_digest = hex::encode(descriptor.to_hashtree()?.root_digest());
+            return Ok(Some(root_digest.as_bytes().to_vec()));
+        }
+    }
+    Err(anyhow!("No hashtree digest is extracted from microdroid vendor image"))
 }
 
 fn write_zero_filler(zero_filler_path: &Path) -> Result<()> {
@@ -754,7 +819,6 @@ fn load_app_config(
         if let Some(file) = custom_config.customKernelImage.as_ref() {
             vm_config.kernel = Some(ParcelFileDescriptor::new(clone_file(file)?))
         }
-        vm_config.taskProfiles = custom_config.taskProfiles.clone();
         vm_config.gdbPort = custom_config.gdbPort;
 
         if let Some(file) = custom_config.vendorImage.as_ref() {
