@@ -48,7 +48,7 @@ pub fn command_run_app(config: RunAppConfig) -> Result<(), Error> {
 
     let extra_apks = match config.config_path.as_deref() {
         Some(path) => parse_extra_apk_list(&config.apk, path)?,
-        None => vec![],
+        None => config.extra_apks().to_vec(),
     };
 
     if extra_apks.len() != config.extra_idsigs.len() {
@@ -101,13 +101,15 @@ pub fn command_run_app(config: RunAppConfig) -> Result<(), Error> {
     let vendor =
         config.microdroid.vendor().as_ref().map(|p| open_parcel_file(p, false)).transpose()?;
 
-    let extra_idsig_files: Result<Vec<File>, _> =
-        config.extra_idsigs.iter().map(File::open).collect();
+    let extra_idsig_files: Result<Vec<_>, _> = config.extra_idsigs.iter().map(File::open).collect();
     let extra_idsig_fds = extra_idsig_files?.into_iter().map(ParcelFileDescriptor::new).collect();
 
     let payload = if let Some(config_path) = config.config_path {
         if config.payload_binary_name.is_some() {
             bail!("Only one of --config-path or --payload-binary-name can be defined")
+        }
+        if config.microdroid.gki().is_some() {
+            bail!("--gki cannot be defined with --config-path. Use 'os' field in the config file")
         }
         Payload::ConfigPath(config_path)
     } else if let Some(payload_binary_name) = config.payload_binary_name {
@@ -116,9 +118,14 @@ pub fn command_run_app(config: RunAppConfig) -> Result<(), Error> {
         } else {
             "microdroid".to_owned()
         };
+
+        let extra_apk_files: Result<Vec<_>, _> = extra_apks.iter().map(File::open).collect();
+        let extra_apk_fds = extra_apk_files?.into_iter().map(ParcelFileDescriptor::new).collect();
+
         Payload::PayloadConfig(VirtualMachinePayloadConfig {
             payloadBinaryName: payload_binary_name,
             osName: os_name,
+            extraApks: extra_apk_fds,
         })
     } else {
         bail!("Either --config-path or --payload-binary-name must be defined")
@@ -129,7 +136,6 @@ pub fn command_run_app(config: RunAppConfig) -> Result<(), Error> {
     let custom_config = CustomConfig {
         customKernelImage: None,
         gdbPort: config.debug.gdb.map(u16::from).unwrap_or(0) as i32, // 0 means no gdb
-        taskProfiles: config.common.task_profiles,
         vendorImage: vendor,
         devices: config
             .microdroid
@@ -205,9 +211,8 @@ pub fn command_run_microdroid(config: RunMicrodroidConfig) -> Result<(), Error> 
         apk,
         idsig,
         instance: instance_img,
-        config_path: None,
         payload_binary_name: Some("MicrodroidEmptyPayloadJniLib.so".to_owned()),
-        extra_idsigs: [].to_vec(),
+        ..Default::default()
     };
     command_run_app(app_config)
 }
@@ -229,7 +234,6 @@ pub fn command_run(config: RunCustomVmConfig) -> Result<(), Error> {
         vm_config.gdbPort = gdb.get() as i32;
     }
     vm_config.cpuTopology = config.common.cpu_topology;
-    vm_config.taskProfiles = config.common.task_profiles;
     run(
         get_service()?.as_ref(),
         &VirtualMachineConfig::RawConfig(vm_config),
@@ -307,11 +311,11 @@ fn run(
     Ok(())
 }
 
-fn parse_extra_apk_list(apk: &Path, config_path: &str) -> Result<Vec<String>, Error> {
+fn parse_extra_apk_list(apk: &Path, config_path: &str) -> Result<Vec<PathBuf>, Error> {
     let mut archive = ZipArchive::new(File::open(apk)?)?;
     let config_file = archive.by_name(config_path)?;
     let config: VmPayloadConfig = serde_json::from_reader(config_file)?;
-    Ok(config.extra_apks.into_iter().map(|x| x.path).collect())
+    Ok(config.extra_apks.into_iter().map(|x| x.path.into()).collect())
 }
 
 struct Callback {}

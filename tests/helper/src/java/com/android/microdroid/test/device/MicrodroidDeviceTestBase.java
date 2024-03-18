@@ -21,6 +21,7 @@ import static com.google.common.truth.Truth.assertThat;
 import static com.google.common.truth.TruthJUnit.assume;
 
 import static org.junit.Assume.assumeTrue;
+import static org.junit.Assume.assumeFalse;
 
 import android.app.Instrumentation;
 import android.app.UiAutomation;
@@ -62,6 +63,7 @@ public abstract class MicrodroidDeviceTestBase {
     private static final String TAG = "MicrodroidDeviceTestBase";
     private final String MAX_PERFORMANCE_TASK_PROFILE = "CPUSET_SP_TOP_APP";
 
+    protected static final String KERNEL_VERSION = SystemProperties.get("ro.kernel.version");
     protected static final Set<String> SUPPORTED_GKI_VERSIONS =
             Collections.unmodifiableSet(new HashSet(Arrays.asList("android14-6.1")));
 
@@ -110,9 +112,9 @@ public abstract class MicrodroidDeviceTestBase {
         }
     }
 
-    private Context mCtx;
+    private final Context mCtx = ApplicationProvider.getApplicationContext();
     private boolean mProtectedVm;
-    private String mOs;
+    private String mGki;
 
     protected Context getContext() {
         return mCtx;
@@ -122,8 +124,17 @@ public abstract class MicrodroidDeviceTestBase {
         return mCtx.getSystemService(VirtualMachineManager.class);
     }
 
-    public VirtualMachineConfig.Builder newVmConfigBuilder() {
-        return new VirtualMachineConfig.Builder(mCtx).setProtectedVm(mProtectedVm).setOs(mOs);
+    public VirtualMachineConfig.Builder newVmConfigBuilderWithPayloadConfig(String configPath) {
+        return new VirtualMachineConfig.Builder(mCtx)
+                .setProtectedVm(mProtectedVm)
+                .setPayloadConfigPath(configPath);
+    }
+
+    public VirtualMachineConfig.Builder newVmConfigBuilderWithPayloadBinary(String binaryPath) {
+        return new VirtualMachineConfig.Builder(mCtx)
+                .setProtectedVm(mProtectedVm)
+                .setOs(os())
+                .setPayloadBinaryName(binaryPath);
     }
 
     protected final boolean isProtectedVm() {
@@ -131,7 +142,7 @@ public abstract class MicrodroidDeviceTestBase {
     }
 
     protected final String os() {
-        return mOs;
+        return mGki != null ? "microdroid_gki-" + mGki : "microdroid";
     }
 
     /**
@@ -141,21 +152,25 @@ public abstract class MicrodroidDeviceTestBase {
     public VirtualMachine forceCreateNewVirtualMachine(String name, VirtualMachineConfig config)
             throws VirtualMachineException {
         final VirtualMachineManager vmm = getVirtualMachineManager();
-        VirtualMachine existingVm = vmm.get(name);
-        if (existingVm != null) {
+        boolean deleteExisting;
+        try {
+            deleteExisting = vmm.get(name) != null;
+        } catch (VirtualMachineException e) {
+            // VM exists, i.e. there are some files for it, but they could not be successfully
+            // loaded.
+            deleteExisting = true;
+        }
+        if (deleteExisting) {
             vmm.delete(name);
         }
         return vmm.create(name, config);
     }
 
     public void prepareTestSetup(boolean protectedVm, String gki) {
-        mCtx = ApplicationProvider.getApplicationContext();
-        assume().withMessage("Device doesn't support AVF")
-                .that(mCtx.getPackageManager().hasSystemFeature(FEATURE_VIRTUALIZATION_FRAMEWORK))
-                .isTrue();
+        assumeFeatureVirtualizationFramework();
 
         mProtectedVm = protectedVm;
-        mOs = gki != null ? "microdroid_gki-" + gki : "microdroid";
+        mGki = gki;
 
         int capabilities = getVirtualMachineManager().getCapabilities();
         if (protectedVm) {
@@ -169,13 +184,25 @@ public abstract class MicrodroidDeviceTestBase {
         }
 
         try {
-            assume().withMessage("Skip where requested OS \"" + mOs + "\" isn't supported")
-                    .that(mOs)
+            assume().withMessage("Skip where requested OS \"" + os() + "\" isn't supported")
+                    .that(os())
                     .isIn(getVirtualMachineManager().getSupportedOSList());
         } catch (VirtualMachineException e) {
             Log.e(TAG, "Error getting supported OS list", e);
             throw new RuntimeException("Failed to get supported OS list.", e);
         }
+    }
+
+    protected void assumeFeatureVirtualizationFramework() {
+        assume().withMessage("Device doesn't support AVF")
+                .that(mCtx.getPackageManager().hasSystemFeature(FEATURE_VIRTUALIZATION_FRAMEWORK))
+                .isTrue();
+    }
+
+    protected void assumeSupportedDevice() {
+        assume().withMessage("Skip on 5.4 kernel. b/218303240")
+                .that(KERNEL_VERSION)
+                .isNotEqualTo("5.4");
     }
 
     public abstract static class VmEventListener implements VirtualMachineCallback {
@@ -584,5 +611,9 @@ public abstract class MicrodroidDeviceTestBase {
 
     protected void assumeProtectedVM() {
         assumeTrue("Skip on non-protected VM", mProtectedVm);
+    }
+
+    protected void assumeNonProtectedVM() {
+        assumeFalse("Skip on protected VM", mProtectedVm);
     }
 }

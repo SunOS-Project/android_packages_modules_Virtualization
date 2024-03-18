@@ -15,11 +15,11 @@
 //! Implementation of the AIDL interface of the VirtualizationService.
 
 use crate::{get_calling_pid, get_calling_uid};
-use crate::atom::{
-    write_vm_booted_stats, write_vm_creation_stats};
+use crate::atom::{write_vm_booted_stats, write_vm_creation_stats};
 use crate::composite::make_composite_image;
 use crate::crosvm::{CrosvmConfig, DiskFile, PayloadState, VmContext, VmInstance, VmState};
 use crate::debug_config::DebugConfig;
+use crate::dt_overlay::{create_device_tree_overlay, VM_DT_OVERLAY_MAX_SIZE, VM_DT_OVERLAY_PATH};
 use crate::payload::{add_microdroid_payload_images, add_microdroid_system_images, add_microdroid_vendor_image};
 use crate::selinux::{getfilecon, SeContext};
 use android_os_permissions_aidl::aidl::android::os::IPermissionController;
@@ -35,9 +35,6 @@ use android_system_virtualizationservice::aidl::android::system::virtualizations
     IVirtualMachine::{BnVirtualMachine, IVirtualMachine},
     IVirtualMachineCallback::IVirtualMachineCallback,
     IVirtualizationService::IVirtualizationService,
-    IVirtualizationService::FEATURE_MULTI_TENANT,
-    IVirtualizationService::FEATURE_VENDOR_MODULES,
-    IVirtualizationService::FEATURE_DICE_CHANGES,
     MemoryTrimLevel::MemoryTrimLevel,
     Partition::Partition,
     PartitionType::PartitionType,
@@ -68,21 +65,22 @@ use binder::{
     Status, StatusCode, Strong,
     IntoBinderResult,
 };
+use cstr::cstr;
 use disk::QcowFile;
 use glob::glob;
 use lazy_static::lazy_static;
-use libfdt::Fdt;
 use log::{debug, error, info, warn};
-use microdroid_payload_config::{OsConfig, Task, TaskType, VmPayloadConfig};
+use microdroid_payload_config::{ApkConfig, OsConfig, Task, TaskType, VmPayloadConfig};
 use nix::unistd::pipe;
 use rpcbinder::RpcServer;
 use rustutils::system_properties;
 use semver::VersionReq;
 use std::collections::HashSet;
 use std::convert::TryInto;
-use std::ffi::{CStr, CString};
+use std::fs;
+use std::ffi::CStr;
 use std::fs::{canonicalize, read_dir, remove_file, File, OpenOptions};
-use std::io::{BufRead, BufReader, Error, ErrorKind, Write};
+use std::io::{BufRead, BufReader, Error, ErrorKind, Seek, SeekFrom, Write};
 use std::iter;
 use std::num::{NonZeroU16, NonZeroU32};
 use std::os::unix::io::{FromRawFd, IntoRawFd};
@@ -117,11 +115,10 @@ const SECRETKEEPER_IDENTIFIER: &str =
 
 const UNFORMATTED_STORAGE_MAGIC: &str = "UNFORMATTED-STORAGE";
 
-/// Rough size for storing root digest of vendor hash descriptor into DTBO.
-const EMPTY_VENDOR_DT_OVERLAY_BUF_SIZE: usize = 10000;
-
 /// crosvm requires all partitions to be a multiple of 4KiB.
 const PARTITION_GRANULARITY_BYTES: u64 = 4096;
+
+const VM_REFERENCE_DT_ON_HOST_PATH: &str = "/proc/device-tree/avf/reference";
 
 lazy_static! {
     pub static ref GLOBAL_SERVICE: Strong<dyn IVirtualizationServiceInternal> =
@@ -159,6 +156,9 @@ fn create_or_update_idsig_file(
         // We will anyway overwrite the file to the v4signature generated from input_fd.
     }
 
+    output
+        .seek(SeekFrom::Start(0))
+        .context("failed to move cursor to start on the idsig output")?;
     output.set_len(0).context("failed to set_len on the idsig output")?;
     sig.write_into(&mut output).context("failed to write idsig")?;
     Ok(())
@@ -243,9 +243,14 @@ impl IVirtualizationService for VirtualizationService {
             .with_context(|| format!("Invalid size: {}", size_bytes))
             .or_binder_exception(ExceptionCode::ILLEGAL_ARGUMENT)?;
         let size_bytes = round_up(size_bytes, PARTITION_GRANULARITY_BYTES);
-        let image = clone_file(image_fd)?;
+        let mut image = clone_file(image_fd)?;
         // initialize the file. Any data in the file will be erased.
+        image
+            .seek(SeekFrom::Start(0))
+            .context("failed to move cursor to start")
+            .or_service_specific_exception(-1)?;
         image.set_len(0).context("Failed to reset a file").or_service_specific_exception(-1)?;
+
         let mut part = QcowFile::new(image, size_bytes)
             .context("Failed to create QCOW2 image")
             .or_service_specific_exception(-1)?;
@@ -298,18 +303,11 @@ impl IVirtualizationService for VirtualizationService {
     /// Returns whether given feature is enabled
     fn isFeatureEnabled(&self, feature: &str) -> binder::Result<bool> {
         check_manage_access()?;
+        Ok(avf_features::is_feature_enabled(feature))
+    }
 
-        // This approach is quite cumbersome, but will do the work for the short term.
-        // TODO(b/298012279): make this scalable.
-        match feature {
-            FEATURE_DICE_CHANGES => Ok(cfg!(dice_changes)),
-            FEATURE_MULTI_TENANT => Ok(cfg!(multi_tenant)),
-            FEATURE_VENDOR_MODULES => Ok(cfg!(vendor_modules)),
-            _ => {
-                warn!("unknown feature {feature}");
-                Ok(false)
-            }
-        }
+    fn enableTestAttestation(&self) -> binder::Result<()> {
+        GLOBAL_SERVICE.enableTestAttestation()
     }
 }
 
@@ -362,21 +360,7 @@ impl VirtualizationService {
         // Allocating VM context checks the MANAGE_VIRTUAL_MACHINE permission.
         let (vm_context, cid, temporary_directory) = self.create_vm_context(requester_debug_pid)?;
 
-        let is_custom = match config {
-            VirtualMachineConfig::RawConfig(_) => true,
-            VirtualMachineConfig::AppConfig(config) => {
-                // Some features are reserved for platform apps only, even when using
-                // VirtualMachineAppConfig. Almost all of these features are grouped in the
-                // CustomConfig struct:
-                // - controlling CPUs;
-                // - specifying a config file in the APK; (this one is not part of CustomConfig)
-                // - gdbPort is set, meaning that crosvm will start a gdb server;
-                // - using anything other than the default kernel;
-                // - specifying devices to be assigned.
-                config.customConfig.is_some() || matches!(config.payload, Payload::ConfigPath(_))
-            }
-        };
-        if is_custom {
+        if is_custom_config(config) {
             check_use_custom_virtual_machine()?;
         }
 
@@ -387,25 +371,59 @@ impl VirtualizationService {
             check_gdb_allowed(config)?;
         }
 
-        let vendor_hashtree_descriptor_root_digest =
-            extract_vendor_hashtree_descriptor_root_digest(config)
-                .context("Failed to extract root digest of vendor")
-                .or_service_specific_exception(-1)?;
-        let dtbo_vendor = if let Some(vendor_hashtree_descriptor_root_digest) =
-            vendor_hashtree_descriptor_root_digest
+        // Currently, VirtMgr adds the host copy of reference DT & an untrusted prop (instance-id)
+        let host_ref_dt = Path::new(VM_REFERENCE_DT_ON_HOST_PATH);
+        let host_ref_dt = if host_ref_dt.exists()
+            && read_dir(host_ref_dt).or_service_specific_exception(-1)?.next().is_some()
         {
-            let root_digest_hex = hex::encode(vendor_hashtree_descriptor_root_digest);
-            let dtbo_for_vendor_image = temporary_directory.join("dtbo_vendor");
-            create_dtbo_for_vendor_image(root_digest_hex.as_bytes(), &dtbo_for_vendor_image)
-                .context("Failed to write root digest of vendor")
-                .or_service_specific_exception(-1)?;
-            let file = File::open(dtbo_for_vendor_image)
-                .context("Failed to open dtbo_vendor")
-                .or_service_specific_exception(-1)?;
-            Some(file)
+            Some(host_ref_dt)
         } else {
+            warn!("VM reference DT doesn't exist in host DT");
             None
         };
+
+        let vendor_hashtree_digest = extract_vendor_hashtree_digest(config)
+            .context("Failed to extract vendor hashtree digest")
+            .or_service_specific_exception(-1)?;
+
+        let trusted_props = if let Some(ref vendor_hashtree_digest) = vendor_hashtree_digest {
+            info!(
+                "Passing vendor hashtree digest to pvmfw. This will be rejected if it doesn't \
+                match the trusted digest in the pvmfw config, causing the VM to fail to start."
+            );
+            vec![(
+                cstr!("vendor_hashtree_descriptor_root_digest"),
+                vendor_hashtree_digest.as_slice(),
+            )]
+        } else {
+            vec![]
+        };
+
+        let untrusted_props = if cfg!(llpvm_changes) {
+            // TODO(b/291213394): Replace this with a per-VM instance Id.
+            let instance_id = b"sixtyfourbyteslonghardcoded_indeed_sixtyfourbyteslonghardcoded_h";
+            vec![(cstr!("instance-id"), &instance_id[..])]
+        } else {
+            vec![]
+        };
+
+        let device_tree_overlay =
+            if host_ref_dt.is_some() || !untrusted_props.is_empty() || !trusted_props.is_empty() {
+                let dt_output = temporary_directory.join(VM_DT_OVERLAY_PATH);
+                let mut data = [0_u8; VM_DT_OVERLAY_MAX_SIZE];
+                let fdt = create_device_tree_overlay(
+                    &mut data,
+                    host_ref_dt,
+                    &untrusted_props,
+                    &trusted_props,
+                )
+                .map_err(|e| anyhow!("Failed to create DT overlay, {e:?}"))
+                .or_service_specific_exception(-1)?;
+                fs::write(&dt_output, fdt.as_slice()).or_service_specific_exception(-1)?;
+                Some(File::open(dt_output).or_service_specific_exception(-1)?)
+            } else {
+                None
+            };
 
         let debug_level = match config {
             VirtualMachineConfig::AppConfig(config) => config.debugLevel,
@@ -522,7 +540,7 @@ impl VirtualizationService {
                     .getDtboFile()?
                     .as_ref()
                     .try_clone()
-                    .context("Failed to create File from ParcelFileDescriptor")
+                    .context("Failed to create VM DTBO from ParcelFileDescriptor")
                     .or_binder_exception(ExceptionCode::BAD_PARCELABLE)?,
             );
             (devices, Some(dtbo_file))
@@ -544,7 +562,6 @@ impl VirtualizationService {
             memory_mib: config.memoryMib.try_into().ok().and_then(NonZeroU32::new),
             cpus,
             host_cpu_topology,
-            task_profiles: config.taskProfiles.clone(),
             console_out_fd,
             console_in_fd,
             log_fd,
@@ -555,7 +572,7 @@ impl VirtualizationService {
             gdb_port,
             vfio_devices,
             dtbo,
-            dtbo_vendor,
+            device_tree_overlay,
         };
         let instance = Arc::new(
             VmInstance::new(
@@ -574,9 +591,40 @@ impl VirtualizationService {
     }
 }
 
-fn extract_vendor_hashtree_descriptor_root_digest(
-    config: &VirtualMachineConfig,
-) -> Result<Option<Vec<u8>>> {
+/// Returns whether a VM config represents a "custom" virtual machine, which requires the
+/// USE_CUSTOM_VIRTUAL_MACHINE.
+fn is_custom_config(config: &VirtualMachineConfig) -> bool {
+    match config {
+        // Any raw (non-Microdroid) VM is considered custom.
+        VirtualMachineConfig::RawConfig(_) => true,
+        VirtualMachineConfig::AppConfig(config) => {
+            // Some features are reserved for platform apps only, even when using
+            // VirtualMachineAppConfig. Almost all of these features are grouped in the
+            // CustomConfig struct:
+            // - controlling CPUs;
+            // - gdbPort is set, meaning that crosvm will start a gdb server;
+            // - using anything other than the default kernel;
+            // - specifying devices to be assigned.
+            if config.customConfig.is_some() {
+                true
+            } else {
+                // Additional custom features not included in CustomConfig:
+                // - specifying a config file;
+                // - specifying extra APKs;
+                // - specifying an OS other than Microdroid.
+                match &config.payload {
+                    Payload::ConfigPath(_) => true,
+                    Payload::PayloadConfig(payload_config) => {
+                        !payload_config.extraApks.is_empty()
+                            || payload_config.osName != MICRODROID_OS_NAME
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn extract_vendor_hashtree_digest(config: &VirtualMachineConfig) -> Result<Option<Vec<u8>>> {
     let VirtualMachineConfig::AppConfig(config) = config else {
         return Ok(None);
     };
@@ -588,64 +636,18 @@ fn extract_vendor_hashtree_descriptor_root_digest(
     };
 
     let file = clone_file(file)?;
-    let size = file.metadata().context("Failed to get metadata from microdroid-vendor.img")?.len();
+    let size =
+        file.metadata().context("Failed to get metadata from microdroid vendor image")?.len();
     let vbmeta = VbMetaImage::verify_reader_region(&file, 0, size)
         .context("Failed to get vbmeta from microdroid-vendor.img")?;
 
     for descriptor in vbmeta.descriptors()?.iter() {
         if let vbmeta::Descriptor::Hashtree(_) = descriptor {
-            return Ok(Some(descriptor.to_hashtree()?.root_digest().to_vec()));
+            let root_digest = hex::encode(descriptor.to_hashtree()?.root_digest());
+            return Ok(Some(root_digest.as_bytes().to_vec()));
         }
     }
-    Err(anyhow!("No root digest is extracted from microdroid-vendor.img"))
-}
-
-fn create_dtbo_for_vendor_image(
-    vendor_hashtree_descriptor_root_digest: &[u8],
-    dtbo: &PathBuf,
-) -> Result<()> {
-    if dtbo.exists() {
-        return Err(anyhow!("DTBO file already exists"));
-    }
-
-    let mut buf = vec![0; EMPTY_VENDOR_DT_OVERLAY_BUF_SIZE];
-    let fdt = Fdt::create_empty_tree(buf.as_mut_slice())
-        .map_err(|e| anyhow!("Failed to create FDT: {:?}", e))?;
-    let mut root = fdt.root_mut().map_err(|e| anyhow!("Failed to get root node: {:?}", e))?;
-
-    let fragment_node_name = CString::new("fragment@0")?;
-    let mut fragment_node = root
-        .add_subnode(fragment_node_name.as_c_str())
-        .map_err(|e| anyhow!("Failed to create fragment node: {:?}", e))?;
-    let target_path_prop_name = CString::new("target-path")?;
-    let target_path = CString::new("/")?;
-    fragment_node
-        .setprop(target_path_prop_name.as_c_str(), target_path.to_bytes_with_nul())
-        .map_err(|e| anyhow!("Failed to set target-path: {:?}", e))?;
-    let overlay_node_name = CString::new("__overlay__")?;
-    let mut overlay_node = fragment_node
-        .add_subnode(overlay_node_name.as_c_str())
-        .map_err(|e| anyhow!("Failed to create overlay node: {:?}", e))?;
-
-    let avf_node_name = CString::new("avf")?;
-    let mut avf_node = overlay_node
-        .add_subnode(avf_node_name.as_c_str())
-        .map_err(|e| anyhow!("Failed to create avf node: {:?}", e))?;
-    let vendor_hashtree_descriptor_root_digest_name =
-        CString::new("vendor_hashtree_descriptor_root_digest")?;
-    avf_node
-        .setprop(
-            vendor_hashtree_descriptor_root_digest_name.as_c_str(),
-            vendor_hashtree_descriptor_root_digest,
-        )
-        .map_err(|e| {
-            anyhow!("Failed to set avf/vendor_hashtree_descriptor_root_digest: {:?}", e)
-        })?;
-
-    fdt.pack().map_err(|e| anyhow!("Failed to pack fdt: {:?}", e))?;
-    let mut file = File::create(dtbo)?;
-    file.write_all(fdt.as_slice())?;
-    Ok(file.flush()?)
+    Err(anyhow!("No hashtree digest is extracted from microdroid vendor image"))
 }
 
 fn write_zero_filler(zero_filler_path: &Path) -> Result<()> {
@@ -777,12 +779,28 @@ fn load_app_config(
         None
     };
 
-    let vm_payload_config = match &config.payload {
+    let vm_payload_config;
+    let extra_apk_files: Vec<_>;
+    match &config.payload {
         Payload::ConfigPath(config_path) => {
-            load_vm_payload_config_from_file(&apk_file, config_path.as_str())
-                .with_context(|| format!("Couldn't read config from {}", config_path))?
+            vm_payload_config =
+                load_vm_payload_config_from_file(&apk_file, config_path.as_str())
+                    .with_context(|| format!("Couldn't read config from {}", config_path))?;
+            extra_apk_files = vm_payload_config
+                .extra_apks
+                .iter()
+                .enumerate()
+                .map(|(i, apk)| {
+                    File::open(PathBuf::from(&apk.path))
+                        .with_context(|| format!("Failed to open extra apk #{i} {}", apk.path))
+                })
+                .collect::<Result<_>>()?;
         }
-        Payload::PayloadConfig(payload_config) => create_vm_payload_config(payload_config)?,
+        Payload::PayloadConfig(payload_config) => {
+            vm_payload_config = create_vm_payload_config(payload_config)?;
+            extra_apk_files =
+                payload_config.extraApks.iter().map(clone_file).collect::<binder::Result<_>>()?;
+        }
     };
 
     // For now, the only supported OS is Microdroid and Microdroid GKI
@@ -801,7 +819,6 @@ fn load_app_config(
         if let Some(file) = custom_config.customKernelImage.as_ref() {
             vm_config.kernel = Some(ParcelFileDescriptor::new(clone_file(file)?))
         }
-        vm_config.taskProfiles = custom_config.taskProfiles.clone();
         vm_config.gdbPort = custom_config.gdbPort;
 
         if let Some(file) = custom_config.vendorImage.as_ref() {
@@ -830,6 +847,7 @@ fn load_app_config(
         temporary_directory,
         apk_file,
         idsig_file,
+        extra_apk_files,
         &vm_payload_config,
         &mut vm_config,
     )?;
@@ -857,11 +875,17 @@ fn create_vm_payload_config(
 
     let task = Task { type_: TaskType::MicrodroidLauncher, command: payload_binary_name.clone() };
     let name = payload_config.osName.clone();
+
+    // The VM only cares about how many there are, these names are actually ignored.
+    let extra_apk_count = payload_config.extraApks.len();
+    let extra_apks =
+        (0..extra_apk_count).map(|i| ApkConfig { path: format!("extra-apk-{i}") }).collect();
+
     Ok(VmPayloadConfig {
         os: OsConfig { name },
         task: Some(task),
         apexes: vec![],
-        extra_apks: vec![],
+        extra_apks,
         prefer_staged: false,
         export_tombstones: None,
         enable_authfs: false,
@@ -1276,12 +1300,25 @@ fn check_no_devices(config: &VirtualMachineConfig) -> binder::Result<()> {
     Ok(())
 }
 
+fn check_no_extra_apks(config: &VirtualMachineConfig) -> binder::Result<()> {
+    let VirtualMachineConfig::AppConfig(config) = config else { return Ok(()) };
+    let Payload::PayloadConfig(payload_config) = &config.payload else { return Ok(()) };
+    if !payload_config.extraApks.is_empty() {
+        return Err(anyhow!("multi-tenant feature is disabled"))
+            .or_binder_exception(ExceptionCode::UNSUPPORTED_OPERATION);
+    }
+    Ok(())
+}
+
 fn check_config_features(config: &VirtualMachineConfig) -> binder::Result<()> {
     if !cfg!(vendor_modules) {
         check_no_vendor_modules(config)?;
     }
     if !cfg!(device_assignment) {
         check_no_devices(config)?;
+    }
+    if !cfg!(multi_tenant) {
+        check_no_extra_apks(config)?;
     }
     Ok(())
 }
@@ -1424,8 +1461,8 @@ impl IVirtualMachineService for VirtualMachineService {
         Ok(sk.map(|s| BnSecretkeeper::new_binder(SecretkeeperProxy(s), BinderFeatures::default())))
     }
 
-    fn requestAttestation(&self, csr: &[u8]) -> binder::Result<Vec<Certificate>> {
-        GLOBAL_SERVICE.requestAttestation(csr, get_calling_uid() as i32)
+    fn requestAttestation(&self, csr: &[u8], test_mode: bool) -> binder::Result<Vec<Certificate>> {
+        GLOBAL_SERVICE.requestAttestation(csr, get_calling_uid() as i32, test_mode)
     }
 }
 
@@ -1440,6 +1477,70 @@ impl VirtualMachineService {
             VirtualMachineService { state, cid },
             BinderFeatures::default(),
         )
+    }
+}
+
+struct SecretkeeperProxy(Strong<dyn ISecretkeeper>);
+
+impl Interface for SecretkeeperProxy {}
+
+impl ISecretkeeper for SecretkeeperProxy {
+    fn processSecretManagementRequest(&self, req: &[u8]) -> binder::Result<Vec<u8>> {
+        // Pass the request to the channel, and read the response.
+        self.0.processSecretManagementRequest(req)
+    }
+
+    fn getAuthGraphKe(&self) -> binder::Result<Strong<dyn IAuthGraphKeyExchange>> {
+        let ag = AuthGraphKeyExchangeProxy(self.0.getAuthGraphKe()?);
+        Ok(BnAuthGraphKeyExchange::new_binder(ag, BinderFeatures::default()))
+    }
+
+    fn deleteIds(&self, ids: &[SecretId]) -> binder::Result<()> {
+        self.0.deleteIds(ids)
+    }
+
+    fn deleteAll(&self) -> binder::Result<()> {
+        self.0.deleteAll()
+    }
+}
+
+struct AuthGraphKeyExchangeProxy(Strong<dyn IAuthGraphKeyExchange>);
+
+impl Interface for AuthGraphKeyExchangeProxy {}
+
+impl IAuthGraphKeyExchange for AuthGraphKeyExchangeProxy {
+    fn create(&self) -> binder::Result<SessionInitiationInfo> {
+        self.0.create()
+    }
+
+    fn init(
+        &self,
+        peer_pub_key: &PubKey,
+        peer_id: &Identity,
+        peer_nonce: &[u8],
+        peer_version: i32,
+    ) -> binder::Result<KeInitResult> {
+        self.0.init(peer_pub_key, peer_id, peer_nonce, peer_version)
+    }
+
+    fn finish(
+        &self,
+        peer_pub_key: &PubKey,
+        peer_id: &Identity,
+        peer_signature: &SessionIdSignature,
+        peer_nonce: &[u8],
+        peer_version: i32,
+        own_key: &Key,
+    ) -> binder::Result<SessionInfo> {
+        self.0.finish(peer_pub_key, peer_id, peer_signature, peer_nonce, peer_version, own_key)
+    }
+
+    fn authenticationComplete(
+        &self,
+        peer_signature: &SessionIdSignature,
+        shared_keys: &[AuthgraphArc; 2],
+    ) -> binder::Result<[AuthgraphArc; 2]> {
+        self.0.authenticationComplete(peer_signature, shared_keys)
     }
 }
 
@@ -1545,6 +1646,40 @@ mod tests {
     }
 
     #[test]
+    fn test_create_or_update_idsig_on_non_empty_file() -> Result<()> {
+        use std::io::Read;
+
+        // Pick any APK
+        let mut apk = File::open("/system/priv-app/Shell/Shell.apk").unwrap();
+        let idsig_empty = tempfile::tempfile().unwrap();
+        let mut idsig_invalid = tempfile::tempfile().unwrap();
+        idsig_invalid.write_all(b"Oops")?;
+
+        // Create new idsig
+        create_or_update_idsig_file(
+            &ParcelFileDescriptor::new(apk.try_clone()?),
+            &ParcelFileDescriptor::new(idsig_empty.try_clone()?),
+        )?;
+        apk.rewind()?;
+
+        // Update idsig_invalid
+        create_or_update_idsig_file(
+            &ParcelFileDescriptor::new(apk.try_clone()?),
+            &ParcelFileDescriptor::new(idsig_invalid.try_clone()?),
+        )?;
+
+        // Ensure the 2 idsig files have same size!
+        assert!(
+            idsig_empty.metadata()?.len() == idsig_invalid.metadata()?.len(),
+            "idsig files differ in size"
+        );
+        // Ensure the 2 idsig files have same content!
+        for (b1, b2) in idsig_empty.bytes().zip(idsig_invalid.bytes()) {
+            assert!(b1.unwrap() == b2.unwrap(), "idsig files differ")
+        }
+        Ok(())
+    }
+    #[test]
     fn test_append_kernel_param_first_param() {
         let mut vm_config = VirtualMachineRawConfig { ..Default::default() };
         append_kernel_param("foo=1", &mut vm_config);
@@ -1557,65 +1692,6 @@ mod tests {
             VirtualMachineRawConfig { params: Some("foo=5".to_owned()), ..Default::default() };
         append_kernel_param("bar=42", &mut vm_config);
         assert_eq!(vm_config.params, Some("foo=5 bar=42".to_owned()))
-    }
-
-    #[test]
-    fn test_create_dtbo_for_vendor_image() -> Result<()> {
-        let vendor_hashtree_descriptor_root_digest = String::from("foo");
-        let vendor_hashtree_descriptor_root_digest =
-            vendor_hashtree_descriptor_root_digest.as_bytes();
-
-        let tmp_dir = tempfile::TempDir::new()?;
-        let dtbo_path = tmp_dir.path().to_path_buf().join("bar");
-
-        create_dtbo_for_vendor_image(vendor_hashtree_descriptor_root_digest, &dtbo_path)?;
-
-        let data = std::fs::read(dtbo_path)?;
-        let fdt = Fdt::from_slice(&data).unwrap();
-
-        let fragment_node_path = CString::new("/fragment@0")?;
-        let fragment_node = fdt.node(fragment_node_path.as_c_str()).unwrap();
-        let Some(fragment_node) = fragment_node else {
-            bail!("fragment_node shouldn't be None.");
-        };
-        let target_path_prop_name = CString::new("target-path")?;
-        let target_path_from_dtbo =
-            fragment_node.getprop(target_path_prop_name.as_c_str()).unwrap();
-        let target_path_expected = CString::new("/")?;
-        assert_eq!(target_path_from_dtbo, Some(target_path_expected.to_bytes_with_nul()));
-
-        let avf_node_path = CString::new("/fragment@0/__overlay__/avf")?;
-        let avf_node = fdt.node(avf_node_path.as_c_str()).unwrap();
-        let Some(avf_node) = avf_node else {
-            bail!("avf_node shouldn't be None.");
-        };
-        let vendor_hashtree_descriptor_root_digest_name =
-            CString::new("vendor_hashtree_descriptor_root_digest")?;
-        let digest_from_dtbo =
-            avf_node.getprop(vendor_hashtree_descriptor_root_digest_name.as_c_str()).unwrap();
-        assert_eq!(digest_from_dtbo, Some(vendor_hashtree_descriptor_root_digest));
-
-        tmp_dir.close()?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_create_dtbo_for_vendor_image_throws_error_if_already_exists() -> Result<()> {
-        let vendor_hashtree_descriptor_root_digest = String::from("foo");
-        let vendor_hashtree_descriptor_root_digest =
-            vendor_hashtree_descriptor_root_digest.as_bytes();
-
-        let tmp_dir = tempfile::TempDir::new()?;
-        let dtbo_path = tmp_dir.path().to_path_buf().join("bar");
-
-        create_dtbo_for_vendor_image(vendor_hashtree_descriptor_root_digest, &dtbo_path)?;
-
-        let ret_second_trial =
-            create_dtbo_for_vendor_image(vendor_hashtree_descriptor_root_digest, &dtbo_path);
-        assert!(ret_second_trial.is_err(), "should fail");
-
-        tmp_dir.close()?;
-        Ok(())
     }
 
     fn test_extract_os_name_from_config_path(
@@ -1682,69 +1758,5 @@ mod tests {
             bail!("Expected {:?} but was {:?}", os_names, result);
         }
         Ok(())
-    }
-}
-
-struct SecretkeeperProxy(Strong<dyn ISecretkeeper>);
-
-impl Interface for SecretkeeperProxy {}
-
-impl ISecretkeeper for SecretkeeperProxy {
-    fn processSecretManagementRequest(&self, req: &[u8]) -> binder::Result<Vec<u8>> {
-        // Pass the request to the channel, and read the response.
-        self.0.processSecretManagementRequest(req)
-    }
-
-    fn getAuthGraphKe(&self) -> binder::Result<Strong<dyn IAuthGraphKeyExchange>> {
-        let ag = AuthGraphKeyExchangeProxy(self.0.getAuthGraphKe()?);
-        Ok(BnAuthGraphKeyExchange::new_binder(ag, BinderFeatures::default()))
-    }
-
-    fn deleteIds(&self, ids: &[SecretId]) -> binder::Result<()> {
-        self.0.deleteIds(ids)
-    }
-
-    fn deleteAll(&self) -> binder::Result<()> {
-        self.0.deleteAll()
-    }
-}
-
-struct AuthGraphKeyExchangeProxy(Strong<dyn IAuthGraphKeyExchange>);
-
-impl Interface for AuthGraphKeyExchangeProxy {}
-
-impl IAuthGraphKeyExchange for AuthGraphKeyExchangeProxy {
-    fn create(&self) -> binder::Result<SessionInitiationInfo> {
-        self.0.create()
-    }
-
-    fn init(
-        &self,
-        peer_pub_key: &PubKey,
-        peer_id: &Identity,
-        peer_nonce: &[u8],
-        peer_version: i32,
-    ) -> binder::Result<KeInitResult> {
-        self.0.init(peer_pub_key, peer_id, peer_nonce, peer_version)
-    }
-
-    fn finish(
-        &self,
-        peer_pub_key: &PubKey,
-        peer_id: &Identity,
-        peer_signature: &SessionIdSignature,
-        peer_nonce: &[u8],
-        peer_version: i32,
-        own_key: &Key,
-    ) -> binder::Result<SessionInfo> {
-        self.0.finish(peer_pub_key, peer_id, peer_signature, peer_nonce, peer_version, own_key)
-    }
-
-    fn authenticationComplete(
-        &self,
-        peer_signature: &SessionIdSignature,
-        shared_keys: &[AuthgraphArc; 2],
-    ) -> binder::Result<[AuthgraphArc; 2]> {
-        self.0.authenticationComplete(peer_signature, shared_keys)
     }
 }

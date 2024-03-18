@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug)]
 struct Idsigs(Vec<PathBuf>);
 
-#[derive(Args)]
+#[derive(Args, Default)]
 /// Collection of flags that are at VM level and therefore applicable to all subcommands
 pub struct CommonConfig {
     /// Name of VM
@@ -44,10 +44,6 @@ pub struct CommonConfig {
     /// Run VM with vCPU topology matching that of the host. If unspecified, defaults to 1 vCPU.
     #[arg(long, default_value = "one_cpu", value_parser = parse_cpu_topology)]
     cpu_topology: CpuTopology,
-
-    /// Comma separated list of task profile names to apply to the VM
-    #[arg(long)]
-    task_profiles: Vec<String>,
 
     /// Memory size (in MiB) of the VM. If unspecified, defaults to the value of `memory_mib`
     /// in the VM config file.
@@ -59,7 +55,7 @@ pub struct CommonConfig {
     protected: bool,
 }
 
-#[derive(Args)]
+#[derive(Args, Default)]
 /// Collection of flags for debugging
 pub struct DebugConfig {
     /// Debug level of the VM. Supported values: "full" (default), and "none".
@@ -84,7 +80,7 @@ pub struct DebugConfig {
     gdb: Option<NonZeroU16>,
 }
 
-#[derive(Args)]
+#[derive(Args, Default)]
 /// Collection of flags that are Microdroid specific
 pub struct MicrodroidConfig {
     /// Path to the file backing the storage.
@@ -145,7 +141,7 @@ impl MicrodroidConfig {
     }
 }
 
-#[derive(Args)]
+#[derive(Args, Default)]
 /// Flags for the run_app subcommand
 pub struct RunAppConfig {
     #[command(flatten)]
@@ -175,12 +171,30 @@ pub struct RunAppConfig {
     #[arg(alias = "payload_path")]
     payload_binary_name: Option<String>,
 
+    /// Paths to extra apk files.
+    #[cfg(multi_tenant)]
+    #[arg(long = "extra-apk")]
+    #[clap(conflicts_with = "config_path")]
+    extra_apks: Vec<PathBuf>,
+
     /// Paths to extra idsig files.
     #[arg(long = "extra-idsig")]
     extra_idsigs: Vec<PathBuf>,
 }
 
-#[derive(Args)]
+impl RunAppConfig {
+    #[cfg(multi_tenant)]
+    fn extra_apks(&self) -> &[PathBuf] {
+        &self.extra_apks
+    }
+
+    #[cfg(not(multi_tenant))]
+    fn extra_apks(&self) -> &[PathBuf] {
+        &[]
+    }
+}
+
+#[derive(Args, Default)]
 /// Flags for the run_microdroid subcommand
 pub struct RunMicrodroidConfig {
     #[command(flatten)]
@@ -199,7 +213,7 @@ pub struct RunMicrodroidConfig {
     work_dir: Option<PathBuf>,
 }
 
-#[derive(Args)]
+#[derive(Args, Default)]
 /// Flags for the run subcommand
 pub struct RunCustomVmConfig {
     #[command(flatten)]
@@ -214,6 +228,8 @@ pub struct RunCustomVmConfig {
 
 #[derive(Parser)]
 enum Opt {
+    /// Check if the feature is enabled on device.
+    CheckFeatureEnabled { feature: String },
     /// Run a virtual machine with a config in APK
     RunApp {
         #[command(flatten)]
@@ -286,6 +302,13 @@ fn get_service() -> Result<Strong<dyn IVirtualizationService>, Error> {
     virtmgr.connect().context("Failed to connect to VirtualizationService")
 }
 
+fn command_check_feature_enabled(feature: &str) {
+    println!(
+        "Feature {feature} is {}",
+        if avf_features::is_feature_enabled(feature) { "enabled" } else { "disabled" }
+    );
+}
+
 fn main() -> Result<(), Error> {
     env_logger::init();
     let opt = Opt::parse();
@@ -294,6 +317,10 @@ fn main() -> Result<(), Error> {
     ProcessState::start_thread_pool();
 
     match opt {
+        Opt::CheckFeatureEnabled { feature } => {
+            command_check_feature_enabled(&feature);
+            Ok(())
+        }
         Opt::RunApp { config } => command_run_app(config),
         Opt::RunMicrodroid { config } => command_run_microdroid(config),
         Opt::Run { config } => command_run(config),

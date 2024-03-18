@@ -23,6 +23,7 @@ rust_defaults {
     rustlibs: [
         "android.hardware.security.rkp-V3-rust",
         "android.system.virtualizationcommon-rust",
+        "android.system.virtualizationmaintenance-rust",
         "android.system.virtualizationservice-rust",
         "android.system.virtualizationservice_internal-rust",
         "android.system.virtualmachineservice-rust",
@@ -39,7 +40,6 @@ rust_defaults {
         "libopenssl",
         "librkpd_client",
         "librustutils",
-        "libvmclient",
         "libstatslog_virtualization_rust",
         "libtombstoned_client_rust",
         "libvsock",
