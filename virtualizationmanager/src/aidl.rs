@@ -49,7 +49,7 @@ use android_system_virtualizationservice_internal::aidl::android::system::virtua
 use android_system_virtualmachineservice::aidl::android::system::virtualmachineservice::IVirtualMachineService::{
         BnVirtualMachineService, IVirtualMachineService,
 };
-use android_hardware_security_secretkeeper::aidl::android::hardware::security::secretkeeper::ISecretkeeper::ISecretkeeper;
+use android_hardware_security_secretkeeper::aidl::android::hardware::security::secretkeeper::ISecretkeeper::{BnSecretkeeper, ISecretkeeper};
 use android_hardware_security_secretkeeper::aidl::android::hardware::security::secretkeeper::SecretId::SecretId;
 use android_hardware_security_authgraph::aidl::android::hardware::security::authgraph::{
     Arc::Arc as AuthgraphArc, IAuthGraphKeyExchange::IAuthGraphKeyExchange,
@@ -70,7 +70,7 @@ use disk::QcowFile;
 use glob::glob;
 use lazy_static::lazy_static;
 use log::{debug, error, info, warn};
-use microdroid_payload_config::{ApkConfig, OsConfig, Task, TaskType, VmPayloadConfig};
+use microdroid_payload_config::{ApkConfig, Task, TaskType, VmPayloadConfig};
 use nix::unistd::pipe;
 use rpcbinder::RpcServer;
 use rustutils::system_properties;
@@ -434,11 +434,7 @@ impl VirtualizationService {
                 None
             };
 
-        let debug_level = match config {
-            VirtualMachineConfig::AppConfig(config) => config.debugLevel,
-            _ => DebugLevel::NONE,
-        };
-        let debug_config = DebugConfig::new(debug_level);
+        let debug_config = DebugConfig::new(config);
 
         let ramdump = if debug_config.is_ramdump_needed() {
             Some(prepare_ramdump_file(&temporary_directory)?)
@@ -626,13 +622,10 @@ fn is_custom_config(config: &VirtualMachineConfig) -> bool {
                 // - specifying a config file;
                 // - specifying extra APKs;
                 // - specifying an OS other than Microdroid.
-                match &config.payload {
+                (match &config.payload {
                     Payload::ConfigPath(_) => true,
-                    Payload::PayloadConfig(payload_config) => {
-                        !payload_config.extraApks.is_empty()
-                            || payload_config.osName != MICRODROID_OS_NAME
-                    }
-                }
+                    Payload::PayloadConfig(payload_config) => !payload_config.extraApks.is_empty(),
+                }) || config.osName != MICRODROID_OS_NAME
             }
         }
     }
@@ -817,8 +810,13 @@ fn load_app_config(
         }
     };
 
+    let payload_config_os = vm_payload_config.os.name.as_str();
+    if !payload_config_os.is_empty() && payload_config_os != "microdroid" {
+        bail!("'os' in payload config is deprecated");
+    }
+
     // For now, the only supported OS is Microdroid and Microdroid GKI
-    let os_name = vm_payload_config.os.name.as_str();
+    let os_name = config.osName.as_str();
     if !is_valid_os(os_name) {
         bail!("Unknown OS \"{}\"", os_name);
     }
@@ -920,22 +918,13 @@ fn create_vm_payload_config(
     }
 
     let task = Task { type_: TaskType::MicrodroidLauncher, command: payload_binary_name.clone() };
-    let name = payload_config.osName.clone();
 
     // The VM only cares about how many there are, these names are actually ignored.
     let extra_apk_count = payload_config.extraApks.len();
     let extra_apks =
         (0..extra_apk_count).map(|i| ApkConfig { path: format!("extra-apk-{i}") }).collect();
 
-    Ok(VmPayloadConfig {
-        os: OsConfig { name },
-        task: Some(task),
-        apexes: vec![],
-        extra_apks,
-        prefer_staged: false,
-        export_tombstones: None,
-        enable_authfs: false,
-    })
+    Ok(VmPayloadConfig { task: Some(task), extra_apks, ..Default::default() })
 }
 
 /// Generates a unique filename to use for a composite disk image.
@@ -1505,11 +1494,12 @@ impl IVirtualMachineService for VirtualMachineService {
         }
     }
 
-    fn getSecretkeeper(&self) -> binder::Result<Option<Strong<dyn ISecretkeeper>>> {
-        // TODO(b/327526008): Session establishment wth secretkeeper is failing.
-        // Re-enable this when fixed.
-        let _sk_supported = is_secretkeeper_supported();
-        Ok(None)
+    fn getSecretkeeper(&self) -> binder::Result<Strong<dyn ISecretkeeper>> {
+        if !is_secretkeeper_supported() {
+            return Err(StatusCode::NAME_NOT_FOUND)?;
+        }
+        let sk = binder::wait_for_interface(SECRETKEEPER_IDENTIFIER)?;
+        Ok(BnSecretkeeper::new_binder(SecretkeeperProxy(sk), BinderFeatures::default()))
     }
 
     fn requestAttestation(&self, csr: &[u8], test_mode: bool) -> binder::Result<Vec<Certificate>> {
@@ -1518,8 +1508,11 @@ impl IVirtualMachineService for VirtualMachineService {
 }
 
 fn is_secretkeeper_supported() -> bool {
-    binder::is_declared(SECRETKEEPER_IDENTIFIER)
-        .expect("Could not check for declared Secretkeeper interface")
+    // TODO(b/327526008): Session establishment wth secretkeeper is failing.
+    // Re-enable this when fixed.
+    let _sk_supported = binder::is_declared(SECRETKEEPER_IDENTIFIER)
+        .expect("Could not check for declared Secretkeeper interface");
+    false
 }
 
 impl VirtualMachineService {
