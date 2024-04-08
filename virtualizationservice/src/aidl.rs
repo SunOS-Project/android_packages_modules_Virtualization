@@ -15,11 +15,13 @@
 //! Implementation of the AIDL interface of the VirtualizationService.
 
 use crate::atom::{forward_vm_booted_atom, forward_vm_creation_atom, forward_vm_exited_atom};
+use crate::maintenance;
 use crate::remote_provisioning;
 use crate::rkpvm::{generate_ecdsa_p256_key_pair, request_attestation};
 use crate::{get_calling_pid, get_calling_uid, REMOTELY_PROVISIONED_COMPONENT_SERVICE_NAME};
 use android_os_permissions_aidl::aidl::android::os::IPermissionController;
 use android_system_virtualizationcommon::aidl::android::system::virtualizationcommon;
+use android_system_virtualizationmaintenance::aidl::android::system::virtualizationmaintenance;
 use android_system_virtualizationservice::aidl::android::system::virtualizationservice;
 use android_system_virtualizationservice_internal as android_vs_internal;
 use android_system_virtualmachineservice::aidl::android::system::virtualmachineservice;
@@ -35,8 +37,12 @@ use libc::VMADDR_CID_HOST;
 use log::{error, info, warn};
 use nix::unistd::{chown, Uid};
 use openssl::x509::X509;
+use rand::Fill;
 use rkpd_client::get_rkpd_attestation_key;
-use rustutils::system_properties;
+use rustutils::{
+    system_properties,
+    users::{multiuser_get_app_id, multiuser_get_user_id},
+};
 use serde::Deserialize;
 use service_vm_comm::Response;
 use std::collections::{HashMap, HashSet};
@@ -48,6 +54,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use tombstoned_client::{DebuggerdDumpType, TombstonedConnection};
 use virtualizationcommon::Certificate::Certificate;
+use virtualizationmaintenance::{
+    IVirtualizationMaintenance::IVirtualizationMaintenance,
+    IVirtualizationReconciliationCallback::IVirtualizationReconciliationCallback,
+};
 use virtualizationservice::{
     AssignableDevice::AssignableDevice, VirtualMachineDebugInfo::VirtualMachineDebugInfo,
 };
@@ -59,9 +69,7 @@ use virtualizationservice_internal::{
     IGlobalVmContext::{BnGlobalVmContext, IGlobalVmContext},
     IVfioHandler::VfioDev::VfioDev,
     IVfioHandler::{BpVfioHandler, IVfioHandler},
-    IVirtualizationServiceInternal::{
-        BnVirtualizationServiceInternal, IVirtualizationServiceInternal,
-    },
+    IVirtualizationServiceInternal::IVirtualizationServiceInternal,
 };
 use virtualmachineservice::IVirtualMachineService::VM_TOMBSTONES_SERVICE_PORT;
 use vsock::{VsockListener, VsockStream};
@@ -159,14 +167,15 @@ fn is_valid_guest_cid(cid: Cid) -> bool {
 
 /// Singleton service for allocating globally-unique VM resources, such as the CID, and running
 /// singleton servers, like tombstone receiver.
-#[derive(Debug, Default)]
+#[derive(Clone)]
 pub struct VirtualizationServiceInternal {
     state: Arc<Mutex<GlobalState>>,
 }
 
 impl VirtualizationServiceInternal {
-    pub fn init() -> Strong<dyn IVirtualizationServiceInternal> {
-        let service = VirtualizationServiceInternal::default();
+    pub fn init() -> VirtualizationServiceInternal {
+        let service =
+            VirtualizationServiceInternal { state: Arc::new(Mutex::new(GlobalState::new())) };
 
         std::thread::spawn(|| {
             if let Err(e) = handle_stream_connection_tombstoned() {
@@ -174,7 +183,7 @@ impl VirtualizationServiceInternal {
             }
         });
 
-        BnVirtualizationServiceInternal::new_binder(service, BinderFeatures::default())
+        service
     }
 }
 
@@ -260,6 +269,13 @@ impl IVirtualizationServiceInternal for VirtualizationServiceInternal {
             .context("Failed to generate ECDSA P-256 key pair for testing")
             .with_log()
             .or_service_specific_exception(-1)?;
+        // Wait until the service VM shuts down, so that the Service VM will be restarted when
+        // the key generated in the current session will be used for attestation.
+        // This ensures that different Service VM sessions have the same KEK for the key blob.
+        service_vm_manager::wait_until_service_vm_shuts_down()
+            .context("Failed to wait until the service VM shuts down")
+            .with_log()
+            .or_service_specific_exception(-1)?;
         match res {
             Response::GenerateEcdsaP256KeyPair(key_pair) => {
                 FAKE_PROVISIONED_KEY_BLOB_FOR_TESTING
@@ -287,6 +303,13 @@ impl IVirtualizationServiceInternal for VirtualizationServiceInternal {
                     "requestAttestation is not supported with the remote_attestation feature \
                      disabled",
                 ),
+            ))
+            .with_log();
+        }
+        if !remotely_provisioned_component_service_exists()? {
+            return Err(Status::new_exception_str(
+                ExceptionCode::UNSUPPORTED_OPERATION,
+                Some("AVF remotely provisioned component service is not declared"),
             ))
             .with_log();
         }
@@ -378,6 +401,75 @@ impl IVirtualizationServiceInternal for VirtualizationServiceInternal {
         let file = state.get_dtbo_file().or_service_specific_exception(-1)?;
         Ok(ParcelFileDescriptor::new(file))
     }
+
+    fn allocateInstanceId(&self) -> binder::Result<[u8; 64]> {
+        let mut id = [0u8; 64];
+        id.try_fill(&mut rand::thread_rng())
+            .context("Failed to allocate instance_id")
+            .or_service_specific_exception(-1)?;
+        let uid = get_calling_uid();
+        info!("Allocated a VM's instance_id: {:?}, for uid: {:?}", hex::encode(id), uid);
+        let state = &mut *self.state.lock().unwrap();
+        if let Some(sk_state) = &mut state.sk_state {
+            let user_id = multiuser_get_user_id(uid);
+            let app_id = multiuser_get_app_id(uid);
+            info!("Recording possible existence of state for (user_id={user_id}, app_id={app_id})");
+            if let Err(e) = sk_state.add_id(&id, user_id, app_id) {
+                error!("Failed to record the instance_id: {e:?}");
+            }
+        }
+
+        Ok(id)
+    }
+
+    fn removeVmInstance(&self, instance_id: &[u8; 64]) -> binder::Result<()> {
+        let state = &mut *self.state.lock().unwrap();
+        if let Some(sk_state) = &mut state.sk_state {
+            info!("removeVmInstance(): delete secret");
+            sk_state.delete_ids(&[*instance_id]);
+        } else {
+            info!("ignoring removeVmInstance() as no ISecretkeeper");
+        }
+        Ok(())
+    }
+}
+
+impl IVirtualizationMaintenance for VirtualizationServiceInternal {
+    fn appRemoved(&self, user_id: i32, app_id: i32) -> binder::Result<()> {
+        let state = &mut *self.state.lock().unwrap();
+        if let Some(sk_state) = &mut state.sk_state {
+            info!("packageRemoved(user_id={user_id}, app_id={app_id})");
+            sk_state.delete_ids_for_app(user_id, app_id).or_service_specific_exception(-1)?;
+        } else {
+            info!("ignoring packageRemoved(user_id={user_id}, app_id={app_id})");
+        }
+        Ok(())
+    }
+
+    fn userRemoved(&self, user_id: i32) -> binder::Result<()> {
+        let state = &mut *self.state.lock().unwrap();
+        if let Some(sk_state) = &mut state.sk_state {
+            info!("userRemoved({user_id})");
+            sk_state.delete_ids_for_user(user_id).or_service_specific_exception(-1)?;
+        } else {
+            info!("ignoring userRemoved(user_id={user_id})");
+        }
+        Ok(())
+    }
+
+    fn performReconciliation(
+        &self,
+        callback: &Strong<dyn IVirtualizationReconciliationCallback>,
+    ) -> binder::Result<()> {
+        let state = &mut *self.state.lock().unwrap();
+        if let Some(sk_state) = &mut state.sk_state {
+            info!("performReconciliation()");
+            sk_state.reconcile(callback).or_service_specific_exception(-1)?;
+        } else {
+            info!("ignoring performReconciliation()");
+        }
+        Ok(())
+    }
 }
 
 // KEEP IN SYNC WITH assignable_devices.xsd
@@ -462,7 +554,6 @@ impl GlobalVmInstance {
 
 /// The mutable state of the VirtualizationServiceInternal. There should only be one instance
 /// of this struct.
-#[derive(Debug, Default)]
 struct GlobalState {
     /// VM contexts currently allocated to running VMs. A CID is never recycled as long
     /// as there is a strong reference held by a GlobalVmContext.
@@ -470,9 +561,20 @@ struct GlobalState {
 
     /// Cached read-only FD of VM DTBO file. Also serves as a lock for creating the file.
     dtbo_file: Mutex<Option<File>>,
+
+    /// State relating to secrets held by (optional) Secretkeeper instance on behalf of VMs.
+    sk_state: Option<maintenance::State>,
 }
 
 impl GlobalState {
+    fn new() -> Self {
+        Self {
+            held_contexts: HashMap::new(),
+            dtbo_file: Mutex::new(None),
+            sk_state: maintenance::State::new(),
+        }
+    }
+
     /// Get the next available CID, or an error if we have run out. The last CID used is stored in
     /// a system property so that restart of virtualizationservice doesn't reuse CID while the host
     /// Android is up.
@@ -681,6 +783,10 @@ fn handle_tombstone(stream: &mut VsockStream) -> Result<()> {
     Ok(())
 }
 
+fn remotely_provisioned_component_service_exists() -> binder::Result<bool> {
+    Ok(binder::is_declared(REMOTELY_PROVISIONED_COMPONENT_SERVICE_NAME)?)
+}
+
 /// Checks whether the caller has a specific permission
 fn check_permission(perm: &str) -> binder::Result<()> {
     let calling_pid = get_calling_pid();
@@ -717,7 +823,6 @@ fn check_use_custom_virtual_machine() -> binder::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     const TEST_RKP_CERT_CHAIN_PATH: &str = "testdata/rkp_cert_chain.der";
 

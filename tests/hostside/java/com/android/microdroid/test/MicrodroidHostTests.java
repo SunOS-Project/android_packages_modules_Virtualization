@@ -153,7 +153,7 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
             throws Exception {
         PayloadMetadata.write(
                 PayloadMetadata.metadata(
-                        "/mnt/apk/assets/" + mOs + "/vm_config.json",
+                        "/mnt/apk/assets/vm_config.json",
                         PayloadMetadata.apk("microdroid-apk"),
                         apexes.stream()
                                 .map(apex -> PayloadMetadata.apex(apex.name))
@@ -412,7 +412,7 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
     public void protectedVmRunsPvmfw() throws Exception {
         // Arrange
         assumeProtectedVm();
-        final String configPath = "assets/" + mOs + "/vm_config_apex.json";
+        final String configPath = "assets/vm_config_apex.json";
 
         // Act
         mMicrodroidDevice =
@@ -421,6 +421,7 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
                         .memoryMib(minMemorySize())
                         .cpuTopology("match_host")
                         .protectedVm(true)
+                        .gki(mGki)
                         .build(getAndroidDevice());
 
         // Assert
@@ -548,6 +549,7 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
                         .memoryMib(minMemorySize())
                         .cpuTopology("match_host")
                         .protectedVm(protectedVm)
+                        .gki(mGki)
                         .build(getAndroidDevice());
         mMicrodroidDevice.waitForBootComplete(BOOT_COMPLETE_TIMEOUT);
         mMicrodroidDevice.enableAdbRoot();
@@ -569,7 +571,7 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
         assertThat(
                         isTombstoneGeneratedWithCmd(
                                 mProtectedVm,
-                                "assets/" + mOs + "/vm_config.json",
+                                "assets/vm_config.json",
                                 "kill",
                                 "-SIGSEGV",
                                 "$(pidof microdroid_launcher)"))
@@ -583,7 +585,7 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
         assertThat(
                         isTombstoneGeneratedWithCmd(
                                 mProtectedVm,
-                                "assets/" + mOs + "/vm_config_no_tombstone.json",
+                                "assets/vm_config_no_tombstone.json",
                                 "kill",
                                 "-SIGSEGV",
                                 "$(pidof microdroid_launcher)"))
@@ -597,7 +599,7 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
         assertThat(
                         isTombstoneGeneratedWithCmd(
                                 mProtectedVm,
-                                "assets/" + mOs + "/vm_config.json",
+                                "assets/vm_config.json",
                                 "echo",
                                 "c",
                                 ">",
@@ -617,6 +619,7 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
         final String apkPath = getPathForPackage(PACKAGE_NAME);
         final String idsigPath = TEST_ROOT + "idsig";
         final String instanceImgPath = TEST_ROOT + "instance.img";
+        final String instanceIdPath = TEST_ROOT + "instance_id";
         List<String> cmd =
                 new ArrayList<>(
                         Arrays.asList(
@@ -627,8 +630,17 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
                                 apkPath,
                                 idsigPath,
                                 instanceImgPath));
+        if (isFeatureEnabled("com.android.kvm.LLPVM_CHANGES")) {
+            cmd.add("--instance-id-file");
+            cmd.add(instanceIdPath);
+        }
+        ;
         if (protectedVm) {
             cmd.add("--protected");
+        }
+        if (mGki != null) {
+            cmd.add("--gki");
+            cmd.add(mGki);
         }
         Collections.addAll(cmd, additionalArgs);
 
@@ -661,10 +673,7 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
     private boolean isTombstoneGeneratedWithCrashConfig(boolean protectedVm, boolean debuggable)
             throws Exception {
         return isTombstoneGeneratedWithVmRunApp(
-                protectedVm,
-                debuggable,
-                "--config-path",
-                "assets/" + mOs + "/vm_config_crash.json");
+                protectedVm, debuggable, "--config-path", "assets/vm_config_crash.json");
     }
 
     @Test
@@ -699,13 +708,14 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
 
         // Create VM with microdroid
         TestDevice device = getAndroidDevice();
-        final String configPath = "assets/" + mOs + "/vm_config_apex.json"; // path inside the APK
+        final String configPath = "assets/vm_config_apex.json"; // path inside the APK
         ITestDevice microdroid =
                 MicrodroidBuilder.fromDevicePath(getPathForPackage(PACKAGE_NAME), configPath)
                         .debugLevel("full")
                         .memoryMib(minMemorySize())
                         .cpuTopology("match_host")
                         .protectedVm(mProtectedVm)
+                        .gki(mGki)
                         .build(device);
         microdroid.waitForBootComplete(BOOT_COMPLETE_TIMEOUT);
         device.shutdownMicrodroid(microdroid);
@@ -787,12 +797,11 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
         assertWithMessage("Incorrect ABI list").that(abis).hasLength(1);
 
         // Check that no denials have happened so far
+        String logText =
+                getDevice().pullFileContents(CONSOLE_PATH) + getDevice().pullFileContents(LOG_PATH);
         assertWithMessage("Unexpected denials during VM boot")
-                .that(android.tryRun("egrep", "'avc:[[:space:]]{1,2}denied'", LOG_PATH))
-                .isNull();
-        assertWithMessage("Unexpected denials during VM boot")
-                .that(android.tryRun("egrep", "'avc:[[:space:]]{1,2}denied'", CONSOLE_PATH))
-                .isNull();
+                .that(logText)
+                .doesNotContainMatch("avc:\\s+denied");
 
         assertThat(getDeviceNumCpus(microdroid)).isEqualTo(getDeviceNumCpus(android));
 
@@ -828,24 +837,26 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
     @Test
     @CddTest(requirements = {"9.17/C-1-1", "9.17/C-1-2", "9.17/C/1-3"})
     public void testMicrodroidBoots() throws Exception {
-        final String configPath = "assets/" + mOs + "/vm_config.json"; // path inside the APK
+        final String configPath = "assets/vm_config.json"; // path inside the APK
         testMicrodroidBootsWithBuilder(
                 MicrodroidBuilder.fromDevicePath(getPathForPackage(PACKAGE_NAME), configPath)
                         .debugLevel("full")
                         .memoryMib(minMemorySize())
                         .cpuTopology("match_host")
-                        .protectedVm(mProtectedVm));
+                        .protectedVm(mProtectedVm)
+                        .gki(mGki));
     }
 
     @Test
     public void testMicrodroidRamUsage() throws Exception {
-        final String configPath = "assets/" + mOs + "/vm_config.json";
+        final String configPath = "assets/vm_config.json";
         mMicrodroidDevice =
                 MicrodroidBuilder.fromDevicePath(getPathForPackage(PACKAGE_NAME), configPath)
                         .debugLevel("full")
                         .memoryMib(minMemorySize())
                         .cpuTopology("match_host")
                         .protectedVm(mProtectedVm)
+                        .gki(mGki)
                         .build(getAndroidDevice());
         mMicrodroidDevice.waitForBootComplete(BOOT_COMPLETE_TIMEOUT);
         mMicrodroidDevice.enableAdbRoot();
@@ -887,7 +898,6 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
         final String apkPath = getPathForPackage(PACKAGE_NAME);
         final String idSigPath = TEST_ROOT + "idsig";
         android.run(VIRT_APEX + "bin/vm", "create-idsig", apkPath, idSigPath);
-
         // Create the instance image for the VM
         final String instanceImgPath = TEST_ROOT + "instance.img";
         android.run(
@@ -897,17 +907,22 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
                 instanceImgPath,
                 Integer.toString(10 * 1024 * 1024));
 
-        final String ret =
-                android.runForResult(
+        List<String> cmd =
+                new ArrayList<>(
+                        Arrays.asList(
                                 VIRT_APEX + "bin/vm",
                                 "run-app",
                                 "--payload-binary-name",
                                 "./MicrodroidTestNativeLib.so",
                                 apkPath,
                                 idSigPath,
-                                instanceImgPath)
-                        .getStderr()
-                        .trim();
+                                instanceImgPath));
+        if (isFeatureEnabled("com.android.kvm.LLPVM_CHANGES")) {
+            cmd.add("--instance-id-file");
+            cmd.add(TEST_ROOT + "instance_id");
+        }
+
+        final String ret = android.runForResult(String.join(" ", cmd)).getStderr().trim();
 
         assertThat(ret).contains("Payload binary name must not specify a path");
     }
@@ -944,7 +959,43 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
         assertThat(hasDebugPolicy).isFalse();
     }
 
+    private boolean isLz4(String path) throws Exception {
+        File lz4tool = findTestFile("lz4");
+        CommandResult result =
+                new RunUtil().runTimedCmd(5000, lz4tool.getAbsolutePath(), "-t", path);
+        return result.getStatus() == CommandStatus.SUCCESS;
+    }
+
+    private void decompressLz4(String inputPath, String outputPath) throws Exception {
+        File lz4tool = findTestFile("lz4");
+        CommandResult result =
+                new RunUtil()
+                        .runTimedCmd(
+                                5000, lz4tool.getAbsolutePath(), "-d", "-f", inputPath, outputPath);
+        String out = result.getStdout();
+        String err = result.getStderr();
+        assertWithMessage(
+                        "lz4 image "
+                                + inputPath
+                                + " decompression failed."
+                                + "\n\tout: "
+                                + out
+                                + "\n\terr: "
+                                + err
+                                + "\n")
+                .about(command_results())
+                .that(result)
+                .isSuccess();
+    }
+
     private String avbInfo(String image_path) throws Exception {
+        if (isLz4(image_path)) {
+            File decompressedImage = FileUtil.createTempFile("decompressed", ".img");
+            decompressedImage.deleteOnExit();
+            decompressLz4(image_path, decompressedImage.getAbsolutePath());
+            image_path = decompressedImage.getAbsolutePath();
+        }
+
         File avbtool = findTestFile("avbtool");
         List<String> command =
                 Arrays.asList(avbtool.getAbsolutePath(), "info_image", "--image", image_path);
@@ -1037,14 +1088,15 @@ public class MicrodroidHostTests extends MicrodroidHostTestCaseBase {
     }
 
     private void launchWithDeviceAssignment(String device) throws Exception {
-        final String configPath = "assets/" + mOs + "/vm_config.json";
+        final String configPath = "assets/vm_config.json";
 
         MicrodroidBuilder builder =
                 MicrodroidBuilder.fromDevicePath(getPathForPackage(PACKAGE_NAME), configPath)
                         .debugLevel("full")
                         .memoryMib(minMemorySize())
                         .cpuTopology("match_host")
-                        .protectedVm(mProtectedVm);
+                        .protectedVm(mProtectedVm)
+                        .gki(mGki);
         if (device != null) {
             builder.addAssignableDevice(device);
         }

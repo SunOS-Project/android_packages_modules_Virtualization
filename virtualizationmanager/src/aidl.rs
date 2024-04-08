@@ -70,7 +70,7 @@ use disk::QcowFile;
 use glob::glob;
 use lazy_static::lazy_static;
 use log::{debug, error, info, warn};
-use microdroid_payload_config::{ApkConfig, OsConfig, Task, TaskType, VmPayloadConfig};
+use microdroid_payload_config::{ApkConfig, Task, TaskType, VmPayloadConfig};
 use nix::unistd::pipe;
 use rpcbinder::RpcServer;
 use rustutils::system_properties;
@@ -83,7 +83,7 @@ use std::fs::{canonicalize, read_dir, remove_file, File, OpenOptions};
 use std::io::{BufRead, BufReader, Error, ErrorKind, Seek, SeekFrom, Write};
 use std::iter;
 use std::num::{NonZeroU16, NonZeroU32};
-use std::os::unix::io::{FromRawFd, IntoRawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::raw::pid_t;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
@@ -109,9 +109,8 @@ const ANDROID_VM_INSTANCE_VERSION: u16 = 1;
 
 const MICRODROID_OS_NAME: &str = "microdroid";
 
-// TODO(b/291213394): Use 'default' instance for secretkeeper instead of 'nonsecure'
 const SECRETKEEPER_IDENTIFIER: &str =
-    "android.hardware.security.secretkeeper.ISecretkeeper/nonsecure";
+    "android.hardware.security.secretkeeper.ISecretkeeper/default";
 
 const UNFORMATTED_STORAGE_MAGIC: &str = "UNFORMATTED-STORAGE";
 
@@ -228,6 +227,11 @@ impl IVirtualizationService for VirtualizationService {
         );
         write_vm_creation_stats(config, is_protected, &ret);
         ret
+    }
+
+    /// Allocate a new instance_id to the VM
+    fn allocateInstanceId(&self) -> binder::Result<[u8; 64]> {
+        GLOBAL_SERVICE.allocateInstanceId()
     }
 
     /// Initialise an empty partition image of the given size to be used as a writable partition.
@@ -371,7 +375,8 @@ impl VirtualizationService {
             check_gdb_allowed(config)?;
         }
 
-        // Currently, VirtMgr adds the host copy of reference DT & an untrusted prop (instance-id)
+        // Currently, VirtMgr adds the host copy of reference DT & untrusted properties
+        // (e.g. instance-id)
         let host_ref_dt = Path::new(VM_REFERENCE_DT_ON_HOST_PATH);
         let host_ref_dt = if host_ref_dt.exists()
             && read_dir(host_ref_dt).or_service_specific_exception(-1)?.next().is_some()
@@ -399,13 +404,17 @@ impl VirtualizationService {
             vec![]
         };
 
-        let untrusted_props = if cfg!(llpvm_changes) {
-            // TODO(b/291213394): Replace this with a per-VM instance Id.
-            let instance_id = b"sixtyfourbyteslonghardcoded_indeed_sixtyfourbyteslonghardcoded_h";
-            vec![(cstr!("instance-id"), &instance_id[..])]
-        } else {
-            vec![]
-        };
+        let instance_id;
+        let mut untrusted_props = Vec::with_capacity(2);
+        if cfg!(llpvm_changes) {
+            instance_id = extract_instance_id(config);
+            untrusted_props.push((cstr!("instance-id"), &instance_id[..]));
+            if is_secretkeeper_supported() {
+                // Let guest know that it can defer rollback protection to Secretkeeper by setting
+                // an empty property in untrusted node in DT. This enables Updatable VMs.
+                untrusted_props.push((cstr!("defer-rollback-protection"), &[]))
+            }
+        }
 
         let device_tree_overlay =
             if host_ref_dt.is_some() || !untrusted_props.is_empty() || !trusted_props.is_empty() {
@@ -425,11 +434,7 @@ impl VirtualizationService {
                 None
             };
 
-        let debug_level = match config {
-            VirtualMachineConfig::AppConfig(config) => config.debugLevel,
-            _ => DebugLevel::NONE,
-        };
-        let debug_config = DebugConfig::new(debug_level);
+        let debug_config = DebugConfig::new(config);
 
         let ramdump = if debug_config.is_ramdump_needed() {
             Some(prepare_ramdump_file(&temporary_directory)?)
@@ -483,6 +488,11 @@ impl VirtualizationService {
             })
             .try_for_each(check_label_for_partition)
             .or_service_specific_exception(-1)?;
+
+        // Check if files for payloads and bases are NOT coming from /vendor and /odm, as they may
+        // have unstable interfaces.
+        // TODO(b/316431494): remove once Treble interfaces are stabilized.
+        check_partitions_for_files(config).or_service_specific_exception(-1)?;
 
         let kernel = maybe_clone_file(&config.kernel)?;
         let initrd = maybe_clone_file(&config.initrd)?;
@@ -612,13 +622,10 @@ fn is_custom_config(config: &VirtualMachineConfig) -> bool {
                 // - specifying a config file;
                 // - specifying extra APKs;
                 // - specifying an OS other than Microdroid.
-                match &config.payload {
+                (match &config.payload {
                     Payload::ConfigPath(_) => true,
-                    Payload::PayloadConfig(payload_config) => {
-                        !payload_config.extraApks.is_empty()
-                            || payload_config.osName != MICRODROID_OS_NAME
-                    }
-                }
+                    Payload::PayloadConfig(payload_config) => !payload_config.extraApks.is_empty(),
+                }) || config.osName != MICRODROID_OS_NAME
             }
         }
     }
@@ -803,8 +810,13 @@ fn load_app_config(
         }
     };
 
+    let payload_config_os = vm_payload_config.os.name.as_str();
+    if !payload_config_os.is_empty() && payload_config_os != "microdroid" {
+        bail!("'os' in payload config is deprecated");
+    }
+
     // For now, the only supported OS is Microdroid and Microdroid GKI
-    let os_name = vm_payload_config.os.name.as_str();
+    let os_name = config.osName.as_str();
     if !is_valid_os(os_name) {
         bail!("Unknown OS \"{}\"", os_name);
     }
@@ -855,6 +867,38 @@ fn load_app_config(
     Ok(vm_config)
 }
 
+fn check_partition_for_file(fd: &ParcelFileDescriptor) -> Result<()> {
+    let path = format!("/proc/self/fd/{}", fd.as_raw_fd());
+    let link = fs::read_link(&path).context(format!("can't read_link {path}"))?;
+
+    // microdroid vendor image is OK
+    if cfg!(vendor_modules) && link == Path::new("/vendor/etc/avf/microdroid/microdroid_vendor.img")
+    {
+        return Ok(());
+    }
+
+    if link.starts_with("/vendor") || link.starts_with("/odm") {
+        bail!("vendor or odm file {} can't be used for VM", link.display());
+    }
+
+    Ok(())
+}
+
+fn check_partitions_for_files(config: &VirtualMachineRawConfig) -> Result<()> {
+    config
+        .disks
+        .iter()
+        .flat_map(|disk| disk.partitions.iter())
+        .filter_map(|partition| partition.image.as_ref())
+        .try_for_each(check_partition_for_file)?;
+
+    config.kernel.as_ref().map_or(Ok(()), check_partition_for_file)?;
+    config.initrd.as_ref().map_or(Ok(()), check_partition_for_file)?;
+    config.bootloader.as_ref().map_or(Ok(()), check_partition_for_file)?;
+
+    Ok(())
+}
+
 fn load_vm_payload_config_from_file(apk_file: &File, config_path: &str) -> Result<VmPayloadConfig> {
     let mut apk_zip = ZipArchive::new(apk_file)?;
     let config_file = apk_zip.by_name(config_path)?;
@@ -874,22 +918,13 @@ fn create_vm_payload_config(
     }
 
     let task = Task { type_: TaskType::MicrodroidLauncher, command: payload_binary_name.clone() };
-    let name = payload_config.osName.clone();
 
     // The VM only cares about how many there are, these names are actually ignored.
     let extra_apk_count = payload_config.extraApks.len();
     let extra_apks =
         (0..extra_apk_count).map(|i| ApkConfig { path: format!("extra-apk-{i}") }).collect();
 
-    Ok(VmPayloadConfig {
-        os: OsConfig { name },
-        task: Some(task),
-        apexes: vec![],
-        extra_apks,
-        prefer_staged: false,
-        export_tombstones: None,
-        enable_authfs: false,
-    })
+    Ok(VmPayloadConfig { task: Some(task), extra_apks, ..Default::default() })
 }
 
 /// Generates a unique filename to use for a composite disk image.
@@ -1269,6 +1304,13 @@ fn check_gdb_allowed(config: &VirtualMachineConfig) -> binder::Result<()> {
     }
 }
 
+fn extract_instance_id(config: &VirtualMachineConfig) -> [u8; 64] {
+    match config {
+        VirtualMachineConfig::RawConfig(config) => config.instanceId,
+        VirtualMachineConfig::AppConfig(config) => config.instanceId,
+    }
+}
+
 fn extract_gdb_port(config: &VirtualMachineConfig) -> Option<NonZeroU16> {
     match config {
         VirtualMachineConfig::RawConfig(config) => NonZeroU16::new(config.gdbPort as u16),
@@ -1452,13 +1494,12 @@ impl IVirtualMachineService for VirtualMachineService {
         }
     }
 
-    fn getSecretkeeper(&self) -> binder::Result<Option<Strong<dyn ISecretkeeper>>> {
-        let sk = if is_secretkeeper_present() {
-            Some(binder::wait_for_interface(SECRETKEEPER_IDENTIFIER)?)
-        } else {
-            None
-        };
-        Ok(sk.map(|s| BnSecretkeeper::new_binder(SecretkeeperProxy(s), BinderFeatures::default())))
+    fn getSecretkeeper(&self) -> binder::Result<Strong<dyn ISecretkeeper>> {
+        if !is_secretkeeper_supported() {
+            return Err(StatusCode::NAME_NOT_FOUND)?;
+        }
+        let sk = binder::wait_for_interface(SECRETKEEPER_IDENTIFIER)?;
+        Ok(BnSecretkeeper::new_binder(SecretkeeperProxy(sk), BinderFeatures::default()))
     }
 
     fn requestAttestation(&self, csr: &[u8], test_mode: bool) -> binder::Result<Vec<Certificate>> {
@@ -1466,9 +1507,12 @@ impl IVirtualMachineService for VirtualMachineService {
     }
 }
 
-fn is_secretkeeper_present() -> bool {
-    binder::is_declared(SECRETKEEPER_IDENTIFIER)
-        .expect("Could not check for declared Secretkeeper interface")
+fn is_secretkeeper_supported() -> bool {
+    // TODO(b/327526008): Session establishment wth secretkeeper is failing.
+    // Re-enable this when fixed.
+    let _sk_supported = binder::is_declared(SECRETKEEPER_IDENTIFIER)
+        .expect("Could not check for declared Secretkeeper interface");
+    false
 }
 
 impl VirtualMachineService {

@@ -24,10 +24,7 @@ use crate::{
 use android_system_virtualizationservice::aidl::android::system::virtualizationservice::{
     CpuTopology::CpuTopology,
     IVirtualizationService::IVirtualizationService,
-    VirtualMachineAppConfig::{
-        CustomConfig::CustomConfig, DebugLevel::DebugLevel, Payload::Payload,
-        VirtualMachineAppConfig,
-    },
+    VirtualMachineAppConfig::{DebugLevel::DebugLevel, Payload::Payload, VirtualMachineAppConfig},
     VirtualMachineConfig::VirtualMachineConfig,
 };
 use anyhow::{anyhow, bail, Context, Result};
@@ -35,6 +32,7 @@ use binder::{ParcelFileDescriptor, Strong};
 use compos_aidl_interface::aidl::com::android::compos::ICompOsService::ICompOsService;
 use glob::glob;
 use log::{info, warn};
+use platformproperties::hypervisorproperties;
 use rustutils::system_properties;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -72,6 +70,7 @@ impl ComposClient {
     /// Start a new CompOS VM instance using the specified instance image file and parameters.
     pub fn start(
         service: &dyn IVirtualizationService,
+        instance_id: [u8; 64],
         instance_image: File,
         idsig: &Path,
         idsig_manifest_apk: &Path,
@@ -121,15 +120,15 @@ impl ComposClient {
             name: parameters.name.clone(),
             apk: Some(apk_fd),
             idsig: Some(idsig_fd),
+            instanceId: instance_id,
             instanceImage: Some(instance_fd),
-            encryptedStorageImage: None,
             payload: Payload::ConfigPath(config_path),
             debugLevel: debug_level,
             extraIdsigs: extra_idsigs,
             protectedVm: protected_vm,
             memoryMib: parameters.memory_mib.unwrap_or(0), // 0 means use the default
             cpuTopology: cpu_topology,
-            customConfig: Some(CustomConfig { ..Default::default() }),
+            ..Default::default()
         });
 
         // Let logs go to logcat.
@@ -230,7 +229,7 @@ fn prepare_idsig(
 
 fn want_protected_vm() -> Result<bool> {
     let have_protected_vm =
-        system_properties::read_bool("ro.boot.hypervisor.protected_vm.supported", false)?;
+        hypervisorproperties::hypervisor_protected_vm_supported()?.unwrap_or(false);
     if have_protected_vm {
         info!("Starting protected VM");
         return Ok(true);
@@ -241,8 +240,7 @@ fn want_protected_vm() -> Result<bool> {
         bail!("Protected VM not supported, unable to start VM");
     }
 
-    let have_non_protected_vm =
-        system_properties::read_bool("ro.boot.hypervisor.vm.supported", false)?;
+    let have_non_protected_vm = hypervisorproperties::hypervisor_vm_supported()?.unwrap_or(false);
     if have_non_protected_vm {
         warn!("Protected VM not supported, falling back to non-protected on debuggable build");
         return Ok(false);

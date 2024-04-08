@@ -33,11 +33,11 @@
 //! The payload of a partition is encrypted/signed by a key that is unique to the loader and to the
 //! VM as well. Failing to decrypt/authenticate a partition by a loader stops the boot process.
 
-use crate::dice_driver::DiceDriver;
 use crate::ioutil;
 
 use anyhow::{anyhow, bail, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use dice_driver::DiceDriver;
 use openssl::symm::{decrypt_aead, encrypt_aead, Cipher};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
@@ -273,6 +273,8 @@ fn round_to_multiple(n: u64, unit: u64) -> Result<u64> {
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MicrodroidData {
+    // `salt` is obsolete, it was used as a differentiator for non-protected VM instances running
+    // same payload. Instance-id (present in DT) is used for that now.
     pub salt: Vec<u8>, // Should be [u8; 64] but that isn't serializable.
     pub apk_data: ApkData,
     pub extra_apks_data: Vec<ApkData>,

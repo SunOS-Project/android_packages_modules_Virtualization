@@ -15,7 +15,6 @@
 //! Microdroid Manager
 
 mod dice;
-mod dice_driver;
 mod instance;
 mod ioutil;
 mod payload;
@@ -33,20 +32,18 @@ use android_system_virtualization_payload::aidl::android::system::virtualization
 };
 
 use crate::dice::dice_derivation;
-use crate::dice_driver::DiceDriver;
 use crate::instance::{InstanceDisk, MicrodroidData};
 use crate::verify::verify_payload;
 use crate::vm_payload_service::register_vm_payload_service;
 use anyhow::{anyhow, bail, ensure, Context, Error, Result};
 use binder::Strong;
+use dice_driver::DiceDriver;
 use keystore2_crypto::ZVec;
 use libc::VMADDR_CID_HOST;
 use log::{error, info};
-use microdroid_metadata::PayloadMetadata;
+use microdroid_metadata::{Metadata, PayloadMetadata};
 use microdroid_payload_config::{ApkConfig, OsConfig, Task, TaskType, VmPayloadConfig};
 use nix::sys::signal::Signal;
-use openssl::hkdf::hkdf;
-use openssl::md::Md;
 use payload::load_metadata;
 use rpcbinder::RpcSession;
 use rustutils::sockets::android_get_control_socket;
@@ -73,6 +70,9 @@ const AVF_NEW_INSTANCE: &str = "/proc/device-tree/chosen/avf,new-instance";
 const AVF_DEBUG_POLICY_RAMDUMP: &str = "/proc/device-tree/avf/guest/common/ramdump";
 const DEBUG_MICRODROID_NO_VERIFIED_BOOT: &str =
     "/proc/device-tree/virtualization/guest/debug-microdroid,no-verified-boot";
+const SECRETKEEPER_KEY: &str = "/proc/device-tree/avf/secretkeeper_public_key";
+const INSTANCE_ID_PATH: &str = "/proc/device-tree/avf/untrusted/instance-id";
+const DEFER_ROLLBACK_PROTECTION: &str = "/proc/device-tree/avf/untrusted/defer-rollback-protection";
 
 const ENCRYPTEDSTORE_BIN: &str = "/system/bin/encryptedstore";
 const ZIPFUSE_BIN: &str = "/system/bin/zipfuse";
@@ -143,6 +143,27 @@ fn write_death_reason_to_serial(err: &Error) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The (host allocated) instance_id can be found at node /avf/untrusted/ in the device tree.
+fn get_instance_id() -> Result<Option<[u8; ID_SIZE]>> {
+    let path = Path::new(INSTANCE_ID_PATH);
+    let instance_id = if path.exists() {
+        Some(
+            fs::read(path)?
+                .try_into()
+                .map_err(|x: Vec<_>| anyhow!("Expected {ID_SIZE} bytes, found {:?}", x.len()))?,
+        )
+    } else {
+        // TODO(b/325094712): x86 support for Device tree in nested guest is limited/broken/
+        // untested. So instance_id will not be present in cuttlefish.
+        None
+    };
+    Ok(instance_id)
+}
+
+fn should_defer_rollback_protection() -> bool {
+    Path::new(DEFER_ROLLBACK_PROTECTION).exists()
 }
 
 fn main() -> Result<()> {
@@ -219,16 +240,12 @@ fn try_main() -> Result<()> {
     }
 }
 
-fn try_run_payload(
-    service: &Strong<dyn IVirtualMachineService>,
-    vm_payload_service_fd: OwnedFd,
-) -> Result<i32> {
-    let metadata = load_metadata().context("Failed to load payload metadata")?;
-    let dice = DiceDriver::new(Path::new("/dev/open-dice0")).context("Failed to load DICE")?;
-
+fn verify_payload_with_instance_img(
+    metadata: &Metadata,
+    dice: &DiceDriver,
+) -> Result<MicrodroidData> {
     let mut instance = InstanceDisk::new().context("Failed to load instance.img")?;
-    let saved_data =
-        instance.read_microdroid_data(&dice).context("Failed to read identity data")?;
+    let saved_data = instance.read_microdroid_data(dice).context("Failed to read identity data")?;
 
     if is_strict_boot() {
         // Provisioning must happen on the first boot and never again.
@@ -248,7 +265,7 @@ fn try_run_payload(
     }
 
     // Verify the payload before using it.
-    let extracted_data = verify_payload(&metadata, saved_data.as_ref())
+    let extracted_data = verify_payload(metadata, saved_data.as_ref())
         .context("Payload verification failed")
         .map_err(|e| MicrodroidError::PayloadVerificationFailed(e.to_string()))?;
 
@@ -272,9 +289,28 @@ fn try_run_payload(
     } else {
         info!("Saving verified data.");
         instance
-            .write_microdroid_data(&extracted_data, &dice)
+            .write_microdroid_data(&extracted_data, dice)
             .context("Failed to write identity data")?;
         extracted_data
+    };
+    Ok(instance_data)
+}
+
+fn try_run_payload(
+    service: &Strong<dyn IVirtualMachineService>,
+    vm_payload_service_fd: OwnedFd,
+) -> Result<i32> {
+    let metadata = load_metadata().context("Failed to load payload metadata")?;
+    let dice = DiceDriver::new(Path::new("/dev/open-dice0"), is_strict_boot())
+        .context("Failed to load DICE")?;
+
+    // Microdroid skips checking payload against instance image iff the device supports
+    // secretkeeper. In that case Microdroid use VmSecret::V2, which provide protection against
+    // rollback of boot images and packages.
+    let instance_data = if should_defer_rollback_protection() {
+        verify_payload(&metadata, None)?
+    } else {
+        verify_payload_with_instance_img(&metadata, &dice)?
     };
 
     let payload_metadata = metadata.payload.ok_or_else(|| {
@@ -284,19 +320,8 @@ fn try_run_payload(
     // To minimize the exposure to untrusted data, derive dice profile as soon as possible.
     info!("DICE derivation for payload");
     let dice_artifacts = dice_derivation(dice, &instance_data, &payload_metadata)?;
-    // TODO(b/291213394): This will be the Id for non-pVM only, instance_data.salt is all 0
-    // for protected VM, implement a mechanism for pVM!
-    let mut vm_id = [0u8; ID_SIZE];
-    hkdf(
-        &mut vm_id,
-        Md::sha256(),
-        &instance_data.salt,
-        /* salt */ b"",
-        /* info */ b"VM_ID",
-    )
-    .context("hkdf failed")?;
     let vm_secret =
-        VmSecret::new(vm_id, dice_artifacts, service).context("Failed to create VM secrets")?;
+        VmSecret::new(dice_artifacts, service).context("Failed to create VM secrets")?;
 
     if cfg!(dice_changes) {
         // Now that the DICE derivation is done, it's ok to allow payload code to run.

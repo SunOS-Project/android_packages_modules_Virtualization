@@ -23,6 +23,9 @@ parcelable VirtualMachineAppConfig {
     /** Name of VM */
     String name;
 
+    /** Id of the VM instance */
+    byte[64] instanceId;
+
     /** Main APK */
     ParcelFileDescriptor apk;
 
@@ -58,6 +61,15 @@ parcelable VirtualMachineAppConfig {
 
     /** Detailed configuration for the VM, specifying how the payload will be run. */
     Payload payload;
+
+    /**
+     * Name of the OS to run the payload. Currently "microdroid" and
+     * "microdroid_gki-android14-6.1" is supported.
+     *
+     * <p>Setting this field to a value other than "microdroid" requires
+     * android.permission.USE_CUSTOM_VIRTUAL_MACHINE
+     */
+    @utf8InCpp String osName = "microdroid";
 
     enum DebugLevel {
         /** Not debuggable at all */

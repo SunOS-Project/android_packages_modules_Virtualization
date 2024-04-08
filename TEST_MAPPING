@@ -12,6 +12,9 @@
       "name": "MicrodroidTestApp"
     },
     {
+      "name": "MicrodroidTestAppNoPerm"
+    },
+    {
       "name": "VmAttestationTestApp"
     },
     {
@@ -54,6 +57,14 @@
     },
     {
       "name": "AVFHostTestCases"
+    },
+    {
+      // TODO(b/325610326): Add this target to presubmit once there is enough
+      // SLO data for it.
+      "name": "AvfRkpdAppIntegrationTests"
+    },
+    {
+      "name": "AvfRkpdVmAttestationTestApp"
     }
   ],
   "postsubmit": [
