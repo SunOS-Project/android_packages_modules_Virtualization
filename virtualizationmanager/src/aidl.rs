@@ -17,7 +17,7 @@
 use crate::{get_calling_pid, get_calling_uid};
 use crate::atom::{write_vm_booted_stats, write_vm_creation_stats};
 use crate::composite::make_composite_image;
-use crate::crosvm::{CrosvmConfig, DiskFile, PayloadState, VmContext, VmInstance, VmState};
+use crate::crosvm::{CrosvmConfig, DiskFile, DisplayConfig, PayloadState, VmContext, VmInstance, VmState};
 use crate::debug_config::DebugConfig;
 use crate::dt_overlay::{create_device_tree_overlay, VM_DT_OVERLAY_MAX_SIZE, VM_DT_OVERLAY_PATH};
 use crate::payload::{add_microdroid_payload_images, add_microdroid_system_images, add_microdroid_vendor_image};
@@ -231,6 +231,7 @@ impl IVirtualizationService for VirtualizationService {
 
     /// Allocate a new instance_id to the VM
     fn allocateInstanceId(&self) -> binder::Result<[u8; 64]> {
+        check_manage_access()?;
         GLOBAL_SERVICE.allocateInstanceId()
     }
 
@@ -312,6 +313,29 @@ impl IVirtualizationService for VirtualizationService {
 
     fn enableTestAttestation(&self) -> binder::Result<()> {
         GLOBAL_SERVICE.enableTestAttestation()
+    }
+
+    fn isRemoteAttestationSupported(&self) -> binder::Result<bool> {
+        check_manage_access()?;
+        GLOBAL_SERVICE.isRemoteAttestationSupported()
+    }
+
+    fn isUpdatableVmSupported(&self) -> binder::Result<bool> {
+        // The response is specific to Microdroid. Updatable VMs are only possible if device
+        // supports Secretkeeper. Guest OS needs to use Secretkeeper based secrets. Microdroid does
+        // this, however other guest OSes may do things differently.
+        check_manage_access()?;
+        Ok(is_secretkeeper_supported())
+    }
+
+    fn removeVmInstance(&self, instance_id: &[u8; 64]) -> binder::Result<()> {
+        check_manage_access()?;
+        GLOBAL_SERVICE.removeVmInstance(instance_id)
+    }
+
+    fn claimVmInstance(&self, instance_id: &[u8; 64]) -> binder::Result<()> {
+        check_manage_access()?;
+        GLOBAL_SERVICE.claimVmInstance(instance_id)
     }
 }
 
@@ -558,6 +582,13 @@ impl VirtualizationService {
             (vec![], None)
         };
 
+        let display_config = config
+            .displayConfig
+            .as_ref()
+            .map(DisplayConfig::new)
+            .transpose()
+            .or_binder_exception(ExceptionCode::ILLEGAL_ARGUMENT)?;
+
         // Actually start the VM.
         let crosvm_config = CrosvmConfig {
             cid,
@@ -583,6 +614,7 @@ impl VirtualizationService {
             vfio_devices,
             dtbo,
             device_tree_overlay,
+            display_config,
         };
         let instance = Arc::new(
             VmInstance::new(
@@ -1508,11 +1540,8 @@ impl IVirtualMachineService for VirtualMachineService {
 }
 
 fn is_secretkeeper_supported() -> bool {
-    // TODO(b/327526008): Session establishment wth secretkeeper is failing.
-    // Re-enable this when fixed.
-    let _sk_supported = binder::is_declared(SECRETKEEPER_IDENTIFIER)
-        .expect("Could not check for declared Secretkeeper interface");
-    false
+    binder::is_declared(SECRETKEEPER_IDENTIFIER)
+        .expect("Could not check for declared Secretkeeper interface")
 }
 
 impl VirtualMachineService {
