@@ -155,6 +155,12 @@ public abstract class MicrodroidDeviceTestBase {
     public VirtualMachine forceCreateNewVirtualMachine(String name, VirtualMachineConfig config)
             throws VirtualMachineException {
         final VirtualMachineManager vmm = getVirtualMachineManager();
+        deleteVirtualMachineIfExists(name);
+        return vmm.create(name, config);
+    }
+
+    protected void deleteVirtualMachineIfExists(String name) throws VirtualMachineException {
+        VirtualMachineManager vmm = getVirtualMachineManager();
         boolean deleteExisting;
         try {
             deleteExisting = vmm.get(name) != null;
@@ -166,7 +172,6 @@ public abstract class MicrodroidDeviceTestBase {
         if (deleteExisting) {
             vmm.delete(name);
         }
-        return vmm.create(name, config);
     }
 
     public void prepareTestSetup(boolean protectedVm, String gki) {
@@ -206,6 +211,12 @@ public abstract class MicrodroidDeviceTestBase {
         assume().withMessage("Skip on 5.4 kernel. b/218303240")
                 .that(KERNEL_VERSION)
                 .isNotEqualTo("5.4");
+    }
+
+    protected void assumeNoUpdatableVmSupport() throws VirtualMachineException {
+        assume().withMessage("Secretkeeper not supported")
+                .that(getVirtualMachineManager().isUpdatableVmSupported())
+                .isFalse();
     }
 
     public abstract static class VmEventListener implements VirtualMachineCallback {

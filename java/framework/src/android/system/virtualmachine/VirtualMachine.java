@@ -71,6 +71,7 @@ import android.system.virtualizationservice.IVirtualizationService;
 import android.system.virtualizationservice.MemoryTrimLevel;
 import android.system.virtualizationservice.PartitionType;
 import android.system.virtualizationservice.VirtualMachineAppConfig;
+import android.system.virtualizationservice.VirtualMachineRawConfig;
 import android.system.virtualizationservice.VirtualMachineState;
 import android.util.JsonReader;
 import android.util.Log;
@@ -430,10 +431,6 @@ public class VirtualMachine implements AutoCloseable {
                 VirtualMachineConfig config = VirtualMachineConfig.from(vmDescriptor.getConfigFd());
                 vm = new VirtualMachine(context, name, config, VirtualizationService.getInstance());
                 config.serialize(vm.mConfigFilePath);
-                if (vm.mInstanceIdPath != null) {
-                    vm.importInstanceIdFrom(vmDescriptor.getInstanceIdFd());
-                }
-
                 try {
                     vm.mInstanceFilePath.createNewFile();
                 } catch (IOException e) {
@@ -450,13 +447,17 @@ public class VirtualMachine implements AutoCloseable {
                     }
                     vm.importEncryptedStoreFrom(vmDescriptor.getEncryptedStoreFd());
                 }
+                if (vm.mInstanceIdPath != null) {
+                    vm.importInstanceIdFrom(vmDescriptor.getInstanceIdFd());
+                    vm.claimInstance();
+                }
             }
             return vm;
         } catch (VirtualMachineException | RuntimeException e) {
             // If anything goes wrong, delete any files created so far and the VM's directory
             try {
                 deleteRecursively(vmDir);
-            } catch (IOException innerException) {
+            } catch (Exception innerException) {
                 e.addSuppressed(innerException);
             }
             throw e;
@@ -542,8 +543,8 @@ public class VirtualMachine implements AutoCloseable {
         } catch (VirtualMachineException | RuntimeException e) {
             // If anything goes wrong, delete any files created so far and the VM's directory
             try {
-                deleteRecursively(vmDir);
-            } catch (IOException innerException) {
+                vmInstanceCleanup(context, name);
+            } catch (Exception innerException) {
                 e.addSuppressed(innerException);
             }
             throw e;
@@ -585,15 +586,49 @@ public class VirtualMachine implements AutoCloseable {
             // if a new VM is created with the same name (and files) that's unrelated.
             mWasDeleted = true;
         }
-        // TODO(b/294177871): Request deletion of VM secrets.
-        deleteVmDirectory(context, name);
+        vmInstanceCleanup(context, name);
     }
 
-    static void deleteVmDirectory(Context context, String name) throws VirtualMachineException {
+    // Delete the full VM directory and notify VirtualizationService to remove this
+    // VM instance for housekeeping.
+    @GuardedBy("VirtualMachineManager.sCreateLock")
+    static void vmInstanceCleanup(Context context, String name) throws VirtualMachineException {
+        File vmDir = getVmDir(context, name);
+        notifyInstanceRemoval(vmDir, VirtualizationService.getInstance());
         try {
-            deleteRecursively(getVmDir(context, name));
+            deleteRecursively(vmDir);
         } catch (IOException e) {
             throw new VirtualMachineException(e);
+        }
+    }
+
+    private static void notifyInstanceRemoval(
+            File vmDirectory, @NonNull VirtualizationService service) {
+        File instanceIdFile = new File(vmDirectory, INSTANCE_ID_FILE);
+        try {
+            byte[] instanceId = Files.readAllBytes(instanceIdFile.toPath());
+            service.getBinder().removeVmInstance(instanceId);
+        } catch (Exception e) {
+            // Deliberately ignoring error in removing VM instance. This potentially leads to
+            // unaccounted instances in the VS' database. But, nothing much can be done by caller.
+            Log.w(TAG, "Failed to notify VS to remove the VM instance", e);
+        }
+    }
+
+    // Claim the instance. This notifies the global VS about the ownership of this
+    // instance_id for housekeeping purpose.
+    void claimInstance() throws VirtualMachineException {
+        if (mInstanceIdPath != null) {
+            IVirtualizationService service = mVirtualizationService.getBinder();
+            try {
+                byte[] instanceId = Files.readAllBytes(mInstanceIdPath.toPath());
+                service.claimVmInstance(instanceId);
+            }
+            catch (IOException e) {
+                throw new VirtualMachineException("failed to read instance_id", e);
+            } catch (RemoteException e) {
+                throw e.rethrowAsRuntimeException();
+            }
         }
     }
 
@@ -810,6 +845,58 @@ public class VirtualMachine implements AutoCloseable {
         }
     }
 
+    private android.system.virtualizationservice.VirtualMachineConfig
+            createVirtualMachineConfigForRawFrom(VirtualMachineConfig vmConfig)
+                    throws IllegalStateException, IOException {
+        VirtualMachineRawConfig rawConfig = vmConfig.toVsRawConfig();
+        return android.system.virtualizationservice.VirtualMachineConfig.rawConfig(rawConfig);
+    }
+
+    private android.system.virtualizationservice.VirtualMachineConfig
+            createVirtualMachineConfigForAppFrom(
+                    VirtualMachineConfig vmConfig, IVirtualizationService service)
+                    throws RemoteException, IOException, VirtualMachineException {
+        VirtualMachineAppConfig appConfig = vmConfig.toVsConfig(mContext.getPackageManager());
+        appConfig.instanceImage = ParcelFileDescriptor.open(mInstanceFilePath, MODE_READ_WRITE);
+        appConfig.name = mName;
+        if (mInstanceIdPath != null) {
+            appConfig.instanceId = Files.readAllBytes(mInstanceIdPath.toPath());
+        } else {
+            // FEATURE_LLPVM_CHANGES is disabled, instance_id is not used.
+            appConfig.instanceId = new byte[64];
+        }
+        if (mEncryptedStoreFilePath != null) {
+            appConfig.encryptedStorageImage =
+                    ParcelFileDescriptor.open(mEncryptedStoreFilePath, MODE_READ_WRITE);
+        }
+
+        if (!vmConfig.getExtraApks().isEmpty()) {
+            // Extra APKs were specified directly, rather than via config file.
+            // We've already populated the file names for the extra APKs and IDSigs
+            // (via setupExtraApks). But we also need to open the APK files and add
+            // fds for them to the payload config.
+            // This isn't needed when the extra APKs are specified in a config file -
+            // then
+            // Virtualization Manager opens them itself.
+            List<ParcelFileDescriptor> extraApkFiles = new ArrayList<>(mExtraApks.size());
+            for (ExtraApkSpec extraApk : mExtraApks) {
+                try {
+                    extraApkFiles.add(ParcelFileDescriptor.open(extraApk.apk, MODE_READ_ONLY));
+                } catch (FileNotFoundException e) {
+                    throw new VirtualMachineException("Failed to open extra APK", e);
+                }
+            }
+            appConfig.payload.getPayloadConfig().extraApks = extraApkFiles;
+        }
+
+        try {
+            createIdSigsAndUpdateConfig(service, appConfig);
+        } catch (FileNotFoundException e) {
+            throw new VirtualMachineException("Failed to generate APK signature", e);
+        }
+        return android.system.virtualizationservice.VirtualMachineConfig.appConfig(appConfig);
+    }
+
     /**
      * Runs this virtual machine. The returning of this method however doesn't mean that the VM has
      * actually started running or the OS has booted there. Such events can be notified by
@@ -850,50 +937,10 @@ public class VirtualMachine implements AutoCloseable {
                 }
 
                 VirtualMachineConfig vmConfig = getConfig();
-                VirtualMachineAppConfig appConfig =
-                        vmConfig.toVsConfig(mContext.getPackageManager());
-                appConfig.instanceImage =
-                        ParcelFileDescriptor.open(mInstanceFilePath, MODE_READ_WRITE);
-                appConfig.name = mName;
-                if (mInstanceIdPath != null) {
-                    appConfig.instanceId = Files.readAllBytes(mInstanceIdPath.toPath());
-                } else {
-                    // FEATURE_LLPVM_CHANGES is disabled, instance_id is not used.
-                    appConfig.instanceId = new byte[64];
-                }
-                if (mEncryptedStoreFilePath != null) {
-                    appConfig.encryptedStorageImage =
-                            ParcelFileDescriptor.open(mEncryptedStoreFilePath, MODE_READ_WRITE);
-                }
-
-                if (!vmConfig.getExtraApks().isEmpty()) {
-                    // Extra APKs were specified directly, rather than via config file.
-                    // We've already populated the file names for the extra APKs and IDSigs
-                    // (via setupExtraApks). But we also need to open the APK files and add
-                    // fds for them to the payload config.
-                    // This isn't needed when the extra APKs are specified in a config file - then
-                    // Virtualization Manager opens them itself.
-                    List<ParcelFileDescriptor> extraApkFiles = new ArrayList<>(mExtraApks.size());
-                    for (ExtraApkSpec extraApk : mExtraApks) {
-                        try {
-                            extraApkFiles.add(
-                                    ParcelFileDescriptor.open(extraApk.apk, MODE_READ_ONLY));
-                        } catch (FileNotFoundException e) {
-                            throw new VirtualMachineException("Failed to open extra APK", e);
-                        }
-                    }
-                    appConfig.payload.getPayloadConfig().extraApks = extraApkFiles;
-                }
-
-                try {
-                    createIdSigsAndUpdateConfig(service, appConfig);
-                } catch (FileNotFoundException e) {
-                    throw new VirtualMachineException("Failed to generate APK signature", e);
-                }
-
                 android.system.virtualizationservice.VirtualMachineConfig vmConfigParcel =
-                        android.system.virtualizationservice.VirtualMachineConfig.appConfig(
-                                appConfig);
+                        vmConfig.getCustomImageConfig() != null
+                                ? createVirtualMachineConfigForRawFrom(vmConfig)
+                                : createVirtualMachineConfigForAppFrom(vmConfig, service);
 
                 mVirtualMachine =
                         service.createVm(
