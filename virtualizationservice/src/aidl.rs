@@ -51,7 +51,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::raw::{pid_t, uid_t};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use tombstoned_client::{DebuggerdDumpType, TombstonedConnection};
 use virtualizationcommon::Certificate::Certificate;
 use virtualizationmaintenance::{
@@ -170,12 +170,15 @@ fn is_valid_guest_cid(cid: Cid) -> bool {
 #[derive(Clone)]
 pub struct VirtualizationServiceInternal {
     state: Arc<Mutex<GlobalState>>,
+    display_service_set: Arc<Condvar>,
 }
 
 impl VirtualizationServiceInternal {
     pub fn init() -> VirtualizationServiceInternal {
-        let service =
-            VirtualizationServiceInternal { state: Arc::new(Mutex::new(GlobalState::new())) };
+        let service = VirtualizationServiceInternal {
+            state: Arc::new(Mutex::new(GlobalState::new())),
+            display_service_set: Arc::new(Condvar::new()),
+        };
 
         std::thread::spawn(|| {
             if let Err(e) = handle_stream_connection_tombstoned() {
@@ -190,6 +193,39 @@ impl VirtualizationServiceInternal {
 impl Interface for VirtualizationServiceInternal {}
 
 impl IVirtualizationServiceInternal for VirtualizationServiceInternal {
+    fn setDisplayService(
+        &self,
+        ibinder: &binder::SpIBinder,
+    ) -> std::result::Result<(), binder::Status> {
+        check_manage_access()?;
+        check_use_custom_virtual_machine()?;
+        let state = &mut *self.state.lock().unwrap();
+        state.display_service = Some(ibinder.clone());
+        self.display_service_set.notify_all();
+        Ok(())
+    }
+
+    fn clearDisplayService(&self) -> std::result::Result<(), binder::Status> {
+        check_manage_access()?;
+        check_use_custom_virtual_machine()?;
+        let state = &mut *self.state.lock().unwrap();
+        state.display_service = None;
+        self.display_service_set.notify_all();
+        Ok(())
+    }
+
+    fn waitDisplayService(&self) -> std::result::Result<binder::SpIBinder, binder::Status> {
+        check_manage_access()?;
+        check_use_custom_virtual_machine()?;
+        let state = self
+            .display_service_set
+            .wait_while(self.state.lock().unwrap(), |state| state.display_service.is_none())
+            .unwrap();
+        Ok((state.display_service)
+            .as_ref()
+            .cloned()
+            .expect("Display service cannot be None in this context"))
+    }
     fn removeMemlockRlimit(&self) -> binder::Result<()> {
         let pid = get_calling_pid();
         let lim = libc::rlimit { rlim_cur: libc::RLIM_INFINITY, rlim_max: libc::RLIM_INFINITY };
@@ -362,13 +398,17 @@ impl IVirtualizationServiceInternal for VirtualizationServiceInternal {
         Ok(certificate_chain)
     }
 
+    fn isRemoteAttestationSupported(&self) -> binder::Result<bool> {
+        remotely_provisioned_component_service_exists()
+    }
+
     fn getAssignableDevices(&self) -> binder::Result<Vec<AssignableDevice>> {
         check_use_custom_virtual_machine()?;
 
         Ok(get_assignable_devices()?
             .device
             .into_iter()
-            .map(|x| AssignableDevice { node: x.sysfs_path, kind: x.kind })
+            .map(|x| AssignableDevice { node: x.sysfs_path, dtbo_label: x.dtbo_label })
             .collect::<Vec<_>>())
     }
 
@@ -432,6 +472,28 @@ impl IVirtualizationServiceInternal for VirtualizationServiceInternal {
         }
         Ok(())
     }
+
+    fn claimVmInstance(&self, instance_id: &[u8; 64]) -> binder::Result<()> {
+        let state = &mut *self.state.lock().unwrap();
+        if let Some(sk_state) = &mut state.sk_state {
+            let uid = get_calling_uid();
+            info!(
+                "Claiming a VM's instance_id: {:?}, for uid: {:?}",
+                hex::encode(instance_id),
+                uid
+            );
+
+            let user_id = multiuser_get_user_id(uid);
+            let app_id = multiuser_get_app_id(uid);
+            info!("Recording possible new owner of state for (user_id={user_id}, app_id={app_id})");
+            if let Err(e) = sk_state.add_id(instance_id, user_id, app_id) {
+                error!("Failed to update the instance_id owner: {e:?}");
+            }
+        } else {
+            info!("ignoring claimVmInstance() as no ISecretkeeper");
+        }
+        Ok(())
+    }
 }
 
 impl IVirtualizationMaintenance for VirtualizationServiceInternal {
@@ -472,10 +534,8 @@ impl IVirtualizationMaintenance for VirtualizationServiceInternal {
     }
 }
 
-// KEEP IN SYNC WITH assignable_devices.xsd
 #[derive(Debug, Deserialize)]
 struct Device {
-    kind: String,
     dtbo_label: String,
     sysfs_path: String,
 }
@@ -564,6 +624,8 @@ struct GlobalState {
 
     /// State relating to secrets held by (optional) Secretkeeper instance on behalf of VMs.
     sk_state: Option<maintenance::State>,
+
+    display_service: Option<binder::SpIBinder>,
 }
 
 impl GlobalState {
@@ -572,6 +634,7 @@ impl GlobalState {
             held_contexts: HashMap::new(),
             dtbo_file: Mutex::new(None),
             sk_state: maintenance::State::new(),
+            display_service: None,
         }
     }
 

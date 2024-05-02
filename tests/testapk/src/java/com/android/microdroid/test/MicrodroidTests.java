@@ -28,6 +28,8 @@ import static android.system.virtualmachine.VirtualMachineManager.CAPABILITY_PRO
 import static com.google.common.truth.Truth.assertThat;
 import static com.google.common.truth.Truth.assertWithMessage;
 import static com.google.common.truth.TruthJUnit.assume;
+import com.android.virt.vm_attestation.testservice.IAttestationService.AttestationStatus;
+import com.android.virt.vm_attestation.testservice.IAttestationService.SigningResult;
 
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
@@ -35,6 +37,7 @@ import static org.junit.Assume.assumeFalse;
 import static org.junit.Assume.assumeTrue;
 
 import static java.nio.file.StandardCopyOption.REPLACE_EXISTING;
+import static java.util.stream.Collectors.toList;
 
 import android.app.Instrumentation;
 import android.app.UiAutomation;
@@ -67,6 +70,7 @@ import com.android.microdroid.test.vmshare.IVmShareTestService;
 import com.android.microdroid.testservice.IAppCallback;
 import com.android.microdroid.testservice.ITestService;
 import com.android.microdroid.testservice.IVmCallback;
+import com.android.virt.vm_attestation.util.X509Utils;
 
 import com.google.common.base.Strings;
 import com.google.common.truth.BooleanSubject;
@@ -94,6 +98,7 @@ import java.io.Writer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.security.cert.X509Certificate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -106,6 +111,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Stream;
 
 import co.nstant.in.cbor.CborDecoder;
 import co.nstant.in.cbor.model.Array;
@@ -115,6 +121,9 @@ import co.nstant.in.cbor.model.MajorType;
 @RunWith(Parameterized.class)
 public class MicrodroidTests extends MicrodroidDeviceTestBase {
     private static final String TAG = "MicrodroidTests";
+    private static final String TEST_APP_PACKAGE_NAME = "com.android.microdroid.test";
+    private static final String VM_ATTESTATION_PAYLOAD_PATH = "libvm_attestation_test_payload.so";
+    private static final String VM_ATTESTATION_MESSAGE = "Hello RKP from AVF!";
 
     @Rule public Timeout globalTimeout = Timeout.seconds(300);
 
@@ -206,6 +215,78 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
     @CddTest(requirements = {"9.17/C-1-1", "9.17/C-2-1"})
     public void createAndConnectToVm_HostCpuTopology() throws Exception {
         createAndConnectToVmHelper(CPU_TOPOLOGY_MATCH_HOST);
+    }
+
+    @Test
+    @CddTest(requirements = {"9.17/C-1-1", "9.17/C-2-1"})
+    public void vmAttestationWhenRemoteAttestationIsNotSupported() throws Exception {
+        // pVM remote attestation is only supported on protected VMs.
+        assumeProtectedVM();
+        assumeFeatureEnabled(VirtualMachineManager.FEATURE_REMOTE_ATTESTATION);
+        assume().withMessage(
+                        "This test does not apply to a device that supports Remote Attestation")
+                .that(getVirtualMachineManager().isRemoteAttestationSupported())
+                .isFalse();
+        VirtualMachineConfig config =
+                newVmConfigBuilderWithPayloadBinary(VM_ATTESTATION_PAYLOAD_PATH)
+                        .setProtectedVm(mProtectedVm)
+                        .setDebugLevel(DEBUG_LEVEL_FULL)
+                        .build();
+        VirtualMachine vm =
+                forceCreateNewVirtualMachine("cts_attestation_with_rkpd_unsupported", config);
+        byte[] challenge = new byte[32];
+        Arrays.fill(challenge, (byte) 0xcc);
+
+        // Act.
+        SigningResult signingResult =
+                runVmAttestationService(TAG, vm, challenge, VM_ATTESTATION_MESSAGE.getBytes());
+
+        // Assert.
+        assertThat(signingResult.status).isEqualTo(AttestationStatus.ERROR_UNSUPPORTED);
+    }
+
+    @Test
+    @CddTest(requirements = {"9.17/C-1-1", "9.17/C-2-1"})
+    public void vmAttestationWhenRemoteAttestationIsSupported() throws Exception {
+        // pVM remote attestation is only supported on protected VMs.
+        assumeProtectedVM();
+        assumeFeatureEnabled(VirtualMachineManager.FEATURE_REMOTE_ATTESTATION);
+        assume().withMessage("Test needs Remote Attestation support")
+                .that(getVirtualMachineManager().isRemoteAttestationSupported())
+                .isTrue();
+        VirtualMachineConfig config =
+                newVmConfigBuilderWithPayloadBinary(VM_ATTESTATION_PAYLOAD_PATH)
+                        .setProtectedVm(mProtectedVm)
+                        .setDebugLevel(DEBUG_LEVEL_FULL)
+                        .build();
+        VirtualMachine vm =
+                forceCreateNewVirtualMachine("cts_attestation_with_rkpd_supported", config);
+
+        // Check with an invalid challenge.
+        byte[] invalidChallenge = new byte[65];
+        Arrays.fill(invalidChallenge, (byte) 0xbb);
+        SigningResult signingResultInvalidChallenge =
+                runVmAttestationService(
+                        TAG, vm, invalidChallenge, VM_ATTESTATION_MESSAGE.getBytes());
+        assertThat(signingResultInvalidChallenge.status)
+                .isEqualTo(AttestationStatus.ERROR_INVALID_CHALLENGE);
+
+        // Check with a valid challenge.
+        byte[] challenge = new byte[32];
+        Arrays.fill(challenge, (byte) 0xac);
+        SigningResult signingResult =
+                runVmAttestationService(TAG, vm, challenge, VM_ATTESTATION_MESSAGE.getBytes());
+        assertWithMessage(
+                        "VM attestation should either succeed or fail when the network is unstable")
+                .that(signingResult.status)
+                .isAnyOf(AttestationStatus.OK, AttestationStatus.ERROR_ATTESTATION_FAILED);
+        if (signingResult.status == AttestationStatus.OK) {
+            X509Certificate[] certs =
+                    X509Utils.validateAndParseX509CertChain(signingResult.certificateChain);
+            X509Utils.verifyAvfRelatedCerts(certs, challenge, TEST_APP_PACKAGE_NAME);
+            X509Utils.verifySignature(
+                    certs[0], VM_ATTESTATION_MESSAGE.getBytes(), signingResult.signature);
+        }
     }
 
     @Test
@@ -976,6 +1057,51 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
         changeDebugLevel(DEBUG_LEVEL_NONE, DEBUG_LEVEL_FULL);
     }
 
+    // Copy the Vm directory, creating the target Vm directory if it does not already exist.
+    private void copyVmDirectory(String sourceVmName, String targetVmName) throws IOException {
+        Path sourceVm = getVmDirectory(sourceVmName);
+        Path targetVm = getVmDirectory(targetVmName);
+        if (!Files.exists(targetVm)) {
+            Files.createDirectories(targetVm);
+        }
+
+        try (Stream<Path> stream = Files.list(sourceVm)) {
+            for (Path f : stream.collect(toList())) {
+                Files.copy(f, targetVm.resolve(f.getFileName()), REPLACE_EXISTING);
+            }
+        }
+    }
+
+    private Path getVmDirectory(String vmName) {
+        Context context = getContext();
+        Path filePath = Paths.get(context.getDataDir().getPath(), "vm", vmName);
+        return filePath;
+    }
+
+    // Create a fresh VM with the given `vmName`, instance_id & instance.img. This function creates
+    // a Vm with a different temporary name & copies it to target VM directory. This ensures this
+    // VM is not in cache of `VirtualMachineManager` which makes it possible to modify underlying
+    // files.
+    private void createUncachedVmWithName(
+            String vmName, VirtualMachineConfig config, File vmIdBackup, File vmInstanceBackup)
+            throws Exception {
+        deleteVirtualMachineIfExists(vmName);
+        forceCreateNewVirtualMachine("test_vm_tmp", config);
+        copyVmDirectory("test_vm_tmp", vmName);
+        if (vmInstanceBackup != null) {
+            Files.copy(
+                    vmInstanceBackup.toPath(),
+                    getVmFile(vmName, "instance.img").toPath(),
+                    REPLACE_EXISTING);
+        }
+        if (vmIdBackup != null) {
+            Files.copy(
+                    vmIdBackup.toPath(),
+                    getVmFile(vmName, "instance_id").toPath(),
+                    REPLACE_EXISTING);
+        }
+    }
+
     @Test
     @CddTest(requirements = {"9.17/C-1-1", "9.17/C-2-7"})
     public void changingDebuggableVmNonDebuggableInvalidatesVmIdentity() throws Exception {
@@ -995,24 +1121,32 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
         VirtualMachineConfig normalConfig = builder.build();
         assertThat(tryBootVmWithConfig(normalConfig, "test_vm").payloadStarted).isTrue();
 
-        // Try to run the VM again with the previous instance.img
+        // Try to run the VM again with the previous instance
         // We need to make sure that no changes on config don't invalidate the identity, to compare
         // the result with the below "different debug level" test.
+        File vmInstanceBackup = null, vmIdBackup = null;
         File vmInstance = getVmFile("test_vm", "instance.img");
-        File vmInstanceBackup = File.createTempFile("instance", ".img");
-        Files.copy(vmInstance.toPath(), vmInstanceBackup.toPath(), REPLACE_EXISTING);
-        forceCreateNewVirtualMachine("test_vm", normalConfig);
-        Files.copy(vmInstanceBackup.toPath(), vmInstance.toPath(), REPLACE_EXISTING);
-        assertThat(tryBootVm(TAG, "test_vm").payloadStarted).isTrue();
+        File vmId = getVmFile("test_vm", "instance_id");
+        if (vmInstance.exists()) {
+            vmInstanceBackup = File.createTempFile("instance", ".img");
+            Files.copy(vmInstance.toPath(), vmInstanceBackup.toPath(), REPLACE_EXISTING);
+        }
+        if (vmId.exists()) {
+            vmIdBackup = File.createTempFile("instance_id", "backup");
+            Files.copy(vmId.toPath(), vmIdBackup.toPath(), REPLACE_EXISTING);
+        }
+
+        createUncachedVmWithName("test_vm_rerun", normalConfig, vmIdBackup, vmInstanceBackup);
+        assertThat(tryBootVm(TAG, "test_vm_rerun").payloadStarted).isTrue();
 
         // Launch the same VM with a different debug level. The Java API prohibits this
         // (thankfully).
-        // For testing, we do that by creating a new VM with debug level, and copy the old instance
-        // image to the new VM instance image.
+        // For testing, we do that by creating a new VM with debug level, and overwriting the old
+        // instance data to the new VM instance data.
         VirtualMachineConfig debugConfig = builder.setDebugLevel(toLevel).build();
-        forceCreateNewVirtualMachine("test_vm", debugConfig);
-        Files.copy(vmInstanceBackup.toPath(), vmInstance.toPath(), REPLACE_EXISTING);
-        assertThat(tryBootVm(TAG, "test_vm").payloadStarted).isFalse();
+        createUncachedVmWithName(
+                "test_vm_changed_debug_level", debugConfig, vmIdBackup, vmInstanceBackup);
+        assertThat(tryBootVm(TAG, "test_vm_changed_debug_level").payloadStarted).isFalse();
     }
 
     private static class VmCdis {
@@ -1231,6 +1365,8 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
             "9.17/C-2-7"
     })
     public void bootFailsWhenMicrodroidDataIsCompromised() throws Exception {
+        // If Updatable VM is supported => No instance.img required
+        assumeNoUpdatableVmSupport();
         assertThatBootFailsAfterCompromisingPartition(MICRODROID_PARTITION_UUID);
     }
 
@@ -1240,6 +1376,8 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
             "9.17/C-2-7"
     })
     public void bootFailsWhenPvmFwDataIsCompromised() throws Exception {
+        // If Updatable VM is supported => No instance.img required
+        assumeNoUpdatableVmSupport();
         if (mProtectedVm) {
             assertThatBootFailsAfterCompromisingPartition(PVM_FW_PARTITION_UUID);
         } else {
@@ -1452,7 +1590,6 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
             assertFileContentsAreEqualInTwoVms("storage.img", vmNameOrig, vmNameImport);
         }
         assertThat(vmImport).isNotEqualTo(vmOrig);
-        vmm.delete(vmNameOrig);
         assertThat(vmImport).isEqualTo(vmm.get(vmNameImport));
         TestResults testResults =
                 runVmTestService(

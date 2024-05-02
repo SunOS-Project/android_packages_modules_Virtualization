@@ -12,13 +12,17 @@ aidl_interface {
     backend: {
         java: {
             sdk_version: "module_current",
-            apex_available: ["com.android.virt"],
+            apex_available: [
+                "//apex_available:platform",
+                "com.android.virt",
+            ],
         },
         cpp: {
             enabled: true,
         },
         ndk: {
             apex_available: [
+                "//apex_available:platform",
                 "com.android.virt",
                 "com.android.compos",
             ],
@@ -44,10 +48,19 @@ aidl_interface {
     backend: {
         java: {
             sdk_version: "module_current",
+            apex_available: [
+                "com.android.virt",
+            ],
         },
         rust: {
             enabled: true,
             apex_available: [
+                "com.android.virt",
+            ],
+        },
+        ndk: {
+            apex_available: [
+                "//apex_available:platform",
                 "com.android.virt",
             ],
         },
@@ -103,10 +116,14 @@ aidl_interface {
     backend: {
         java: {
             sdk_version: "module_current",
-            apex_available: ["com.android.virt"],
+            apex_available: [
+                "com.android.virt",
+                "//apex_available:platform",
+            ],
         },
         ndk: {
             apex_available: [
+                "//apex_available:platform",
                 "com.android.virt",
                 "com.android.compos",
             ],
