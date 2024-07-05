@@ -159,6 +159,7 @@ pub fn command_run_app(config: RunAppConfig) -> Result<(), Error> {
                 x.to_str().map(String::from).ok_or(anyhow!("Failed to convert {x:?} to String"))
             })
             .collect::<Result<_, _>>()?,
+        networkSupported: config.common.network_supported(),
         ..Default::default()
     };
 
@@ -178,6 +179,7 @@ pub fn command_run_app(config: RunAppConfig) -> Result<(), Error> {
         customConfig: Some(custom_config),
         osName: os_name,
         hugePages: config.common.hugepages,
+        boostUclamp: config.common.boost_uclamp,
     });
     run(
         service.as_ref(),
@@ -259,6 +261,7 @@ pub fn command_run(config: RunCustomVmConfig) -> Result<(), Error> {
     }
     vm_config.cpuTopology = config.common.cpu_topology;
     vm_config.hugePages = config.common.hugepages;
+    vm_config.boostUclamp = config.common.boost_uclamp;
     run(
         get_service()?.as_ref(),
         &VirtualMachineConfig::RawConfig(vm_config),

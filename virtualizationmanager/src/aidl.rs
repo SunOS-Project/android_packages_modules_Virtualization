@@ -14,10 +14,10 @@
 
 //! Implementation of the AIDL interface of the VirtualizationService.
 
-use crate::{get_calling_pid, get_calling_uid};
+use crate::{get_calling_pid, get_calling_uid, get_this_pid};
 use crate::atom::{write_vm_booted_stats, write_vm_creation_stats};
 use crate::composite::make_composite_image;
-use crate::crosvm::{CrosvmConfig, DiskFile, DisplayConfig, InputDeviceOption, PayloadState, VmContext, VmInstance, VmState};
+use crate::crosvm::{CrosvmConfig, DiskFile, DisplayConfig, GpuConfig, InputDeviceOption, PayloadState, VmContext, VmInstance, VmState};
 use crate::debug_config::DebugConfig;
 use crate::dt_overlay::{create_device_tree_overlay, VM_DT_OVERLAY_MAX_SIZE, VM_DT_OVERLAY_PATH};
 use crate::payload::{add_microdroid_payload_images, add_microdroid_system_images, add_microdroid_vendor_image};
@@ -401,69 +401,10 @@ impl VirtualizationService {
             check_gdb_allowed(config)?;
         }
 
-        // Currently, VirtMgr adds the host copy of reference DT & untrusted properties
-        // (e.g. instance-id)
-        let host_ref_dt = Path::new(VM_REFERENCE_DT_ON_HOST_PATH);
-        let host_ref_dt = if host_ref_dt.exists()
-            && read_dir(host_ref_dt).or_service_specific_exception(-1)?.next().is_some()
-        {
-            Some(host_ref_dt)
-        } else {
-            warn!("VM reference DT doesn't exist in host DT");
-            None
-        };
-
-        let vendor_hashtree_digest = extract_vendor_hashtree_digest(config)
-            .context("Failed to extract vendor hashtree digest")
-            .or_service_specific_exception(-1)?;
-
-        let trusted_props = if let Some(ref vendor_hashtree_digest) = vendor_hashtree_digest {
-            info!(
-                "Passing vendor hashtree digest to pvmfw. This will be rejected if it doesn't \
-                match the trusted digest in the pvmfw config, causing the VM to fail to start."
-            );
-            vec![(
-                cstr!("vendor_hashtree_descriptor_root_digest"),
-                vendor_hashtree_digest.as_slice(),
-            )]
-        } else {
-            vec![]
-        };
-
-        let instance_id;
-        let mut untrusted_props = Vec::with_capacity(2);
-        if cfg!(llpvm_changes) {
-            instance_id = extract_instance_id(config);
-            untrusted_props.push((cstr!("instance-id"), &instance_id[..]));
-            let want_updatable = extract_want_updatable(config);
-            if want_updatable && is_secretkeeper_supported() {
-                // Let guest know that it can defer rollback protection to Secretkeeper by setting
-                // an empty property in untrusted node in DT. This enables Updatable VMs.
-                untrusted_props.push((cstr!("defer-rollback-protection"), &[]))
-            }
-        }
-
-        let device_tree_overlay =
-            if host_ref_dt.is_some() || !untrusted_props.is_empty() || !trusted_props.is_empty() {
-                let dt_output = temporary_directory.join(VM_DT_OVERLAY_PATH);
-                let mut data = [0_u8; VM_DT_OVERLAY_MAX_SIZE];
-                let fdt = create_device_tree_overlay(
-                    &mut data,
-                    host_ref_dt,
-                    &untrusted_props,
-                    &trusted_props,
-                )
-                .map_err(|e| anyhow!("Failed to create DT overlay, {e:?}"))
-                .or_service_specific_exception(-1)?;
-                fs::write(&dt_output, fdt.as_slice()).or_service_specific_exception(-1)?;
-                Some(File::open(dt_output).or_service_specific_exception(-1)?)
-            } else {
-                None
-            };
+        let device_tree_overlay = maybe_create_device_tree_overlay(config, &temporary_directory)?;
 
         let debug_config = DebugConfig::new(config);
-
-        let ramdump = if debug_config.is_ramdump_needed() {
+        let ramdump = if !uses_gki_kernel(config) && debug_config.is_ramdump_needed() {
             Some(prepare_ramdump_file(&temporary_directory)?)
         } else {
             None
@@ -594,6 +535,16 @@ impl VirtualizationService {
         } else {
             None
         };
+        let gpu_config = if cfg!(paravirtualized_devices) {
+            config
+                .gpuConfig
+                .as_ref()
+                .map(GpuConfig::new)
+                .transpose()
+                .or_binder_exception(ExceptionCode::ILLEGAL_ARGUMENT)?
+        } else {
+            None
+        };
 
         let input_device_options = if cfg!(paravirtualized_devices) {
             config
@@ -605,6 +556,27 @@ impl VirtualizationService {
         } else {
             vec![]
         };
+
+        // Create TAP network interface if the VM supports network.
+        let tap = if cfg!(network) && config.networkSupported {
+            if *is_protected {
+                return Err(anyhow!("Network feature is not supported for pVM yet"))
+                    .with_log()
+                    .or_binder_exception(ExceptionCode::UNSUPPORTED_OPERATION)?;
+            }
+            Some(File::from(
+                GLOBAL_SERVICE
+                    .createTapInterface(&get_this_pid().to_string())?
+                    .as_ref()
+                    .try_clone()
+                    .context("Failed to get TAP interface from ParcelFileDescriptor")
+                    .or_binder_exception(ExceptionCode::BAD_PARCELABLE)?,
+            ))
+        } else {
+            None
+        };
+        let virtio_snd_backend =
+            if cfg!(paravirtualized_devices) { Some(String::from("aaudio")) } else { None };
 
         // Actually start the VM.
         let crosvm_config = CrosvmConfig {
@@ -634,6 +606,11 @@ impl VirtualizationService {
             display_config,
             input_device_options,
             hugepages: config.hugePages,
+            tap,
+            virtio_snd_backend,
+            console_input_device: config.consoleInputDevice.clone(),
+            boost_uclamp: config.boostUclamp,
+            gpu_config,
         };
         let instance = Arc::new(
             VmInstance::new(
@@ -708,6 +685,67 @@ fn extract_vendor_hashtree_digest(config: &VirtualMachineConfig) -> Result<Optio
     Err(anyhow!("No hashtree digest is extracted from microdroid vendor image"))
 }
 
+fn maybe_create_device_tree_overlay(
+    config: &VirtualMachineConfig,
+    temporary_directory: &Path,
+) -> binder::Result<Option<File>> {
+    // Currently, VirtMgr adds the host copy of reference DT & untrusted properties
+    // (e.g. instance-id)
+    let host_ref_dt = Path::new(VM_REFERENCE_DT_ON_HOST_PATH);
+    let host_ref_dt = if host_ref_dt.exists()
+        && read_dir(host_ref_dt).or_service_specific_exception(-1)?.next().is_some()
+    {
+        Some(host_ref_dt)
+    } else {
+        warn!("VM reference DT doesn't exist in host DT");
+        None
+    };
+
+    let vendor_hashtree_digest = extract_vendor_hashtree_digest(config)
+        .context("Failed to extract vendor hashtree digest")
+        .or_service_specific_exception(-1)?;
+
+    let trusted_props = if let Some(ref vendor_hashtree_digest) = vendor_hashtree_digest {
+        info!(
+            "Passing vendor hashtree digest to pvmfw. This will be rejected if it doesn't \
+                match the trusted digest in the pvmfw config, causing the VM to fail to start."
+        );
+        vec![(cstr!("vendor_hashtree_descriptor_root_digest"), vendor_hashtree_digest.as_slice())]
+    } else {
+        vec![]
+    };
+
+    let instance_id;
+    let mut untrusted_props = Vec::with_capacity(2);
+    if cfg!(llpvm_changes) {
+        instance_id = extract_instance_id(config);
+        untrusted_props.push((cstr!("instance-id"), &instance_id[..]));
+        let want_updatable = extract_want_updatable(config);
+        if want_updatable && is_secretkeeper_supported() {
+            // Let guest know that it can defer rollback protection to Secretkeeper by setting
+            // an empty property in untrusted node in DT. This enables Updatable VMs.
+            untrusted_props.push((cstr!("defer-rollback-protection"), &[]))
+        }
+    }
+
+    let device_tree_overlay = if host_ref_dt.is_some()
+        || !untrusted_props.is_empty()
+        || !trusted_props.is_empty()
+    {
+        let dt_output = temporary_directory.join(VM_DT_OVERLAY_PATH);
+        let mut data = [0_u8; VM_DT_OVERLAY_MAX_SIZE];
+        let fdt =
+            create_device_tree_overlay(&mut data, host_ref_dt, &untrusted_props, &trusted_props)
+                .map_err(|e| anyhow!("Failed to create DT overlay, {e:?}"))
+                .or_service_specific_exception(-1)?;
+        fs::write(&dt_output, fdt.as_slice()).or_service_specific_exception(-1)?;
+        Some(File::open(dt_output).or_service_specific_exception(-1)?)
+    } else {
+        None
+    };
+    Ok(device_tree_overlay)
+}
+
 fn write_zero_filler(zero_filler_path: &Path) -> Result<()> {
     let file = OpenOptions::new()
         .create_new(true)
@@ -756,6 +794,9 @@ fn to_input_device_option_from(input_device: &InputDevice) -> Result<InputDevice
         )?),
         InputDevice::Keyboard(keyboard) => InputDeviceOption::Keyboard(clone_file(
             keyboard.pfd.as_ref().ok_or(anyhow!("pfd should have value"))?,
+        )?),
+        InputDevice::Mouse(mouse) => InputDeviceOption::Mouse(clone_file(
+            mouse.pfd.as_ref().ok_or(anyhow!("pfd should have value"))?,
         )?),
     })
 }
@@ -842,6 +883,16 @@ fn is_valid_os(os_name: &str) -> bool {
     SUPPORTED_OS_NAMES.contains(os_name)
 }
 
+fn uses_gki_kernel(config: &VirtualMachineConfig) -> bool {
+    if !cfg!(vendor_modules) {
+        return false;
+    }
+    match config {
+        VirtualMachineConfig::RawConfig(_) => false,
+        VirtualMachineConfig::AppConfig(config) => config.osName.starts_with("microdroid_gki-"),
+    }
+}
+
 fn load_app_config(
     config: &VirtualMachineAppConfig,
     debug_config: &DebugConfig,
@@ -910,6 +961,7 @@ fn load_app_config(
         }
 
         vm_config.devices.clone_from(&custom_config.devices);
+        vm_config.networkSupported = custom_config.networkSupported;
     }
 
     if config.memoryMib > 0 {
@@ -920,6 +972,7 @@ fn load_app_config(
     vm_config.protectedVm = config.protectedVm;
     vm_config.cpuTopology = config.cpuTopology;
     vm_config.hugePages = config.hugePages || vm_payload_config.hugepages;
+    vm_config.boostUclamp = config.boostUclamp;
 
     // Microdroid takes additional init ramdisk & (optionally) storage image
     add_microdroid_system_images(config, instance_file, storage_image, os_name, &mut vm_config)?;
@@ -1033,7 +1086,7 @@ fn check_permission(perm: &str) -> binder::Result<()> {
         return Ok(());
     }
     let perm_svc: Strong<dyn IPermissionController::IPermissionController> =
-        binder::get_interface("permission")?;
+        binder::wait_for_interface("permission")?;
     if perm_svc.checkPermission(perm, calling_pid, calling_uid as i32)? {
         Ok(())
     } else {

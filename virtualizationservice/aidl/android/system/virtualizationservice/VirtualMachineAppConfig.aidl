@@ -124,6 +124,9 @@ parcelable VirtualMachineAppConfig {
          * should rarely need to be set false.
          */
         boolean wantUpdatable = true;
+
+        /** Whether the VM should have network feature. */
+        boolean networkSupported;
     }
 
     /** Configuration parameters guarded by android.permission.USE_CUSTOM_VIRTUAL_MACHINE */
@@ -136,4 +139,7 @@ parcelable VirtualMachineAppConfig {
      *  https://docs.kernel.org/admin-guide/mm/transhuge.html
      */
     boolean hugePages;
+
+    /** Enable boost UClamp for less variance during testing/benchmarking */
+    boolean boostUclamp;
 }

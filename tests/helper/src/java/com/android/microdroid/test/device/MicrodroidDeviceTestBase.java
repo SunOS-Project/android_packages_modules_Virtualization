@@ -20,8 +20,8 @@ import static android.content.pm.PackageManager.FEATURE_VIRTUALIZATION_FRAMEWORK
 import static com.google.common.truth.Truth.assertThat;
 import static com.google.common.truth.TruthJUnit.assume;
 
-import static org.junit.Assume.assumeTrue;
 import static org.junit.Assume.assumeFalse;
+import static org.junit.Assume.assumeTrue;
 
 import android.app.Instrumentation;
 import android.app.UiAutomation;
@@ -73,6 +73,10 @@ public abstract class MicrodroidDeviceTestBase {
 
     public static boolean isCuttlefish() {
         return getDeviceProperties().isCuttlefish();
+    }
+
+    private static boolean isCuttlefishArm64() {
+        return getDeviceProperties().isCuttlefishArm64();
     }
 
     public static boolean isHwasan() {
@@ -187,6 +191,9 @@ public abstract class MicrodroidDeviceTestBase {
             assume().withMessage("Skip where protected VMs aren't supported")
                     .that(capabilities & VirtualMachineManager.CAPABILITY_PROTECTED_VM)
                     .isNotEqualTo(0);
+            assume().withMessage("Testing protected VMs on GSI isn't supported. b/272443823")
+                    .that(isGsi())
+                    .isFalse();
         } else {
             assume().withMessage("Skip where VMs aren't supported")
                     .that(capabilities & VirtualMachineManager.CAPABILITY_NON_PROTECTED_VM)
@@ -207,17 +214,32 @@ public abstract class MicrodroidDeviceTestBase {
         assume().withMessage("Device doesn't support AVF")
                 .that(mCtx.getPackageManager().hasSystemFeature(FEATURE_VIRTUALIZATION_FRAMEWORK))
                 .isTrue();
-        int vendorApiLevel = SystemProperties.getInt("ro.vendor.api_level", 0);
-        boolean isGsi = new File("/system/system_ext/etc/init/init.gsi.rc").exists();
+        int vendorApiLevel = getVendorApiLevel();
+        boolean isGsi = isGsi();
+        Log.i(TAG, "isGsi = " + isGsi + ", vendor api level = " + vendorApiLevel);
         assume().withMessage("GSI with vendor API level < 202404 may not support AVF")
                 .that(isGsi && vendorApiLevel < 202404)
                 .isFalse();
+    }
+
+    protected boolean isGsi() {
+        return new File("/system/system_ext/etc/init/init.gsi.rc").exists();
+    }
+
+    protected static int getVendorApiLevel() {
+        return SystemProperties.getInt("ro.board.api_level", 0);
     }
 
     protected void assumeSupportedDevice() {
         assume().withMessage("Skip on 5.4 kernel. b/218303240")
                 .that(KERNEL_VERSION)
                 .isNotEqualTo("5.4");
+
+        // Cuttlefish on Arm 64 doesn't and cannot support any form of virtualization, so there's
+        // no point running any of these tests.
+        assume().withMessage("Virtualization not supported on Arm64 Cuttlefish. b/341889915")
+                .that(isCuttlefishArm64())
+                .isFalse();
     }
 
     protected void assumeNoUpdatableVmSupport() throws VirtualMachineException {

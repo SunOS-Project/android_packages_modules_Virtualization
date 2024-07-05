@@ -57,6 +57,8 @@ cc_defaults {
         hwaddress: false,
     },
     native_coverage: false,
+    // TODO(b/346974429): Workaround pvmfw failure when enabling full LTO
+    lto_O0: true,
 }
 
 // Used by cc_binary when producing the ELF of a vmbase-based binary.
@@ -79,13 +81,14 @@ rust_library_rlib {
         "libbuddy_system_allocator",
         "libcstr",
         "libfdtpci",
-        "libhyp",
         "liblibfdt",
         "liblog_rust_nostd",
         "libonce_cell_nostd",
         "libsmccc",
         "libspin_nostd",
+        "libstatic_assertions",
         "libtinyvec_nostd",
+        "libuuid_nostd",
         "libvirtio_drivers",
         "libzerocopy_nostd",
         "libzeroize_nostd",
@@ -93,7 +96,9 @@ rust_library_rlib {
     whole_static_libs: [
         "librust_baremetal",
     ],
+    // TODO(b/277859415, b/277860860): Drop "compat_android_13".
     features: [
+        "compat_android_13",
         "cpu_feat_hafdbs",
     ],
 }

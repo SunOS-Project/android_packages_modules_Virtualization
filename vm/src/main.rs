@@ -60,6 +60,27 @@ pub struct CommonConfig {
     /// https://docs.kernel.org/admin-guide/mm/transhuge.html
     #[arg(short, long)]
     hugepages: bool,
+
+    /// Run VM with network feature.
+    #[cfg(network)]
+    #[arg(short, long)]
+    network_supported: bool,
+
+    /// Boost uclamp to stablise results for benchmarks.
+    #[arg(short, long)]
+    boost_uclamp: bool,
+}
+
+impl CommonConfig {
+    #[cfg(network)]
+    fn network_supported(&self) -> bool {
+        self.network_supported
+    }
+
+    #[cfg(not(network))]
+    fn network_supported(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Args, Default)]
