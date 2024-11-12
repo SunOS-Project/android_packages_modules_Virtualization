@@ -151,7 +151,6 @@ avf_flag_aware_apex_defaults {
         "vm",
     ],
     prebuilts: [
-        "features_com.android.virt.xml",
         "microdroid_initrd_debuggable",
         "microdroid_initrd_normal",
         "microdroid.json",
