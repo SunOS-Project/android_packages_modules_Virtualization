@@ -248,8 +248,7 @@ pub(crate) unsafe trait Libfdt {
         let prop = unsafe { libfdt_bindgen::fdt_get_property_by_offset(fdt, offset, &mut len) };
 
         let data_len = FdtRawResult::from(len).try_into()?;
-        // TODO(stable_feature(offset_of)): mem::offset_of!(fdt_property, data).
-        let data_offset = memoffset::offset_of!(libfdt_bindgen::fdt_property, data);
+        let data_offset = mem::offset_of!(libfdt_bindgen::fdt_property, data);
         let len = data_offset.checked_add(data_len).ok_or(FdtError::Internal)?;
 
         if !is_aligned(prop) || get_slice_at_ptr(self.as_fdt_slice(), prop.cast(), len).is_none() {
@@ -293,7 +292,7 @@ pub(crate) unsafe trait Libfdt {
         // SAFETY: Accesses (read-only) are constrained to the DT totalsize.
         let ret = unsafe { libfdt_bindgen::fdt_find_max_phandle(fdt, &mut phandle) };
 
-        FdtRawResult::from(ret).try_into()?;
+        () = FdtRawResult::from(ret).try_into()?;
 
         phandle.try_into()
     }
@@ -391,7 +390,7 @@ pub(crate) unsafe trait LibfdtMut {
             // SAFETY: Accesses are constrained to the DT totalsize (validated by ctor).
             unsafe { libfdt_bindgen::fdt_setprop_placeholder(fdt, node, name, len, &mut data) };
 
-        FdtRawResult::from(ret).try_into()?;
+        () = FdtRawResult::from(ret).try_into()?;
 
         get_mut_slice_at_ptr(self.as_fdt_slice_mut(), data.cast(), size).ok_or(FdtError::Internal)
     }

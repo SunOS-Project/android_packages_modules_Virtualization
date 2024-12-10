@@ -205,6 +205,18 @@ Here's example.
 * `<sysfs_path>`: Sysfs path of the device in host, used to bind to the VFIO
   driver. Must be non-empty and unique in the XML.
 
+### List support assignable devices
+
+In order to query list of the devices that can be assigned to a pVM, run the
+following command:
+
+```bash
+adb shell /apex/com.android.virt/bin/vm info
+```
+
+All supported assignable devices will be located under the "Assignable devices:"
+section of the output.
+
 ## Boot with VM DTBO
 
 Bootloader should provide VM DTBO to both Android and pvmfw.
@@ -221,7 +233,7 @@ For protected VM, bootloader must provide VM DTBO to the pvmfw. pvmfw sanitizes
 incoming device tree with the VM DTBO.
 
 For more detail about providing VM DTBO in pvmfw,
-see: [pvmfw/README.md](../pvmfw/README.md#configuration-data-format)
+see: [pvmfw/README.md](../guest/pvmfw/README.md#configuration-data-format)
 
 
 ## Launch VM with device assignment

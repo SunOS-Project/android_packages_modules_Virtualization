@@ -37,6 +37,7 @@ import static org.junit.Assume.assumeTrue;
 import static java.nio.file.StandardCopyOption.REPLACE_EXISTING;
 import static java.util.stream.Collectors.toList;
 
+import android.app.ActivityManager;
 import android.app.Instrumentation;
 import android.app.UiAutomation;
 import android.content.ComponentName;
@@ -197,6 +198,7 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
                             tr.mSublibRunProp = ts.readProperty("debug.microdroid.app.sublib.run");
                             tr.mApkContentsPath = ts.getApkContentsPath();
                             tr.mEncryptedStoragePath = ts.getEncryptedStoragePath();
+                            tr.mInstanceSecret = ts.insecurelyExposeVmInstanceSecret();
                         });
         testResults.assertNoException();
         assertThat(testResults.mAddInteger).isEqualTo(123 + 456);
@@ -204,6 +206,7 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
         assertThat(testResults.mSublibRunProp).isEqualTo("true");
         assertThat(testResults.mApkContentsPath).isEqualTo("/mnt/apk");
         assertThat(testResults.mEncryptedStoragePath).isEqualTo("");
+        assertThat(testResults.mInstanceSecret).hasLength(32);
     }
 
     @Test
@@ -332,6 +335,7 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
         testResults.assertNoException();
         assertThat(testResults.mAddInteger).isEqualTo(37 + 73);
     }
+
     @Test
     @CddTest(requirements = {"9.17/C-1-1"})
     public void autoCloseVm() throws Exception {
@@ -574,7 +578,6 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
         assertThat(minimal.getEncryptedStorageBytes()).isEqualTo(0);
         assertThat(minimal.isVmOutputCaptured()).isFalse();
         assertThat(minimal.getOs()).isEqualTo("microdroid");
-        assertThat(minimal.isNetworkSupported()).isFalse();
 
         // Maximal has everything that can be set to some non-default value. (And has different
         // values than minimal for the required fields.)
@@ -591,9 +594,6 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
                         .setEncryptedStorageBytes(1_000_000)
                         .setVmOutputCaptured(true)
                         .setOs("microdroid_gki-android14-6.1");
-        if (!mProtectedVm) {
-            maximalBuilder.setNetworkSupported(true);
-        }
         VirtualMachineConfig maximal = maximalBuilder.build();
 
         assertThat(maximal.getApkPath()).isEqualTo("/apk/path");
@@ -610,9 +610,6 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
         assertThat(maximal.getEncryptedStorageBytes()).isEqualTo(1_000_000);
         assertThat(maximal.isVmOutputCaptured()).isTrue();
         assertThat(maximal.getOs()).isEqualTo("microdroid_gki-android14-6.1");
-        if (!mProtectedVm) {
-            assertThat(maximal.isNetworkSupported()).isTrue();
-        }
 
         assertThat(minimal.isCompatibleWith(maximal)).isFalse();
         assertThat(minimal.isCompatibleWith(minimal)).isTrue();
@@ -667,18 +664,6 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
                         .setVmConsoleInputSupported(true);
         e = assertThrows(IllegalStateException.class, () -> captureInputOnNonDebuggable.build());
         assertThat(e).hasMessageThat().contains("debug level must be FULL to use console input");
-
-        if (mProtectedVm) {
-            VirtualMachineConfig.Builder networkSupportedOnProtectedVm =
-                    newVmConfigBuilderWithPayloadBinary("binary.so")
-                            .setProtectedVm(mProtectedVm)
-                            .setNetworkSupported(true);
-            e =
-                    assertThrows(
-                            IllegalStateException.class,
-                            () -> networkSupportedOnProtectedVm.build());
-            assertThat(e).hasMessageThat().contains("network is not supported on pVM");
-        }
     }
 
     @Test
@@ -753,7 +738,6 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
         VirtualMachineConfig.Builder otherOsBuilder =
                 newBaselineBuilder().setOs("microdroid_gki-android14-6.1");
         assertConfigCompatible(microdroidOsConfig, otherOsBuilder).isFalse();
-
     }
 
     private VirtualMachineConfig.Builder newBaselineBuilder() {
@@ -886,11 +870,12 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
     }
 
     @Test
-    @CddTest(requirements = {
-            "9.17/C-1-1",
-            "9.17/C-1-2",
-            "9.17/C-1-4",
-    })
+    @CddTest(
+            requirements = {
+                "9.17/C-1-1",
+                "9.17/C-1-2",
+                "9.17/C-1-4",
+            })
     public void createVmWithConfigRequiresPermission() throws Exception {
         assumeSupportedDevice();
         revokePermission(VirtualMachine.USE_CUSTOM_VIRTUAL_MACHINE_PERMISSION);
@@ -906,14 +891,16 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
         SecurityException e =
                 assertThrows(
                         SecurityException.class, () -> runVmTestService(TAG, vm, (ts, tr) -> {}));
-        assertThat(e).hasMessageThat()
+        assertThat(e)
+                .hasMessageThat()
                 .contains("android.permission.USE_CUSTOM_VIRTUAL_MACHINE permission");
     }
 
     @Test
-    @CddTest(requirements = {
-            "9.17/C-1-1",
-    })
+    @CddTest(
+            requirements = {
+                "9.17/C-1-1",
+            })
     public void deleteVm() throws Exception {
         assumeSupportedDevice();
 
@@ -970,9 +957,10 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
     }
 
     @Test
-    @CddTest(requirements = {
-            "9.17/C-1-1",
-    })
+    @CddTest(
+            requirements = {
+                "9.17/C-1-1",
+            })
     public void validApkPathIsAccepted() throws Exception {
         assumeSupportedDevice();
 
@@ -1005,10 +993,7 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
     }
 
     @Test
-    @CddTest(requirements = {
-            "9.17/C-1-1",
-            "9.17/C-2-1"
-    })
+    @CddTest(requirements = {"9.17/C-1-1", "9.17/C-2-1"})
     public void extraApk() throws Exception {
         assumeSupportedDevice();
 
@@ -1060,7 +1045,7 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
 
     @Test
     public void bootFailsWhenLowMem() throws Exception {
-        for (int memMib : new int[]{ 10, 20, 40 }) {
+        for (int memMib : new int[] {10, 20, 40}) {
             VirtualMachineConfig lowMemConfig =
                     newVmConfigBuilderWithPayloadBinary("MicrodroidTestNativeLib.so")
                             .setMemoryBytes(memMib)
@@ -1077,8 +1062,9 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
                             onPayloadReadyExecuted.complete(true);
                             super.onPayloadReady(vm);
                         }
+
                         @Override
-                        public void onStopped(VirtualMachine vm,  int reason) {
+                        public void onStopped(VirtualMachine vm, int reason) {
                             onStoppedExecuted.complete(true);
                             super.onStopped(vm, reason);
                         }
@@ -1226,16 +1212,14 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
     }
 
     @Test
-    @CddTest(requirements = {
-            "9.17/C-1-1",
-            "9.17/C-2-7"
-    })
+    @CddTest(requirements = {"9.17/C-1-1", "9.17/C-2-7"})
     public void instancesOfSameVmHaveDifferentCdis() throws Exception {
         assumeSupportedDevice();
         // TODO(b/325094712): VMs on CF with same payload have the same secret. This is because
         // `instance-id` which is input to DICE is contained in DT which is missing in CF.
         assumeFalse(
-                "Cuttlefish doesn't support device tree under /proc/device-tree", isCuttlefish());
+                "Cuttlefish/Goldfish doesn't support device tree under /proc/device-tree",
+                isCuttlefish() || isGoldfish());
 
         grantPermission(VirtualMachine.USE_CUSTOM_VIRTUAL_MACHINE_PERMISSION);
         VirtualMachineConfig normalConfig =
@@ -1255,10 +1239,7 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
     }
 
     @Test
-    @CddTest(requirements = {
-            "9.17/C-1-1",
-            "9.17/C-2-7"
-    })
+    @CddTest(requirements = {"9.17/C-1-1", "9.17/C-2-7"})
     public void sameInstanceKeepsSameCdis() throws Exception {
         assumeSupportedDevice();
         assume().withMessage("Skip on CF. Too Slow. b/257270529").that(isCuttlefish()).isFalse();
@@ -1313,7 +1294,7 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
                 // then pvmfw, vm_entry (Microdroid kernel) and Microdroid payload entries.
                 // Before Android V we did not require that vendor code contain any DICE entries
                 // preceding pvmfw, so the minimum is one less.
-                int minDiceChainSize = getVendorApiLevel() >= 202404 ? 5 : 4;
+                int minDiceChainSize = getVendorApiLevel() > 202404 ? 5 : 4;
                 assertThat(diceChainSize).isAtLeast(minDiceChainSize);
             } else {
                 // pvmfw truncates the DICE chain it gets, so we expect exactly entries for
@@ -1324,10 +1305,41 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
     }
 
     @Test
-    @CddTest(requirements = {
-            "9.17/C-1-1",
-            "9.17/C-1-2"
-    })
+    @VsrTest(requirements = {"VSR-7.1-001.004"})
+    public void protectedVmHasValidDiceChain() throws Exception {
+        // This test validates two things regarding the pVM DICE chain:
+        // 1. The DICE chain is well-formed that all the entries conform to the DICE spec.
+        // 2. Each entry in the DICE chain is signed by the previous entry's subject public key.
+        assumeSupportedDevice();
+        assumeProtectedVM();
+        assumeVsrCompliant();
+        assumeTrue("Vendor API must be newer than 202404", getVendorApiLevel() > 202404);
+
+        grantPermission(VirtualMachine.USE_CUSTOM_VIRTUAL_MACHINE_PERMISSION);
+        VirtualMachineConfig config =
+                newVmConfigBuilderWithPayloadConfig("assets/vm_config.json")
+                        .setDebugLevel(DEBUG_LEVEL_NONE)
+                        .build();
+        VirtualMachine vm = forceCreateNewVirtualMachine("bcc_vm_for_vsr", config);
+        TestResults testResults =
+                runVmTestService(
+                        TAG,
+                        vm,
+                        (service, results) -> {
+                            results.mBcc = service.getBcc();
+                        });
+        testResults.assertNoException();
+        byte[] bccBytes = testResults.mBcc;
+        assertThat(bccBytes).isNotNull();
+
+        String buildType = SystemProperties.get("ro.build.type");
+        boolean nonUserBuild = !buildType.isEmpty() && buildType != "user";
+
+        assertThat(HwTrustJni.validateDiceChain(bccBytes, nonUserBuild)).isTrue();
+    }
+
+    @Test
+    @CddTest(requirements = {"9.17/C-1-1", "9.17/C-1-2"})
     public void accessToCdisIsRestricted() throws Exception {
         assumeSupportedDevice();
 
@@ -1384,8 +1396,7 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
 
     private void assertThatPartitionIsMissing(UUID partitionUuid) throws Exception {
         RandomAccessFile instanceFile = prepareInstanceImage("test_vm_integrity");
-        assertThat(findPartitionDataOffset(instanceFile, partitionUuid).isPresent())
-                .isFalse();
+        assertThat(findPartitionDataOffset(instanceFile, partitionUuid).isPresent()).isFalse();
     }
 
     // Flips a bit of given partition, and then see if boot fails.
@@ -1405,10 +1416,7 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
     }
 
     @Test
-    @CddTest(requirements = {
-            "9.17/C-1-1",
-            "9.17/C-2-7"
-    })
+    @CddTest(requirements = {"9.17/C-1-1", "9.17/C-2-7"})
     public void bootFailsWhenMicrodroidDataIsCompromised() throws Exception {
         // If Updatable VM is supported => No instance.img required
         assumeNoUpdatableVmSupport();
@@ -1416,10 +1424,7 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
     }
 
     @Test
-    @CddTest(requirements = {
-            "9.17/C-1-1",
-            "9.17/C-2-7"
-    })
+    @CddTest(requirements = {"9.17/C-1-1", "9.17/C-2-7"})
     public void bootFailsWhenPvmFwDataIsCompromised() throws Exception {
         // If Updatable VM is supported => No instance.img required
         assumeNoUpdatableVmSupport();
@@ -1441,8 +1446,8 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
 
         BootResult bootResult = tryBootVmWithConfig(config, "test_vm_invalid_config");
         assertThat(bootResult.payloadStarted).isFalse();
-        assertThat(bootResult.deathReason).isEqualTo(
-                VirtualMachineCallback.STOP_REASON_MICRODROID_INVALID_PAYLOAD_CONFIG);
+        assertThat(bootResult.deathReason)
+                .isEqualTo(VirtualMachineCallback.STOP_REASON_MICRODROID_INVALID_PAYLOAD_CONFIG);
     }
 
     @Test
@@ -1679,7 +1684,8 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
         // TODO(b/325094712): VMs on CF with same payload have the same secret. This is because
         // `instance-id` which is input to DICE is contained in DT which is missing in CF.
         assumeFalse(
-                "Cuttlefish doesn't support device tree under /proc/device-tree", isCuttlefish());
+                "Cuttlefish/Goldfish doesn't support device tree under /proc/device-tree",
+                isCuttlefish() || isGoldfish());
 
         VirtualMachineConfig config =
                 newVmConfigBuilderWithPayloadBinary("MicrodroidTestNativeLib.so")
@@ -2127,7 +2133,6 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
         IVmShareTestService service = connection.waitForService();
         assertWithMessage("Timed out connecting to " + serviceIntent).that(service).isNotNull();
 
-
         try {
             ITestService testServiceProxy = transferAndStartVm(service, vmDesc, "vm_to_share");
 
@@ -2304,6 +2309,7 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
     @Test
     @VsrTest(requirements = {"VSR-7.1-001.003"})
     public void kernelVersionRequirement() throws Exception {
+        assumeVsrCompliant();
         int firstApiLevel = SystemProperties.getInt("ro.product.first_api_level", 0);
         assume().withMessage("Skip on devices launched before Android 14 (API level 34)")
                 .that(firstApiLevel)
@@ -2320,47 +2326,61 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
         }
     }
 
-    private VirtualMachineConfig buildVmConfigWithNetworkSupported() throws Exception {
-        return buildVmConfigWithNetworkSupported("MicrodroidTestNativeLib.so");
-    }
+    @Test
+    public void createAndRunRustVm() throws Exception {
+        // This test is here mostly to exercise the Rust wrapper around the VM Payload API.
+        // We're testing the same functionality as in other tests, the only difference is
+        // that the payload is written in Rust.
 
-    private VirtualMachineConfig buildVmConfigWithNetworkSupported(String binaryPath)
-            throws Exception {
         assumeSupportedDevice();
-        assumeNonProtectedVM();
-        assumeFeatureEnabled(VirtualMachineManager.FEATURE_NETWORK);
+
         VirtualMachineConfig config =
-                newVmConfigBuilderWithPayloadBinary(binaryPath)
-                        .setNetworkSupported(true)
+                newVmConfigBuilderWithPayloadBinary("libmicrodroid_testlib_rust.so")
+                        .setMemoryBytes(minMemoryRequired())
                         .setDebugLevel(DEBUG_LEVEL_FULL)
                         .build();
-        grantPermission(VirtualMachine.USE_CUSTOM_VIRTUAL_MACHINE_PERMISSION);
-        return config;
+        VirtualMachine vm = forceCreateNewVirtualMachine("rust_vm", config);
+
+        TestResults testResults =
+                runVmTestService(
+                        TAG,
+                        vm,
+                        (ts, tr) -> {
+                            tr.mAddInteger = ts.addInteger(37, 73);
+                            tr.mApkContentsPath = ts.getApkContentsPath();
+                            tr.mEncryptedStoragePath = ts.getEncryptedStoragePath();
+                            tr.mInstanceSecret = ts.insecurelyExposeVmInstanceSecret();
+                        });
+        testResults.assertNoException();
+        assertThat(testResults.mAddInteger).isEqualTo(37 + 73);
+        assertThat(testResults.mApkContentsPath).isEqualTo("/mnt/apk");
+        assertThat(testResults.mEncryptedStoragePath).isEqualTo("");
+        assertThat(testResults.mInstanceSecret).hasLength(32);
     }
 
     @Test
-    public void configuringNetworkSupportedRequiresCustomPermission() throws Exception {
-        VirtualMachineConfig config = buildVmConfigWithNetworkSupported();
-        revokePermission(VirtualMachine.USE_CUSTOM_VIRTUAL_MACHINE_PERMISSION);
+    public void createAndRunRustVmWithEncryptedStorage() throws Exception {
+        // This test is here mostly to exercise the Rust wrapper around the VM Payload API.
+        // We're testing the same functionality as in other tests, the only difference is
+        // that the payload is written in Rust.
 
-        VirtualMachine vm =
-                forceCreateNewVirtualMachine(
-                        "test_network_supported_req_custom_permission", config);
-        SecurityException e =
-                assertThrows(
-                        SecurityException.class, () -> runVmTestService(TAG, vm, (ts, tr) -> {}));
-        assertThat(e)
-                .hasMessageThat()
-                .contains("android.permission.USE_CUSTOM_VIRTUAL_MACHINE permission");
-    }
+        assumeSupportedDevice();
 
-    @Test
-    public void bootsWithNetworkSupported() throws Exception {
-        VirtualMachineConfig config = buildVmConfigWithNetworkSupported();
+        VirtualMachineConfig config =
+                newVmConfigBuilderWithPayloadBinary("libmicrodroid_testlib_rust.so")
+                        .setMemoryBytes(minMemoryRequired())
+                        .setDebugLevel(DEBUG_LEVEL_FULL)
+                        .setEncryptedStorageBytes(ENCRYPTED_STORAGE_BYTES)
+                        .build();
+        VirtualMachine vm = forceCreateNewVirtualMachine("rust_vm", config);
 
-        VirtualMachine vm =
-                forceCreateNewVirtualMachine("test_boot_with_network_supported", config);
-        runVmTestService(TAG, vm, (ts, tr) -> {}).assertNoException();
+        TestResults testResults =
+                runVmTestService(
+                        TAG,
+                        vm,
+                        (ts, tr) -> tr.mEncryptedStoragePath = ts.getEncryptedStoragePath());
+        testResults.assertNoException();
+        assertThat(testResults.mEncryptedStoragePath).isEqualTo("/mnt/encryptedstore");
     }
 
     private VirtualMachineConfig buildVmConfigWithVendor(File vendorDiskImage) throws Exception {
@@ -2372,7 +2392,8 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
         assumeSupportedDevice();
         // TODO(b/325094712): Boot fails with vendor partition in Cuttlefish.
         assumeFalse(
-                "Cuttlefish doesn't support device tree under /proc/device-tree", isCuttlefish());
+                "Cuttlefish/Goldfish doesn't support device tree under /proc/device-tree",
+                isCuttlefish() || isGoldfish());
         // TODO(b/317567210): Boot fails with vendor partition in HWASAN enabled microdroid
         // after introducing verification based on DT and fstab in microdroid vendor partition.
         assumeFalse(
@@ -2515,6 +2536,52 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
         }
     }
 
+    @Test
+    public void concurrentVms() throws Exception {
+        final long vmSize = minMemoryRequired();
+        final int numVMs = 8;
+        final long availableMem = getAvailableMemory();
+
+        // Let's not use more than half of the available memory
+        assume().withMessage("Available memory (" + availableMem + " bytes) too small")
+                .that((numVMs * vmSize) <= (availableMem / 2))
+                .isTrue();
+
+        VirtualMachine[] vms = new VirtualMachine[numVMs];
+        try {
+            for (int i = 0; i < numVMs; i++) {
+                VirtualMachineConfig config =
+                        newVmConfigBuilderWithPayloadBinary("MicrodroidIdleNativeLib.so")
+                                .setDebugLevel(DEBUG_LEVEL_NONE)
+                                .setMemoryBytes(vmSize)
+                                .build();
+
+                vms[i] = forceCreateNewVirtualMachine("test_concurrent_vms_" + i, config);
+                vms[i].run();
+            }
+
+            for (VirtualMachine vm : vms) {
+                assertThat(vm.getStatus()).isEqualTo(VirtualMachine.STATUS_RUNNING);
+            }
+
+        } finally {
+            // Ensure that VMs are all stopped. Otherwise we may try to reuse some of these for
+            // another run of this test with different parameters.
+            for (VirtualMachine vm : vms) {
+                if (vm != null) {
+                    vm.close();
+                }
+            }
+        }
+    }
+
+    private long getAvailableMemory() {
+        ActivityManager am = getContext().getSystemService(ActivityManager.class);
+        ActivityManager.MemoryInfo memoryInfo = new ActivityManager.MemoryInfo();
+        am.getMemoryInfo(memoryInfo);
+        return memoryInfo.availMem;
+    }
+
     private VirtualMachineDescriptor toParcelFromParcel(VirtualMachineDescriptor descriptor) {
         Parcel parcel = Parcel.obtain();
         descriptor.writeToParcel(parcel, 0);
@@ -2549,16 +2616,15 @@ public class MicrodroidTests extends MicrodroidDeviceTestBase {
     }
 
     private long minMemoryRequired() {
-      assertThat(Build.SUPPORTED_ABIS).isNotEmpty();
-      String primaryAbi = Build.SUPPORTED_ABIS[0];
-      switch (primaryAbi) {
-        case "x86_64":
-          return MIN_MEM_X86_64;
-        case "arm64-v8a":
-        case "arm64-v8a-hwasan":
-          return MIN_MEM_ARM64;
-      }
-      throw new AssertionError("Unsupported ABI: " + primaryAbi);
+        assertThat(Build.SUPPORTED_ABIS).isNotEmpty();
+        String primaryAbi = Build.SUPPORTED_ABIS[0];
+        switch (primaryAbi) {
+            case "x86_64":
+                return MIN_MEM_X86_64;
+            case "arm64-v8a":
+            case "arm64-v8a-hwasan":
+                return MIN_MEM_ARM64;
+        }
+        throw new AssertionError("Unsupported ABI: " + primaryAbi);
     }
-
 }
