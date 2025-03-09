@@ -41,6 +41,9 @@ rust_defaults {
     }) + select(release_flag("RELEASE_AVF_ENABLE_VENDOR_MODULES"), {
         true: ["vendor_modules"],
         default: [],
+    }) + select(release_flag("RELEASE_AVF_ENABLE_VM_TO_TEE_SERVICES_ALLOWLIST"), {
+        true: ["tee_services_allowlist"],
+        default: [],
     }) + select(release_flag("RELEASE_AVF_ENABLE_VIRT_CPUFREQ"), {
         true: ["virt_cpufreq"],
         default: [],
@@ -49,9 +52,6 @@ rust_defaults {
         default: [],
     }) + select(release_flag("RELEASE_AVF_SUPPORT_CUSTOM_VM_WITH_PARAVIRTUALIZED_DEVICES"), {
         true: ["paravirtualized_devices"],
-        default: [],
-    }) + select(release_flag("RELEASE_AVF_ENABLE_TPU_ASSIGNABLE_DEVICE"), {
-        true: ["tpu_assignable_device"],
         default: [],
     }),
 }
@@ -67,9 +67,6 @@ cc_defaults {
     }) + select(release_flag("RELEASE_AVF_ENABLE_VIRT_CPUFREQ"), {
         true: ["-DAVF_ENABLE_VIRT_CPUFREQ=1"],
         default: [],
-    }) + select(release_flag("RELEASE_AVF_ENABLE_TPU_ASSIGNABLE_DEVICE"), {
-        true: ["-DAVF_ENABLE_TPU_ASSIGNABLE_DEVICE=1"],
-        default: [],
     }),
 }
 
@@ -77,21 +74,4 @@ genrule_defaults {
     name: "dts_to_dtb",
     tools: ["dtc"],
     cmd: "FILES=($(in)) && $(location dtc) -@ -I dts -O dtb $${FILES[-1]} -o $(out)",
-}
-
-// This is a temporary workaround until b/309090563 is implemented.
-aconfig_declarations {
-    name: "avf_aconfig_flags",
-    package: "com.android.system.virtualmachine.flags",
-    container: "com.android.virt",
-    srcs: [
-        "avf_flags.aconfig",
-    ],
-}
-
-java_aconfig_library {
-    name: "avf_aconfig_flags_java",
-    aconfig_declarations: "avf_aconfig_flags",
-    sdk_version: "module_current",
-    apex_available: ["com.android.virt"],
 }

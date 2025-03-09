@@ -208,14 +208,21 @@ impl VmInstance {
         console_out: Option<File>,
         console_in: Option<File>,
         log: Option<File>,
+        dump_dt: Option<File>,
         callback: Option<Box<dyn VmCallback + Send + Sync>>,
     ) -> BinderResult<Self> {
         let console_out = console_out.map(ParcelFileDescriptor::new);
         let console_in = console_in.map(ParcelFileDescriptor::new);
         let log = log.map(ParcelFileDescriptor::new);
+        let dump_dt = dump_dt.map(ParcelFileDescriptor::new);
 
-        let vm =
-            service.createVm(config, console_out.as_ref(), console_in.as_ref(), log.as_ref())?;
+        let vm = service.createVm(
+            config,
+            console_out.as_ref(),
+            console_in.as_ref(),
+            log.as_ref(),
+            dump_dt.as_ref(),
+        )?;
 
         let cid = vm.getCid()?;
 
@@ -234,6 +241,11 @@ impl VmInstance {
     /// Starts the VM.
     pub fn start(&self) -> BinderResult<()> {
         self.vm.start()
+    }
+
+    /// Stops the VM.
+    pub fn stop(&self) -> BinderResult<()> {
+        self.vm.stop()
     }
 
     /// Returns the CID used for vsock connections to the VM.
